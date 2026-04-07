@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from array import array
+import struct
 import pygame
 
 from doomgame import settings
@@ -45,6 +46,11 @@ class Raycaster:
         self.sprite_depth_buffer = [settings.MAX_RAY_DISTANCE for _ in range(self.width)]
         self.texture_size = settings.TEXTURE_SIZE
         self.wall_textures = self._build_wall_textures()
+        self.native_wall_texture_bytes = self._build_native_wall_texture_bytes()
+        self.floor_textures = self._build_floor_textures()
+        self.native_floor_texture_bytes = self._build_native_floor_texture_bytes()
+        self.ceiling_textures = self._build_ceiling_textures()
+        self.native_ceiling_texture_bytes = self._build_native_ceiling_texture_bytes()
         self.background = self._build_background()
         self.sky_strip = self._build_sky_strip()
         self.vignette = self._build_vignette()
@@ -54,11 +60,30 @@ class Raycaster:
         self.horizon_glow = pygame.Surface((self.width, 48), pygame.SRCALPHA)
         self.horizon_glow.fill((118, 214, 140, 255))
         self.weapon_frames = self._load_weapon_frames()
+        self.weapon_idle_frame = self._load_weapon_idle_frame()
         self.scaled_weapon_frames = self._prepare_weapon_frames()
+        self.scaled_weapon_idle_frame = self._prepare_single_weapon_frame(self.weapon_idle_frame)
         self.pickup_sprites = self._build_pickup_sprites()
         self.door_textures = self._build_door_textures()
         self.exit_sprite = self._make_exit_sprite()
         self.enemy_sprites = self._build_enemy_sprites()
+        self.scaled_sprite_cache: dict[tuple[int, int, int], pygame.Surface] = {}
+        self.outline_cache: dict[tuple[int, int, int, int], pygame.Surface] = {}
+        self.glow_cache: dict[tuple[int, int, int, int, int, int], pygame.Surface] = {}
+        (
+            self.native_enemy_atlas_bytes,
+            self.native_enemy_meta_bytes,
+            self.native_enemy_surface_indices,
+            self.native_enemy_sprite_count,
+            self.native_enemy_cell_size,
+        ) = self._build_native_billboard_resources(projectiles=False)
+        (
+            self.native_projectile_atlas_bytes,
+            self.native_projectile_meta_bytes,
+            self.native_projectile_surface_indices,
+            self.native_projectile_sprite_count,
+            self.native_projectile_cell_size,
+        ) = self._build_native_billboard_resources(projectiles=True)
 
     def set_world(self, world: World) -> None:
         self.map_width = world.width
@@ -112,19 +137,81 @@ class Raycaster:
                 self.map_width,
                 self.map_height,
                 time_seconds,
+                self.native_wall_texture_bytes,
+                self.native_floor_texture_bytes,
+                self.native_ceiling_texture_bytes,
             )
             self.depth_buffer = self.native_depth_buffer
+            self.sprite_depth_buffer = array("f", self.depth_buffer)
+            self._draw_exit_marker(self.native_surface, world, player, time_seconds)
+            self._draw_pickups(self.native_surface, world, player, time_seconds)
+            if (
+                hasattr(self.native_renderer, "render_billboards_into")
+                and self.native_enemy_atlas_bytes
+                and self.native_enemy_sprite_count > 0
+            ):
+                enemy_buffer, enemy_count = self._build_native_enemy_instance_buffer(world, player, time_seconds)
+                if enemy_count > 0:
+                    self.native_renderer.render_billboards_into(
+                        self.framebuffer,
+                        self.sprite_depth_buffer,
+                        self.width,
+                        self.height,
+                        player.x,
+                        player.y,
+                        player.angle,
+                        player.z,
+                        self.floor_height_bytes,
+                        self.map_width,
+                        self.map_height,
+                        enemy_buffer,
+                        enemy_count,
+                        self.native_enemy_atlas_bytes,
+                        self.native_enemy_meta_bytes,
+                        self.native_enemy_sprite_count,
+                        self.native_enemy_cell_size,
+                    )
+            else:
+                self._draw_enemies(self.native_surface, world, player, time_seconds)
+            if (
+                hasattr(self.native_renderer, "render_billboards_into")
+                and self.native_projectile_atlas_bytes
+                and self.native_projectile_sprite_count > 0
+            ):
+                projectile_buffer, projectile_count = self._build_native_projectile_instance_buffer(world)
+                if projectile_count > 0:
+                    self.native_renderer.render_billboards_into(
+                        self.framebuffer,
+                        self.sprite_depth_buffer,
+                        self.width,
+                        self.height,
+                        player.x,
+                        player.y,
+                        player.angle,
+                        player.z,
+                        self.floor_height_bytes,
+                        self.map_width,
+                        self.map_height,
+                        projectile_buffer,
+                        projectile_count,
+                        self.native_projectile_atlas_bytes,
+                        self.native_projectile_meta_bytes,
+                        self.native_projectile_sprite_count,
+                        self.native_projectile_cell_size,
+                    )
+            else:
+                self._draw_enemy_projectiles(self.native_surface, world, player, time_seconds)
             surface.blit(self.native_surface, (0, 0))
         else:
             self._draw_background(surface, player.angle, time_seconds)
             self._draw_floor_and_ceiling(surface, world, player)
             self._draw_walls(surface, world, player)
             self._draw_doors(surface, world, player)
-        self.sprite_depth_buffer = list(self.depth_buffer)
-        self._draw_exit_marker(surface, world, player, time_seconds)
-        self._draw_pickups(surface, world, player, time_seconds)
-        self._draw_enemies(surface, world, player, time_seconds)
-        self._draw_enemy_projectiles(surface, world, player, time_seconds)
+            self.sprite_depth_buffer = array("f", self.depth_buffer)
+            self._draw_exit_marker(surface, world, player, time_seconds)
+            self._draw_pickups(surface, world, player, time_seconds)
+            self._draw_enemies(surface, world, player, time_seconds)
+            self._draw_enemy_projectiles(surface, world, player, time_seconds)
         surface.blit(self.vignette, (0, 0))
         self._draw_weapon(surface, time_seconds, walk_time, move_amount, weapon_frame, muzzle_flash, recoil)
 
@@ -354,12 +441,12 @@ class Raycaster:
         muzzle_flash: float,
         recoil: float,
     ) -> None:
-        sway_x = math.sin(walk_time * 0.9) * 12 * move_amount
-        bob = math.sin(walk_time * 1.8) * 10 * move_amount + math.sin(time_seconds * 0.8) * 2
-        recoil_breath = math.sin(time_seconds * 0.55) * 3
-        kick_y = recoil * 18.0
-        center_x = int(self.width // 2 + sway_x - recoil * 2.0)
-        base_y = int(self.height - 162 + bob + recoil_breath + kick_y)
+        sway_x = math.sin(walk_time * 0.9) * 9 * move_amount
+        bob = math.sin(walk_time * 1.8) * 7 * move_amount + math.sin(time_seconds * 0.8) * 1.5
+        recoil_breath = math.sin(time_seconds * 0.55) * 2
+        kick_y = recoil * 12.0
+        center_x = int(self.width // 2 + sway_x - recoil * 1.5)
+        base_y = int(self.height - 142 + bob + recoil_breath + kick_y)
         if not self.scaled_weapon_frames:
             fallback = pygame.Rect(center_x - 120, base_y + 28, 240, 96)
             pygame.draw.rect(surface, (48, 40, 44), fallback, border_radius=18)
@@ -367,7 +454,9 @@ class Raycaster:
 
         frame_index = max(0, min(len(self.scaled_weapon_frames) - 1, weapon_frame))
         weapon_surface = self.scaled_weapon_frames[frame_index]
-        sprite_rect = weapon_surface.get_rect(midbottom=(center_x + 3, self.height + int(bob * 0.15) + int(kick_y)))
+        if weapon_frame == 0 and self.scaled_weapon_idle_frame is not None:
+            weapon_surface = self.scaled_weapon_idle_frame
+        sprite_rect = weapon_surface.get_rect(midbottom=(center_x + 2, self.height + 8 + int(bob * 0.1) + int(kick_y)))
         surface.blit(weapon_surface, sprite_rect)
 
     def _draw_doors(self, surface: pygame.Surface, world: World, player: Player) -> None:
@@ -552,7 +641,7 @@ class Raycaster:
             screen_x = int((self.width / 2) * (1 + transform_x / transform_y))
             sprite_height = max(18, int(self.height / transform_y * (0.84 * pickup.scale)))
             sprite_width = max(10, int(sprite_height * sprite.get_width() / max(1, sprite.get_height())))
-            scaled = pygame.transform.smoothscale(sprite, (sprite_width, sprite_height))
+            scaled = self._get_scaled_sprite(sprite, sprite_width, sprite_height)
             bottom_y = self._project_z(eye_z, floor_z, transform_y)
             sprite_rect = scaled.get_rect(midbottom=(screen_x, bottom_y))
             if sprite_rect.right < 0 or sprite_rect.left > self.width:
@@ -612,7 +701,7 @@ class Raycaster:
             visible.append((transform_y, transform_x, distance, enemy))
 
         for transform_y, transform_x, distance, enemy in sorted(visible, reverse=True):
-            sprite = self._enemy_sprite(enemy)
+            sprite = self._enemy_sprite(enemy, player_distance=distance)
             if sprite is None:
                 continue
             visual = enemy.definition.visual
@@ -649,10 +738,7 @@ class Raycaster:
 
             outline_alpha = 110 if enemy.dead else 138
             outline_color = (38, 24, 18, outline_alpha)
-            outline = pygame.mask.from_surface(scaled).to_surface(
-                setcolor=outline_color,
-                unsetcolor=(0, 0, 0, 0),
-            )
+            outline = self._get_outline_surface(scaled, outline_alpha)
             for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 self._blit_columns(surface, outline, sprite_rect.move(offset_x, offset_y), visible_columns, target_dx=offset_x)
 
@@ -691,10 +777,12 @@ class Raycaster:
                 continue
             owner_visual = ENEMY_DEFINITIONS[projectile.owner_type].visual
             screen_x = int((self.width / 2) * (1 + transform_x / transform_y))
-            base_scale = 0.46 if projectile.owner_type == "grunt" else 0.6
-            sprite_height = max(10, int(self.height / transform_y * base_scale))
-            sprite_width = max(10, int(sprite_height * sprite.get_width() / max(1, sprite.get_height())))
-            scaled = pygame.transform.smoothscale(sprite, (sprite_width, sprite_height))
+            small_projectile = projectile.owner_type in {"grunt", "heavy"}
+            base_scale = 0.14 if small_projectile else 0.6
+            min_size = 4 if small_projectile else 10
+            sprite_height = max(min_size, int(self.height / transform_y * base_scale))
+            sprite_width = max(min_size, int(sprite_height * sprite.get_width() / max(1, sprite.get_height())))
+            scaled = self._get_scaled_sprite(sprite, sprite_width, sprite_height)
             floor_z = world.get_floor_height(projectile.x, projectile.y) + 0.34 + math.sin(projectile.bob_phase) * 0.04
             bottom_y = self._project_z(eye_z, floor_z, transform_y)
             sprite_rect = scaled.get_rect(center=(screen_x, bottom_y - sprite_height // 2))
@@ -745,7 +833,7 @@ class Raycaster:
         screen_x = int((self.width / 2) * (1 + transform_x / transform_y))
         sprite_height = max(20, int(self.height / transform_y * pulse))
         sprite_width = max(20, int(sprite_height * self.exit_sprite.get_width() / max(1, self.exit_sprite.get_height())))
-        scaled = pygame.transform.smoothscale(self.exit_sprite, (sprite_width, sprite_height))
+        scaled = self._get_scaled_sprite(self.exit_sprite, sprite_width, sprite_height)
         bottom_y = self._project_z(player.z + 0.5, floor_z, transform_y)
         sprite_rect = scaled.get_rect(midbottom=(screen_x, bottom_y))
         if sprite_rect.right < 0 or sprite_rect.left > self.width:
@@ -810,12 +898,164 @@ class Raycaster:
         glow_color: tuple[int, int, int],
         distance: float,
     ) -> pygame.Surface:
+        width, height = size
+        if width <= 0 or height <= 0:
+            return pygame.Surface((1, 1), pygame.SRCALPHA)
+        distance_bucket = max(1, int(distance * 2.0))
+        cache_key = (width, height, glow_color[0], glow_color[1], glow_color[2], distance_bucket)
+        cached = self.glow_cache.get(cache_key)
+        if cached is not None:
+            return cached
         glow = pygame.Surface(size, pygame.SRCALPHA)
         alpha = max(24, 86 - int(distance * 4.0))
         pygame.draw.ellipse(glow, (*glow_color, alpha), glow.get_rect())
         inner = glow.get_rect().inflate(-max(4, size[0] // 4), -max(4, size[1] // 4))
         pygame.draw.ellipse(glow, (*glow_color, max(0, alpha - 18)), inner)
+        if len(self.glow_cache) > 512:
+            self.glow_cache.clear()
+        self.glow_cache[cache_key] = glow
         return glow
+
+    def _quantize_sprite_size(self, width: int, height: int) -> tuple[int, int]:
+        max_dim = max(width, height)
+        step = 4 if max_dim >= 96 else 2
+        quantized_width = max(1, int(round(width / step) * step))
+        quantized_height = max(1, int(round(height / step) * step))
+        return quantized_width, quantized_height
+
+    def _get_scaled_sprite(self, sprite: pygame.Surface, width: int, height: int) -> pygame.Surface:
+        width, height = self._quantize_sprite_size(width, height)
+        cache_key = (id(sprite), width, height)
+        cached = self.scaled_sprite_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        scaled = pygame.transform.scale(sprite, (width, height)).convert_alpha()
+        if len(self.scaled_sprite_cache) > 1024:
+            self.scaled_sprite_cache.clear()
+            self.outline_cache.clear()
+        self.scaled_sprite_cache[cache_key] = scaled
+        return scaled
+
+    def _get_outline_surface(self, sprite: pygame.Surface, alpha: int) -> pygame.Surface:
+        cache_key = (id(sprite), sprite.get_width(), sprite.get_height(), alpha)
+        cached = self.outline_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        outline = pygame.mask.from_surface(sprite).to_surface(
+            setcolor=(38, 24, 18, alpha),
+            unsetcolor=(0, 0, 0, 0),
+        )
+        if len(self.outline_cache) > 1024:
+            self.outline_cache.clear()
+        self.outline_cache[cache_key] = outline
+        return outline
+
+    def _build_native_billboard_resources(
+        self,
+        projectiles: bool,
+    ) -> tuple[bytes, bytes, dict[int, int], int, int]:
+        cell_size = 128 if not projectiles else 64
+        atlas_surfaces: list[pygame.Surface] = []
+        surface_indices: dict[int, int] = {}
+        for sprite_sets in self.enemy_sprites.values():
+            state_names = ("projectile",) if projectiles else ("idle", "alert", "walk", "attack", "pain", "dead")
+            for state_name in state_names:
+                for sprite in sprite_sets.get(state_name, []):
+                    if sprite is None:
+                        continue
+                    sprite_id = id(sprite)
+                    if sprite_id in surface_indices:
+                        continue
+                    surface_indices[sprite_id] = len(atlas_surfaces)
+                    atlas_surfaces.append(sprite)
+        if not atlas_surfaces:
+            return b"", b"", {}, 0, cell_size
+
+        atlas = pygame.Surface((cell_size * len(atlas_surfaces), cell_size), pygame.SRCALPHA)
+        meta = array("H")
+        for index, sprite in enumerate(atlas_surfaces):
+            source_width = sprite.get_width()
+            source_height = sprite.get_height()
+            fit_scale = min(1.0, min(cell_size / max(1, source_width), cell_size / max(1, source_height)))
+            fitted_width = max(1, min(cell_size, int(source_width * fit_scale)))
+            fitted_height = max(1, min(cell_size, int(source_height * fit_scale)))
+            prepared = sprite
+            if fitted_width != source_width or fitted_height != source_height:
+                prepared = pygame.transform.smoothscale(sprite, (fitted_width, fitted_height)).convert_alpha()
+            offset_x = index * cell_size + (cell_size - fitted_width) // 2
+            offset_y = cell_size - fitted_height
+            atlas.blit(prepared, (offset_x, offset_y))
+            meta.extend((offset_x, offset_y, fitted_width, fitted_height))
+        return (
+            pygame.image.tostring(atlas, "RGBA"),
+            meta.tobytes(),
+            surface_indices,
+            len(atlas_surfaces),
+            cell_size,
+        )
+
+    def _build_native_enemy_instance_buffer(
+        self,
+        world: World,
+        player: Player,
+        time_seconds: float,
+    ) -> tuple[bytes, int]:
+        instances = bytearray()
+        count = 0
+        for enemy in world.active_enemies(include_corpses=True):
+            distance = math.hypot(enemy.x - player.x, enemy.y - player.y)
+            sprite = self._enemy_sprite(enemy, player_distance=distance)
+            if sprite is None:
+                continue
+            sprite_index = self.native_enemy_surface_indices.get(id(sprite))
+            if sprite_index is None:
+                continue
+            visual = enemy.definition.visual
+            z_offset = 0.06 if enemy.dead else 0.02 + math.sin(time_seconds * 3.2 + enemy.room_index * 0.7) * 0.012
+            projected_scale = visual.height_scale * visual.sprite_scale
+            instances.extend(
+                struct.pack(
+                    "<ffffHHI",
+                    enemy.x,
+                    enemy.y,
+                    z_offset,
+                    projected_scale,
+                    16,
+                    24,
+                    sprite_index,
+                )
+            )
+            count += 1
+        return bytes(instances), count
+
+    def _build_native_projectile_instance_buffer(self, world: World) -> tuple[bytes, int]:
+        instances = bytearray()
+        count = 0
+        for projectile in world.active_enemy_projectiles():
+            sprite = self._projectile_sprite(projectile)
+            if sprite is None:
+                continue
+            sprite_index = self.native_projectile_surface_indices.get(id(sprite))
+            if sprite_index is None:
+                continue
+            small_projectile = projectile.owner_type in {"grunt", "heavy"}
+            base_scale = 0.14 if small_projectile else 0.6
+            min_size = 4 if small_projectile else 10
+            z_offset = 0.34 + math.sin(projectile.bob_phase) * 0.04
+            instances.extend(
+                struct.pack(
+                    "<ffffHHI",
+                    projectile.x,
+                    projectile.y,
+                    z_offset,
+                    base_scale,
+                    min_size,
+                    min_size,
+                    sprite_index,
+                )
+            )
+            count += 1
+        return bytes(instances), count
 
     def _build_depth_buffer(self, world: World, player: Player) -> list[float]:
         depth_buffer = [settings.MAX_RAY_DISTANCE for _ in range(self.width)]
@@ -882,18 +1122,39 @@ class Raycaster:
             frames.append(frame)
         return frames
 
+    def _load_weapon_idle_frame(self) -> pygame.Surface | None:
+        return self._load_trimmed_asset("weapon_shotgun_idle.png")
+
+    def _load_trimmed_asset(self, asset_name: str) -> pygame.Surface | None:
+        assets_dir = Path(__file__).resolve().parent.parent / "assets"
+        sprite_path = assets_dir / asset_name
+        if not sprite_path.exists():
+            return None
+        raw = pygame.image.load(str(sprite_path)).convert_alpha()
+        bounds = raw.get_bounding_rect()
+        return raw if bounds.width <= 0 or bounds.height <= 0 else raw.subsurface(bounds).copy()
+
     def _prepare_weapon_frames(self) -> list[pygame.Surface]:
         if not self.weapon_frames:
             return []
-        scale = self.width / 620
         scaled_frames: list[pygame.Surface] = []
         for frame in self.weapon_frames:
-            sprite_width = int(frame.get_width() * scale)
-            sprite_height = int(frame.get_height() * scale)
-            scaled_frames.append(
-                pygame.transform.smoothscale(frame, (sprite_width, sprite_height)).convert_alpha()
-            )
+            prepared = self._prepare_single_weapon_frame(frame)
+            if prepared is not None:
+                scaled_frames.append(prepared)
         return scaled_frames
+
+    def _prepare_single_weapon_frame(
+        self,
+        frame: pygame.Surface | None,
+        scale_multiplier: float = 1.0,
+    ) -> pygame.Surface | None:
+        if frame is None:
+            return None
+        scale = self.width / 820 * scale_multiplier
+        sprite_width = max(1, int(frame.get_width() * scale))
+        sprite_height = max(1, int(frame.get_height() * scale))
+        return pygame.transform.smoothscale(frame, (sprite_width, sprite_height)).convert_alpha()
 
     def _build_pickup_sprites(self) -> dict[str, pygame.Surface]:
         sprites = {
@@ -914,6 +1175,10 @@ class Raycaster:
     def _build_enemy_sprites(self) -> dict[str, dict[str, list[pygame.Surface]]]:
         sprites: dict[str, dict[str, list[pygame.Surface]]] = {}
         for enemy_type, definition in ENEMY_DEFINITIONS.items():
+            external_sprites = self._load_external_enemy_sprites(enemy_type)
+            if external_sprites is not None:
+                sprites[enemy_type] = external_sprites
+                continue
             visual = definition.visual
             sprites[enemy_type] = {
                 "idle": [
@@ -949,6 +1214,98 @@ class Raycaster:
                 ],
             }
         return sprites
+
+    def _load_external_enemy_sprites(self, enemy_type: str) -> dict[str, list[pygame.Surface]] | None:
+        if enemy_type == "charger":
+            idle = self._load_sprite_asset(f"{enemy_type}_idle.png")
+            walk_close = self._load_sprite_asset(f"{enemy_type}_walk_01.png")
+            walk_far = self._load_sprite_asset(f"{enemy_type}_walk_02.png")
+            attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
+            dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
+
+            if idle is None or walk_close is None or walk_far is None or attack is None or dead is None:
+                return None
+
+            return {
+                "idle": [idle],
+                "alert": [idle],
+                "walk": [walk_close, walk_far],
+                "attack": [attack],
+                "pain": [idle],
+                "dead": [dead],
+                "projectile": [],
+            }
+
+        if enemy_type == "grunt":
+            idle = self._load_sprite_asset(f"{enemy_type}_idle.png")
+            walk_01 = self._load_sprite_asset(f"{enemy_type}_walk_01.png")
+            walk_02 = self._load_sprite_asset(f"{enemy_type}_walk_02.png")
+            attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
+            dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
+            projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
+
+            if idle is None or walk_01 is None or walk_02 is None or attack is None or dead is None:
+                return None
+
+            return {
+                "idle": [idle],
+                "alert": [idle],
+                "walk": [walk_01, walk_02],
+                "attack": [attack],
+                "pain": [idle],
+                "dead": [dead],
+                "projectile": [projectile] if projectile is not None else [],
+            }
+
+        if enemy_type == "heavy":
+            idle = self._load_sprite_asset(f"{enemy_type}_idle.png")
+            walk_01 = self._load_sprite_asset(f"{enemy_type}_walk_01.png")
+            walk_02 = self._load_sprite_asset(f"{enemy_type}_walk_02.png")
+            attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
+            dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
+            projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
+
+            if idle is None or walk_01 is None or walk_02 is None or attack is None or dead is None:
+                return None
+
+            return {
+                "idle": [idle],
+                "alert": [idle],
+                "walk": [walk_01, walk_02],
+                "attack": [attack],
+                "pain": [idle],
+                "dead": [dead],
+                "projectile": [projectile] if projectile is not None else [],
+            }
+
+        if enemy_type == "warden":
+            idle = self._load_sprite_asset(f"{enemy_type}_idle.png")
+            walk_01 = self._load_sprite_asset(f"{enemy_type}_walk_01.png")
+            walk_02 = self._load_sprite_asset(f"{enemy_type}_walk_02.png")
+            attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
+            dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
+            projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
+
+            if idle is None or walk_01 is None or walk_02 is None or attack is None or dead is None:
+                return None
+
+            return {
+                "idle": [idle],
+                "alert": [idle],
+                "walk": [walk_01, walk_02],
+                "attack": [attack],
+                "pain": [idle],
+                "dead": [dead],
+                "projectile": [projectile] if projectile is not None else [],
+            }
+
+        return None
+
+    def _load_sprite_asset(self, asset_name: str) -> pygame.Surface | None:
+        path = Path(__file__).resolve().parent.parent / "assets" / asset_name
+        if not path.exists():
+            return None
+        return pygame.image.load(str(path)).convert_alpha()
 
     def _build_door_textures(self) -> dict[str, pygame.Surface]:
         textures: dict[str, pygame.Surface] = {}
@@ -1001,12 +1358,18 @@ class Raycaster:
         pygame.draw.ellipse(sprite, (34, 72, 52, 180), (0, 3, 34, 12), 2)
         return sprite
 
-    def _enemy_sprite(self, enemy) -> pygame.Surface | None:
+    def _enemy_sprite(self, enemy, player_distance: float | None = None) -> pygame.Surface | None:
         sprite_sets = self.enemy_sprites.get(enemy.enemy_type)
         if sprite_sets is None:
             return None
         state = enemy.sprite_state()
         frames = sprite_sets.get(state) or sprite_sets["idle"]
+        if enemy.enemy_type == "charger" and not enemy.dead and player_distance is not None:
+            if state == "attack":
+                return sprite_sets["attack"][0]
+            if state in {"walk", "alert"} and len(frames) >= 2:
+                close_threshold = enemy.definition.attack_range + settings.PLAYER_RADIUS + 0.28
+                return frames[0] if player_distance <= close_threshold else frames[1]
         return frames[enemy.sprite_frame() % len(frames)]
 
     def _projectile_sprite(self, projectile) -> pygame.Surface | None:
@@ -1324,6 +1687,21 @@ class Raycaster:
         return vignette
 
     def _build_wall_textures(self) -> list[pygame.Surface]:
+        external_names = [
+            "wall_01_hell_brick.png",
+            "wall_02_corrupted_metal.png",
+            "wall_03_occult_stone.png",
+            "wall_04_bone_fortress.png",
+            "wall_05_tech_hell_panel.png",
+        ]
+        external_textures: list[pygame.Surface] = []
+        for name in external_names:
+            texture = self._load_texture_asset(name)
+            if texture is not None:
+                external_textures.append(texture)
+        if len(external_textures) == len(external_names):
+            return external_textures
+
         size = self.texture_size
         textures = []
 
@@ -1406,6 +1784,65 @@ class Raycaster:
         textures.append(industrial)
 
         return textures
+
+    def _load_texture_asset(self, asset_name: str) -> pygame.Surface | None:
+        path = Path(__file__).resolve().parent.parent / "assets" / asset_name
+        if not path.exists():
+            return None
+        image = pygame.image.load(str(path)).convert()
+        if image.get_width() != self.texture_size or image.get_height() != self.texture_size:
+            image = pygame.transform.smoothscale(image, (self.texture_size, self.texture_size))
+        return image
+
+    def _build_native_wall_texture_bytes(self) -> bytes:
+        textures = list(self.wall_textures[:6])
+        if not textures:
+            return b""
+        while len(textures) < 6:
+            textures.append(textures[-1])
+        return b"".join(pygame.image.tostring(texture, "RGB") for texture in textures)
+
+    def _build_floor_textures(self) -> list[pygame.Surface]:
+        external_names = [
+            "floor_01_blood_stone.png",
+            "floor_02_hell_metal_grate.png",
+            "floor_03_occult_tiles.png",
+            "floor_04_corrupted_flesh_metal.png",
+        ]
+        textures: list[pygame.Surface] = []
+        for name in external_names:
+            texture = self._load_texture_asset(name)
+            if texture is not None:
+                textures.append(texture)
+        return textures
+
+    def _build_native_floor_texture_bytes(self) -> bytes:
+        textures = list(self.floor_textures[:4])
+        if not textures:
+            return b""
+        while len(textures) < 4:
+            textures.append(textures[-1])
+        return b"".join(pygame.image.tostring(texture, "RGB") for texture in textures)
+
+    def _build_ceiling_textures(self) -> list[pygame.Surface]:
+        external_names = [
+            "ceiling_01_dark_tech.png",
+            "ceiling_02_hell_vault.png",
+        ]
+        textures: list[pygame.Surface] = []
+        for name in external_names:
+            texture = self._load_texture_asset(name)
+            if texture is not None:
+                textures.append(texture)
+        return textures
+
+    def _build_native_ceiling_texture_bytes(self) -> bytes:
+        textures = list(self.ceiling_textures[:2])
+        if not textures:
+            return b""
+        while len(textures) < 2:
+            textures.append(textures[-1])
+        return b"".join(pygame.image.tostring(texture, "RGB") for texture in textures)
 
     def _build_floor_texture(self) -> pygame.Surface:
         size = self.texture_size

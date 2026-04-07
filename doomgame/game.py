@@ -77,8 +77,21 @@ class DoomGame:
         }
         self.selected_weapon_slot = 3
         self.keys_owned: set[str] = set()
-        self.face_panel_sprite = self._load_scaled_asset("freedoom_face_panel.png", (112, 112))
-        self.skull_face_sprite = self._load_scaled_asset("freedoom_skulface.png", (88, 102))
+        self.face_panel_sprites = {
+            "center": self._load_scaled_asset("doomguy_face_center.png", (124, 124)),
+            "left": self._load_scaled_asset("doomguy_face_left.png", (124, 124)),
+            "right": self._load_scaled_asset("doomguy_face_right.png", (124, 124)),
+            "dead": self._load_scaled_asset("doomguy_face_dead.png", (124, 124)),
+            "hit_light": self._load_scaled_asset("light_damage.png", (124, 124)),
+            "hit_heavy": self._load_scaled_asset("heavy_damage.png", (124, 124)),
+        }
+        if self.face_panel_sprites["center"] is None:
+            self.face_panel_sprites["center"] = self._load_scaled_asset("freedoom_face_panel.png", (124, 124))
+        if self.face_panel_sprites["dead"] is None:
+            self.face_panel_sprites["dead"] = self._load_scaled_asset("freedoom_skulface.png", (124, 124))
+        self.face_idle_sequence = ("center", "left", "center", "right")
+        self.face_hit_timer = 0.0
+        self.face_hit_state = "hit_light"
 
         self.world = self._generate_world()
         self.raycaster.set_world(self.world)
@@ -128,6 +141,24 @@ class DoomGame:
             return None
         image = pygame.image.load(str(path)).convert_alpha()
         return pygame.transform.scale(image, size)
+
+    def _current_face_sprite(self) -> pygame.Surface | None:
+        if self.health <= 0:
+            return self.face_panel_sprites.get("dead") or self.face_panel_sprites.get("center")
+        if self.face_hit_timer > 0.0:
+            return (
+                self.face_panel_sprites.get(self.face_hit_state)
+                or self.face_panel_sprites.get("center")
+                or self.face_panel_sprites.get("dead")
+            )
+
+        frame = int(self.time_seconds * 2.4) % len(self.face_idle_sequence)
+        state = self.face_idle_sequence[frame]
+        return (
+            self.face_panel_sprites.get(state)
+            or self.face_panel_sprites.get("center")
+            or self.face_panel_sprites.get("dead")
+        )
 
     def _handle_events(self) -> None:
         for event in pygame.event.get():
@@ -187,6 +218,7 @@ class DoomGame:
         self.pickup_message_timer = max(0.0, self.pickup_message_timer - delta_time)
         self.pickup_flash_timer = max(0.0, self.pickup_flash_timer - delta_time * 2.8)
         self.damage_flash_timer = max(0.0, self.damage_flash_timer - delta_time * 2.8)
+        self.face_hit_timer = max(0.0, self.face_hit_timer - delta_time)
         if self.pickup_message_timer <= 0.0:
             self.pickup_message = ""
 
@@ -300,10 +332,10 @@ class DoomGame:
         self.ammo_pools["SHEL"] = self.ammo
         self.shot_cooldown = settings.SHOT_COOLDOWN
         self.shot_anim_time = 0.0
-        self.shot_anim_frames = [1, 2, 3, 4, 3, 2, 1, 0]
+        self.shot_anim_frames = [1, 2, 2, 3, 4, 5, 0]
         self.shot_anim_index = 0
         self.muzzle_flash = 1.0
-        self.weapon_recoil = 1.0
+        self.weapon_recoil = 0.8
         self.audio.play_shotgun_fire()
         self.world.emit_noise(
             self.player.x,
@@ -321,13 +353,13 @@ class DoomGame:
             self.shot_anim_time += delta_time * settings.SHOT_ANIM_FPS
             frame = min(len(self.shot_anim_frames) - 1, int(self.shot_anim_time))
             self.shot_anim_index = frame
-            if frame >= len(self.shot_anim_frames) - 1 and self.shot_anim_time >= len(self.shot_anim_frames) - 0.15:
+            if frame >= len(self.shot_anim_frames) - 1 and self.shot_anim_time >= len(self.shot_anim_frames) - 0.05:
                 self.shot_anim_frames = [0]
                 self.shot_anim_index = 0
                 self.shot_anim_time = 0.0
 
         self.muzzle_flash = max(0.0, self.muzzle_flash - delta_time * settings.SHOT_FLASH_DECAY)
-        self.weapon_recoil = max(0.0, self.weapon_recoil - delta_time * 5.5)
+        self.weapon_recoil = max(0.0, self.weapon_recoil - delta_time * 4.2)
 
     def _fire_hitscan(self) -> None:
         ray_x = math.cos(self.player.angle)
@@ -414,6 +446,8 @@ class DoomGame:
         self.level_complete_timer = 0.0
         self.damage_flash_timer = 0.0
         self.player_death_timer = 0.0
+        self.face_hit_timer = 0.0
+        self.face_hit_state = "hit_light"
         self._reset_weapon_state()
 
     def _apply_loot(self, kind: str, amount: int) -> str | None:
@@ -463,11 +497,20 @@ class DoomGame:
             return
         absorbed = min(self.armor, int(math.ceil(amount * settings.PLAYER_ARMOR_ABSORB)))
         self.armor = max(0, self.armor - absorbed)
-        self.health = max(0, self.health - max(0, amount - absorbed))
+        damage_taken = max(0, amount - absorbed)
+        self.health = max(0, self.health - damage_taken)
+        self.audio.play_player_hit()
+        if damage_taken >= 18:
+            self.face_hit_state = "hit_heavy"
+            self.face_hit_timer = 0.32
+        else:
+            self.face_hit_state = "hit_light"
+            self.face_hit_timer = 0.18
         self._trigger_damage_flash((255, 72, 52), settings.PLAYER_DAMAGE_FLASH_TIME)
         if self.health > 0:
             return
         self.player_death_timer = settings.PLAYER_DEATH_RESET_TIME
+        self.audio.play_player_death()
         self._show_message("YOU DIED", (255, 96, 72))
 
     def _draw_pickup_message(self) -> None:
@@ -599,9 +642,7 @@ class DoomGame:
         pygame.draw.rect(self.screen, (92, 18, 18), inner, border_radius=3)
         pygame.draw.rect(self.screen, (164, 142, 62), (inner.x + 8, inner.y + 8, inner.width - 16, 6), border_radius=2)
 
-        face_sprite = self.face_panel_sprite
-        if self.health <= 0 and self.skull_face_sprite is not None:
-            face_sprite = self.skull_face_sprite
+        face_sprite = self._current_face_sprite()
         if face_sprite is None:
             return
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from array import array
 import math
+from pathlib import Path
 import random
 
 import pygame
@@ -28,19 +29,39 @@ class DoomAudio:
             "world": pygame.mixer.Channel(3),
             "enemy": pygame.mixer.Channel(4),
         }
+        shotgun_fire = self._load_asset_sound("dspistol.wav")
+        charger_attack = self._load_asset_sound("dsfirsht.wav")
+        grunt_attack = self._load_asset_sound("dsshotgn.wav")
+        heavy_attack = self._load_asset_sound("dsrlaunc.wav")
+        warden_attack = self._load_asset_sound("dsmanatk.wav")
+        charger_death = self._load_asset_sound("dsbgdth1.wav")
+        grunt_death = self._load_asset_sound("dsskedth.wav")
+        heavy_death = self._load_asset_sound("dscybdth.wav")
+        warden_death = self._load_asset_sound("dsmandth.wav")
+        player_pain = self._load_asset_sound("dsplpain.wav")
+        player_oof = self._load_asset_sound("dsoof.wav")
+        player_death = self._load_asset_sound("dspldeth.wav")
         self.sounds = {
-            "shotgun_fire": pygame.mixer.Sound(buffer=self._render_shotgun_fire()),
+            "shotgun_fire": shotgun_fire if shotgun_fire is not None else pygame.mixer.Sound(buffer=self._render_shotgun_fire()),
             "empty_click": pygame.mixer.Sound(buffer=self._render_empty_click()),
             "pickup": pygame.mixer.Sound(buffer=self._render_pickup_ping()),
             "key_pickup": pygame.mixer.Sound(buffer=self._render_key_pickup_ping()),
             "door_open": pygame.mixer.Sound(buffer=self._render_door_open()),
             "door_locked": pygame.mixer.Sound(buffer=self._render_door_locked()),
-            "enemy_alert": pygame.mixer.Sound(buffer=self._render_enemy_alert()),
             "enemy_melee": pygame.mixer.Sound(buffer=self._render_enemy_melee()),
             "enemy_ranged": pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
-            "enemy_pain": pygame.mixer.Sound(buffer=self._render_enemy_pain()),
             "enemy_death": pygame.mixer.Sound(buffer=self._render_enemy_death()),
-            "enemy_hit": pygame.mixer.Sound(buffer=self._render_enemy_hit()),
+            "charger_attack": charger_attack if charger_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_melee()),
+            "grunt_attack": grunt_attack if grunt_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
+            "heavy_attack": heavy_attack if heavy_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
+            "warden_attack": warden_attack if warden_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
+            "charger_death": charger_death if charger_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
+            "grunt_death": grunt_death if grunt_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
+            "heavy_death": heavy_death if heavy_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
+            "warden_death": warden_death if warden_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
+            "player_pain": player_pain,
+            "player_oof": player_oof,
+            "player_death": player_death,
         }
         self.channels["weapon"].set_volume(0.66)
         self.channels["ui"].set_volume(0.40)
@@ -78,26 +99,65 @@ class DoomAudio:
             self.channels["world"].play(self.sounds["door_locked"])
 
     def play_enemy_alert(self, enemy_type: str) -> None:
-        if self.enabled and not self.channels["enemy"].get_busy():
-            self.channels["enemy"].play(self.sounds["enemy_alert"])
+        return
 
     def play_enemy_attack(self, enemy_type: str) -> None:
         if not self.enabled:
             return
-        sound_key = "enemy_melee" if enemy_type == "charger" else "enemy_ranged"
+        sound_key = {
+            "charger": "charger_attack",
+            "grunt": "grunt_attack",
+            "heavy": "heavy_attack",
+            "warden": "warden_attack",
+        }.get(enemy_type)
+        if sound_key is None:
+            sound_key = "enemy_melee" if enemy_type == "charger" else "enemy_ranged"
         self.channels["enemy"].play(self.sounds[sound_key])
 
     def play_enemy_attack_hit(self, enemy_type: str) -> None:
-        if self.enabled:
-            self.channels["enemy"].play(self.sounds["enemy_hit"])
+        return
 
     def play_enemy_pain(self, enemy_type: str) -> None:
-        if self.enabled:
-            self.channels["enemy"].play(self.sounds["enemy_pain"])
+        return
 
     def play_enemy_death(self, enemy_type: str) -> None:
         if self.enabled:
-            self.channels["enemy"].play(self.sounds["enemy_death"])
+            sound_key = {
+                "charger": "charger_death",
+                "grunt": "grunt_death",
+                "heavy": "heavy_death",
+                "warden": "warden_death",
+            }.get(enemy_type, "enemy_death")
+            self.channels["enemy"].play(self.sounds[sound_key])
+
+    def play_player_hit(self) -> None:
+        if not self.enabled:
+            return
+        choices = []
+        if self.sounds.get("player_pain") is not None:
+            choices.append(self.sounds["player_pain"])
+        if self.sounds.get("player_oof") is not None:
+            choices.append(self.sounds["player_oof"])
+        if not choices:
+            return
+        self.channels["ui"].play(random.choice(choices))
+
+    def play_player_death(self) -> None:
+        if not self.enabled:
+            return
+        sound = self.sounds.get("player_death")
+        if sound is None:
+            return
+        self.channels["ui"].play(sound)
+
+    def _load_asset_sound(self, asset_name: str) -> pygame.mixer.Sound | None:
+        asset_path = Path(__file__).resolve().parent.parent / "assets" / asset_name
+        if not asset_path.exists():
+            return None
+        try:
+            return pygame.mixer.Sound(str(asset_path))
+        except pygame.error:
+            return None
 
     def _render_shotgun_fire(self) -> bytes:
         duration = 0.78

@@ -3,6 +3,7 @@ from __future__ import annotations
 from array import array
 from dataclasses import dataclass
 import math
+from pathlib import Path
 import random
 
 import pygame
@@ -46,7 +47,9 @@ class DoomMusicPlayer:
         self.seconds_per_beat = 60.0 / self.bpm
         self._sound: pygame.mixer.Sound | None = None
         self._music_channel: pygame.mixer.Channel | None = None
+        self._music_path = self._find_external_music()
         self.enabled = False
+        self.using_file_music = False
 
     def start(self) -> None:
         try:
@@ -55,6 +58,17 @@ class DoomMusicPlayer:
         except pygame.error:
             self.enabled = False
             return
+
+        if self._music_path is not None:
+            try:
+                pygame.mixer.music.load(str(self._music_path))
+                pygame.mixer.music.set_volume(0.42)
+                pygame.mixer.music.play(-1)
+                self.enabled = True
+                self.using_file_music = True
+                return
+            except pygame.error:
+                self.using_file_music = False
 
         try:
             self._sound = pygame.mixer.Sound(buffer=self._render_loop())
@@ -66,11 +80,36 @@ class DoomMusicPlayer:
         self._music_channel.set_volume(0.42)
         self._music_channel.play(self._sound, loops=-1)
         self.enabled = True
+        self.using_file_music = False
 
     def stop(self) -> None:
+        if self.using_file_music:
+            pygame.mixer.music.stop()
+            self.enabled = False
+            return
         if self._music_channel is not None:
             self._music_channel.stop()
         self.enabled = False
+
+    def _find_external_music(self) -> Path | None:
+        assets_dir = Path(__file__).resolve().parent.parent / "assets"
+        preferred = [
+            "music.mp3",
+            "music.ogg",
+            "music.wav",
+            "doom_music.mp3",
+            "doom_music.ogg",
+            "new_music.mp3",
+        ]
+        for name in preferred:
+            path = assets_dir / name
+            if path.exists():
+                return path
+
+        candidates: list[Path] = []
+        for ext in ("*.mp3", "*.ogg", "*.wav", "*.flac"):
+            candidates.extend(sorted(assets_dir.glob(ext)))
+        return candidates[0] if candidates else None
 
     def _render_loop(self) -> bytes:
         total_beats = 32.0
@@ -97,7 +136,6 @@ class DoomMusicPlayer:
         return pcm.tobytes()
 
     def _build_guitar_events(self, total_beats: float) -> list[NoteEvent]:
-        # Based on the riff the user gave, expanded into a loop with small phrase variations.
         phrase_a = [
             ("E2", 0.0, 0.50, 1.00),
             ("E2", 0.5, 0.50, 0.98),
@@ -239,108 +277,100 @@ class DoomMusicPlayer:
         length = max(1, int(duration * self.sample_rate))
         samples: list[float] = []
         phase = 0.0
-        for idx in range(length):
-            t = idx / self.sample_rate
-            phase += frequency / self.sample_rate
-            base = math.sin(math.tau * phase)
-            octave = math.sin(math.tau * phase * 2.0) * 0.42
-            bite = math.sin(math.tau * phase * 3.0) * 0.18
-            envelope = self._adsr(t, duration, 0.004, 0.08, 0.72, 0.18)
-            palm = 0.70 + 0.30 * math.exp(-t * 18.0)
-            distorted = math.tanh((base * 0.95 + octave + bite) * 2.8) * palm
-            samples.append(distorted * envelope * velocity * 0.54)
+        detune_phase = 0.0
+        for index in range(length):
+            t = index / self.sample_rate
+            envelope = math.exp(-5.2 * t) * 0.82 + math.exp(-1.8 * t) * 0.18
+            tremolo = 1.0 + math.sin(t * 18.0) * 0.08
+            sample = (
+                math.sin(phase)
+                + 0.62 * math.sin(phase * 2.0 + 0.3)
+                + 0.25 * math.sin(phase * 3.0)
+                + 0.18 * math.sin(detune_phase)
+            )
+            sample = math.tanh(sample * 1.35) * envelope * velocity * tremolo * 0.44
+            samples.append(sample)
+            phase += math.tau * frequency / self.sample_rate
+            detune_phase += math.tau * (frequency * 1.006) / self.sample_rate
         return samples
 
     def _lead_sample(self, frequency: float, duration: float, velocity: float) -> list[float]:
         length = max(1, int(duration * self.sample_rate))
         samples: list[float] = []
-        for idx in range(length):
-            t = idx / self.sample_rate
-            vibrato = math.sin(math.tau * 5.4 * t) * 0.004
-            phase = math.tau * frequency * (t + vibrato)
-            body = math.sin(phase) * 0.62
-            bell = math.sin(phase * 2.0) * 0.22
-            sparkle = math.sin(phase * 3.0) * 0.10
-            envelope = self._adsr(t, duration, 0.006, 0.18, 0.22, 0.16)
-            samples.append((body + bell + sparkle) * envelope * velocity * 0.38)
+        phase = 0.0
+        for index in range(length):
+            t = index / self.sample_rate
+            envelope = math.exp(-4.4 * t)
+            vibrato = math.sin(t * 7.5) * 0.014
+            phase += math.tau * frequency * (1.0 + vibrato) / self.sample_rate
+            sample = (
+                math.sin(phase)
+                + 0.4 * math.sin(phase * 2.0)
+                + 0.18 * math.sin(phase * 4.0 + 0.4)
+            )
+            sample = math.tanh(sample * 1.18) * envelope * velocity * 0.24
+            samples.append(sample)
         return samples
 
     def _bass_sample(self, frequency: float, duration: float, velocity: float) -> list[float]:
         length = max(1, int(duration * self.sample_rate))
         samples: list[float] = []
-        for idx in range(length):
-            t = idx / self.sample_rate
-            phase = math.tau * frequency * t
-            fundamental = math.sin(phase)
-            growl = math.sin(phase * 0.5) * 0.18
-            squareish = math.tanh(fundamental * 1.8) * 0.44
-            envelope = self._adsr(t, duration, 0.003, 0.07, 0.78, 0.10)
-            samples.append((fundamental * 0.7 + squareish + growl) * envelope * velocity * 0.46)
+        phase = 0.0
+        for index in range(length):
+            t = index / self.sample_rate
+            envelope = math.exp(-3.2 * t)
+            square = 1.0 if math.sin(phase) >= 0.0 else -1.0
+            sample = (square * 0.66 + math.sin(phase) * 0.34) * envelope * velocity * 0.26
+            samples.append(sample)
+            phase += math.tau * frequency / self.sample_rate
         return samples
 
     def _kick_sample(self, duration: float) -> list[float]:
         length = max(1, int(duration * self.sample_rate))
         samples: list[float] = []
-        for idx in range(length):
-            t = idx / self.sample_rate
-            sweep = 98.0 * math.exp(-t * 9.0) + 34.0
-            phase = math.tau * sweep * t
-            envelope = math.exp(-t * 11.5)
-            click = math.exp(-t * 45.0) * 0.22
-            samples.append((math.sin(phase) * envelope + click) * 0.78)
+        phase = 0.0
+        for index in range(length):
+            t = index / self.sample_rate
+            freq = 120.0 - 82.0 * (t / max(duration, 0.001))
+            phase += math.tau * max(28.0, freq) / self.sample_rate
+            envelope = math.exp(-12.0 * t)
+            click = math.exp(-280.0 * t) * 0.5
+            sample = math.sin(phase) * envelope * 0.95 + click
+            samples.append(sample * 0.58)
         return samples
 
     def _snare_sample(self, duration: float) -> list[float]:
+        rng = random.Random(29)
         length = max(1, int(duration * self.sample_rate))
-        rng = random.Random(404)
         samples: list[float] = []
-        for idx in range(length):
-            t = idx / self.sample_rate
-            noise = (rng.random() * 2.0 - 1.0)
-            body = math.sin(math.tau * 192.0 * t) * math.exp(-t * 16.0) * 0.22
-            envelope = math.exp(-t * 19.0)
-            samples.append((noise * envelope * 0.52 + body) * 0.58)
+        tone_phase = 0.0
+        for index in range(length):
+            t = index / self.sample_rate
+            noise = (rng.random() * 2.0 - 1.0) * math.exp(-18.0 * t)
+            tone_phase += math.tau * 220.0 / self.sample_rate
+            tone = math.sin(tone_phase) * math.exp(-16.0 * t) * 0.24
+            sample = noise * 0.92 + tone
+            samples.append(sample * 0.36)
         return samples
 
     def _hat_sample(self, duration: float) -> list[float]:
+        rng = random.Random(7)
         length = max(1, int(duration * self.sample_rate))
-        rng = random.Random(808)
-        last = 0.0
         samples: list[float] = []
-        for idx in range(length):
-            t = idx / self.sample_rate
-            noise = rng.random() * 2.0 - 1.0
-            high = noise - last * 0.82
-            last = noise
-            envelope = math.exp(-t * 52.0)
-            samples.append(high * envelope * 0.26)
+        prev = 0.0
+        for index in range(length):
+            t = index / self.sample_rate
+            noise = (rng.random() * 2.0 - 1.0)
+            prev = prev * 0.18 + noise * 0.82
+            sample = (noise - prev) * math.exp(-34.0 * t)
+            samples.append(sample * 0.16)
         return samples
-
-    def _note_frequency(self, note: str) -> float:
-        name = note[:-1]
-        octave = int(note[-1])
-        midi = (octave + 1) * 12 + NOTE_INDEX[name]
-        return 440.0 * (2.0 ** ((midi - 69) / 12.0))
-
-    def _adsr(
-        self,
-        time_position: float,
-        duration: float,
-        attack: float,
-        decay: float,
-        sustain_level: float,
-        release: float,
-    ) -> float:
-        release_start = max(0.0, duration - release)
-        if time_position < attack:
-            return time_position / max(attack, 0.0001)
-        if time_position < attack + decay:
-            decay_progress = (time_position - attack) / max(decay, 0.0001)
-            return 1.0 + (sustain_level - 1.0) * decay_progress
-        if time_position < release_start:
-            return sustain_level
-        release_progress = (time_position - release_start) / max(release, 0.0001)
-        return sustain_level * max(0.0, 1.0 - release_progress)
 
     def _soft_clip(self, value: float) -> float:
         return math.tanh(value * 1.35)
+
+    def _note_frequency(self, note: str) -> float:
+        pitch = note[:-1]
+        octave = int(note[-1])
+        semitone = NOTE_INDEX[pitch] + (octave + 1) * 12
+        return 440.0 * (2.0 ** ((semitone - 69) / 12.0))
