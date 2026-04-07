@@ -8,8 +8,65 @@ from doomgame.enemies import EnemySpawn
 from doomgame import settings
 from doomgame.doors import DoorSpawn, KeySpawn, KEY_TYPES, locked_door_type_for_key
 from doomgame.loot import ROOM_LOOT_COUNTS, ROOM_LOOT_TABLES, resolve_pickup_amount
+from doomgame.progression import (
+    ACTION_ACTIVATE_EXIT_ROUTE,
+    ACTION_ACTIVATE_SECRET,
+    ACTION_OPEN_DOOR,
+    ACTION_SPAWN_AMBUSH,
+    ACTION_UNLOCK_SHORTCUT,
+    ACTION_WAKE_ROOM,
+    DEFAULT_DIFFICULTY_ID,
+    EDGE_LOOP,
+    EDGE_MAIN,
+    EDGE_SHORTCUT,
+    EncounterEventPlan,
+    LevelGenerationRequest,
+    MacroRouteEdge,
+    MacroRouteNode,
+    MacroRoutePlan,
+    ProgressionAction,
+    ProgressionBeat,
+    QualityScoreReport,
+    ROOM_ROLE_AMBUSH_ROOM,
+    ROOM_ROLE_FINAL_ROOM,
+    ROOM_ROLE_KEY_ROOM,
+    ROOM_ROLE_PRESSURE_CORRIDOR,
+    ROOM_ROLE_RETURN_ROUTE,
+    ROOM_ROLE_SECRET_ROOM,
+    ROOM_ROLE_SHORTCUT_HALL,
+    ROOM_ROLE_START,
+    ROOM_ROLE_SWITCH_ROOM,
+    ROOM_ROLE_VISTA,
+    RoomMetadata,
+    SecretSpawn,
+    ValidationReport,
+    WorldSwitchSpawn,
+    WorldTriggerSpawn,
+    build_macro_signature,
+    calculate_level_identity_score,
+    get_difficulty_definition,
+    get_skeleton_profile,
+)
 
 ROOM_KINDS = ("start", "storage", "arena", "tech", "shrine", "cross")
+SECTOR_SAFE = 0
+SECTOR_ACID = 1
+SECTOR_BRIDGE = 2
+ROOM_KIND_HAZARD = 6
+ROOM_KIND_CATWALK = 7
+ROOM_KIND_VISTA = 8
+
+ARCHETYPE_HIGH_CEILING_HALL = "high_ceiling_hall"
+ARCHETYPE_TOXIC_PIT_ROOM = "toxic_pit_room"
+ARCHETYPE_BRIDGE_CROSSING = "bridge_crossing"
+ARCHETYPE_OFFSET_CORRIDOR = "offset_corridor"
+ARCHETYPE_SPLIT_ARENA = "split_arena"
+ARCHETYPE_OVERLOOK_VISTA = "overlook_vista"
+ARCHETYPE_CRUSHER_PASSAGE = "crusher_like_narrow_passage"
+ARCHETYPE_RAISED_PLATFORM = "raised_platform_room"
+ARCHETYPE_ACID_RING = "acid_ring_room"
+ARCHETYPE_TOXIC_CANALS = "toxic_canals_room"
+ARCHETYPE_GRAND_CHAMBER = "grand_chamber"
 
 
 @dataclass(frozen=True)
@@ -20,6 +77,9 @@ class Room:
     height: int
     kind: str
     floor_height: int
+    shape_family: str = "rectangular"
+    spatial_archetype: str = "standard"
+    ceiling_height: int = 1
 
     @property
     def center(self) -> tuple[int, int]:
@@ -44,8 +104,10 @@ class Room:
 class GeneratedMap:
     tiles: list[list[int]]
     floor_heights: list[list[int]]
+    ceiling_heights: list[list[int]]
     stair_mask: list[list[int]]
     room_kinds: list[list[int]]
+    sector_types: list[list[int]]
     loot_spawns: list["LootSpawn"]
     enemy_spawns: list[EnemySpawn]
     door_spawns: list[DoorSpawn]
@@ -53,6 +115,25 @@ class GeneratedMap:
     exit_spawn: "ExitSpawn | None"
     spawn: tuple[float, float]
     seed: int
+    run_seed: int
+    per_level_seed: int
+    difficulty_id: str
+    level_index: int
+    level_archetype_id: str
+    skeleton_profile_id: str
+    level_title: str
+    level_subtitle: str
+    macro_layout_type: str
+    macro_signature: str
+    route_plan: MacroRoutePlan
+    room_metadata: tuple[RoomMetadata, ...]
+    progression_beats: tuple[ProgressionBeat, ...]
+    switch_spawns: tuple[WorldSwitchSpawn, ...]
+    trigger_spawns: tuple[WorldTriggerSpawn, ...]
+    secret_spawns: tuple[SecretSpawn, ...]
+    encounter_events: tuple[EncounterEventPlan, ...]
+    validation_report: ValidationReport
+    quality_report: QualityScoreReport
 
 
 @dataclass(frozen=True)
@@ -80,6 +161,8 @@ class CorridorConnection:
     path: list[tuple[int, int]]
     is_main_path: bool
     door_candidate: tuple[int, int, str] | None = None
+    edge_kind: str = EDGE_MAIN
+    trigger_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +193,8 @@ class ProgressionLayout:
 class LayoutPlan:
     rooms: tuple[Room, ...]
     progression: ProgressionLayout
+    route_plan: MacroRoutePlan
+    template_variant: str
 
 
 class MapGenerator:
@@ -118,32 +203,41 @@ class MapGenerator:
         width: int = settings.MAP_WIDTH,
         height: int = settings.MAP_HEIGHT,
         seed: int | None = None,
-        difficulty_rating: float = 1.0,
+        difficulty_id: str = DEFAULT_DIFFICULTY_ID,
+        runtime_pressure_bias: float = 1.0,
+        generation_request: LevelGenerationRequest | None = None,
     ) -> None:
         self.width = width
         self.height = height
-        self.seed = seed if seed is not None else random.randrange(1, 999_999)
+        self.generation_request = generation_request
+        resolved_seed = (
+            generation_request.per_level_seed
+            if generation_request is not None
+            else (seed if seed is not None else random.randrange(1, 999_999))
+        )
+        resolved_difficulty = generation_request.difficulty_id if generation_request is not None else difficulty_id
+        self.seed = resolved_seed
         self.rng = random.Random(self.seed)
-        self.difficulty_rating = max(settings.ENEMY_DIFFICULTY_MIN, min(settings.ENEMY_DIFFICULTY_MAX, difficulty_rating))
+        self.difficulty_id = resolved_difficulty
+        self.difficulty = get_difficulty_definition(resolved_difficulty)
+        self.runtime_pressure_bias = max(
+            settings.ENEMY_DIFFICULTY_MIN,
+            min(settings.ENEMY_DIFFICULTY_MAX, runtime_pressure_bias),
+        )
 
     def generate(self) -> GeneratedMap:
         best_map: GeneratedMap | None = None
-        best_locked_count = -1
+        best_score = float("-inf")
         for attempt in range(settings.MAPGEN_MAX_ATTEMPTS):
-            self.rng = random.Random(self.seed + attempt * 7919)
+            self.rng = random.Random(f"topology:{self.seed}:{attempt}")
             generated = self._generate_once()
             if generated is None:
                 continue
-            locked_count = sum(1 for door in generated.door_spawns if door.door_type != "normal")
-            if locked_count > best_locked_count:
+            score = generated.quality_report.doom_likeness_score
+            if score > best_score:
                 best_map = generated
-                best_locked_count = locked_count
-            if (
-                locked_count == len(KEY_TYPES)
-                and len(generated.key_spawns) == len(KEY_TYPES)
-                and generated.exit_spawn is not None
-                and generated.exit_spawn.required_door_id is not None
-            ):
+                best_score = score
+            if self._meets_quality_target(generated.quality_report, generated.validation_report):
                 return generated
         if best_map is not None:
             return best_map
@@ -152,45 +246,119 @@ class MapGenerator:
             return fallback
         raise RuntimeError(f"Unable to generate a valid progression layout for seed {self.seed}")
 
+    def _campaign_field(self, field_name: str, default):
+        if self.generation_request is None:
+            return default
+        return getattr(self.generation_request, field_name)
+
+    def _campaign_archetype_id(self) -> str:
+        return self._campaign_field("level_archetype_id", "single_level")
+
+    def _build_generated_map(
+        self,
+        *,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room_kinds: list[list[int]],
+        sector_types: list[list[int]],
+        loot_spawns: list["LootSpawn"],
+        enemy_spawns: list[EnemySpawn],
+        door_spawns: list[DoorSpawn],
+        key_spawns: list[KeySpawn],
+        exit_spawn: "ExitSpawn | None",
+        spawn: tuple[float, float],
+        macro_layout_type: str,
+        route_plan: MacroRoutePlan,
+        room_metadata: tuple[RoomMetadata, ...],
+        progression_beats: tuple[ProgressionBeat, ...],
+        switch_spawns: tuple[WorldSwitchSpawn, ...],
+        trigger_spawns: tuple[WorldTriggerSpawn, ...],
+        secret_spawns: tuple[SecretSpawn, ...],
+        encounter_events: tuple[EncounterEventPlan, ...],
+        validation_report: ValidationReport,
+        quality_report: QualityScoreReport,
+    ) -> GeneratedMap:
+        macro_signature = build_macro_signature(
+            skeleton_profile_id=self._campaign_field("skeleton_profile_id", macro_layout_type),
+            macro_layout_type=macro_layout_type,
+            room_metadata=room_metadata,
+            route_plan=route_plan,
+        )
+        return GeneratedMap(
+            tiles=tiles,
+            floor_heights=floor_heights,
+            ceiling_heights=ceiling_heights,
+            stair_mask=stair_mask,
+            room_kinds=room_kinds,
+            sector_types=sector_types,
+            loot_spawns=loot_spawns,
+            enemy_spawns=enemy_spawns,
+            door_spawns=door_spawns,
+            key_spawns=key_spawns,
+            exit_spawn=exit_spawn,
+            spawn=spawn,
+            seed=self.seed,
+            run_seed=self._campaign_field("run_seed", self.seed),
+            per_level_seed=self._campaign_field("per_level_seed", self.seed),
+            difficulty_id=self.difficulty_id,
+            level_index=self._campaign_field("level_index", 1),
+            level_archetype_id=self._campaign_field("level_archetype_id", "single_level"),
+            skeleton_profile_id=self._campaign_field("skeleton_profile_id", macro_layout_type),
+            level_title=self._campaign_field("level_title", f"Level {self._campaign_field('level_index', 1)}"),
+            level_subtitle=self._campaign_field("level_subtitle", macro_layout_type.replace("_", " ").title()),
+            macro_layout_type=macro_layout_type,
+            macro_signature=macro_signature,
+            route_plan=route_plan,
+            room_metadata=room_metadata,
+            progression_beats=progression_beats,
+            switch_spawns=switch_spawns,
+            trigger_spawns=trigger_spawns,
+            secret_spawns=secret_spawns,
+            encounter_events=encounter_events,
+            validation_report=validation_report,
+            quality_report=quality_report,
+        )
+
     def _generate_once(self) -> GeneratedMap | None:
         tiles = [[1 for _ in range(self.width)] for _ in range(self.height)]
         floor_heights = [[0 for _ in range(self.width)] for _ in range(self.height)]
+        ceiling_heights = [[1 for _ in range(self.width)] for _ in range(self.height)]
         stair_mask = [[0 for _ in range(self.width)] for _ in range(self.height)]
         room_kinds = [[-1 for _ in range(self.width)] for _ in range(self.height)]
-        layout = self._generate_rooms_and_corridors(tiles, floor_heights, stair_mask, room_kinds)
+        sector_types = [[SECTOR_SAFE for _ in range(self.width)] for _ in range(self.height)]
+        layout = self._generate_rooms_and_corridors(
+            tiles,
+            floor_heights,
+            ceiling_heights,
+            stair_mask,
+            room_kinds,
+            sector_types,
+        )
         if layout is None:
             return None
         rooms = list(layout.rooms)
-        connections: list[CorridorConnection] = []
-        room_stages = layout.progression.room_stages
-        for room_index in range(1, len(rooms)):
-            path = self._connect_rooms(
-                tiles,
-                floor_heights,
-                stair_mask,
-                room_kinds,
-                rooms[room_index - 1],
-                rooms[room_index],
-                widen_chance=0.0,
-            )
-            connections.append(
-                CorridorConnection(
-                    index=len(connections),
-                    room_a_index=room_index - 1,
-                    room_b_index=room_index,
-                    path=path,
-                    is_main_path=True,
-                )
-            )
-        self._decorate_rooms(tiles, floor_heights, stair_mask, room_kinds, rooms)
-        self._add_side_connections(
+        connections = self._build_template_connections(
             tiles,
             floor_heights,
+            ceiling_heights,
             stair_mask,
             room_kinds,
+            sector_types,
+            layout.route_plan,
+            layout.template_variant,
+        )
+        if connections is None:
+            return None
+        self._decorate_rooms(
+            tiles,
+            floor_heights,
+            ceiling_heights,
+            stair_mask,
+            room_kinds,
+            sector_types,
             rooms,
-            connections,
-            room_stages,
         )
 
         spawn_x, spawn_y = rooms[0].center
@@ -208,6 +376,7 @@ class MapGenerator:
         key_spawns = self._place_keys(
             tiles,
             stair_mask,
+            sector_types,
             rooms,
             spawn,
             connections,
@@ -225,29 +394,34 @@ class MapGenerator:
             locked_doors,
         )
         door_spawns = [*locked_doors, *normal_doors]
+        shortcut_closed_positions = {
+            connection.door_candidate[:2]
+            for connection in connections
+            if connection.edge_kind == EDGE_SHORTCUT and connection.door_candidate is not None
+        }
         final_gate = locked_doors[-1]
         final_connection = connections[layout.progression.gate_plans[-1].connection_index]
         exit_spawn = self._generate_exit_spawn(
             tiles,
             stair_mask,
+            sector_types,
             rooms,
             spawn,
             [(key.x, key.y) for key in key_spawns],
             set(layout.progression.stage_rooms[-1]),
             final_gate.door_id,
             (final_gate.grid_x, final_gate.grid_y),
+            shortcut_closed_positions,
         )
+        if exit_spawn is None and self.generation_request is not None:
+            final_room = rooms[layout.route_plan.final_room_index]
+            exit_spawn = ExitSpawn(
+                exit_id=f"exit-{self.seed}",
+                x=final_room.center[0] + 0.5,
+                y=final_room.center[1] + 0.5,
+                required_door_id=final_gate.door_id,
+            )
         if exit_spawn is None:
-            return None
-        if not self._validate_progression_layout(
-            tiles,
-            rooms,
-            spawn,
-            layout.progression,
-            locked_doors,
-            key_spawns,
-            exit_spawn,
-        ):
             return None
         boss_guard_plan = self._build_boss_guard_plan(
             rooms,
@@ -257,13 +431,21 @@ class MapGenerator:
             (final_gate.grid_x, final_gate.grid_y),
         )
         reserved_positions = [(key.x, key.y) for key in key_spawns]
-        loot_spawns = self._generate_loot_spawns(tiles, stair_mask, rooms, spawn, reserved_positions)
+        loot_spawns = self._generate_loot_spawns(
+            tiles,
+            stair_mask,
+            sector_types,
+            rooms,
+            spawn,
+            reserved_positions,
+        )
         enemy_reserved_positions = [*reserved_positions, *( (loot.x, loot.y) for loot in loot_spawns )]
         if exit_spawn is not None:
             enemy_reserved_positions.append((exit_spawn.x, exit_spawn.y))
         enemy_spawns, guard_enemy_id = self._generate_enemy_spawns(
             tiles,
             stair_mask,
+            sector_types,
             rooms,
             spawn,
             enemy_reserved_positions,
@@ -278,84 +460,130 @@ class MapGenerator:
                     orientation=door.orientation,
                     door_type=door.door_type,
                     guard_enemy_id=guard_enemy_id if door.door_id == boss_guard_plan.guarded_door_id else door.guard_enemy_id,
+                    required_trigger_id=door.required_trigger_id,
+                    locked_message=door.locked_message,
+                    secret=door.secret,
                 )
                 for door in door_spawns
             ]
 
-        return GeneratedMap(
+        door_spawns, enemy_spawns, room_metadata, progression_beats, switch_spawns, trigger_spawns, secret_spawns, encounter_events, macro_layout_type = self._build_dynamic_layer(
+            rooms,
+            layout.progression,
+            layout.route_plan,
+            connections,
+            tiles,
+            stair_mask,
+            sector_types,
+            spawn,
+            key_spawns,
+            door_spawns,
+            enemy_spawns,
+            exit_spawn,
+        )
+        validation_report = self._build_validation_report(
+            progression_valid=self._validate_progression_layout(
+                tiles,
+                rooms,
+                spawn,
+                layout.progression,
+                door_spawns,
+                key_spawns,
+                exit_spawn,
+            ),
+            rooms=rooms,
+            progression=layout.progression,
+            room_metadata=room_metadata,
+            connections=connections,
+            route_plan=layout.route_plan,
+            spawn=spawn,
+            tiles=tiles,
+            sector_types=sector_types,
+            door_spawns=door_spawns,
+            key_spawns=key_spawns,
+            exit_spawn=exit_spawn,
+            encounter_events=encounter_events,
+            secret_spawns=secret_spawns,
+        )
+        quality_report = self._build_quality_score(
+            room_metadata,
+            encounter_events,
+            validation_report,
+            layout.route_plan,
+            self._key_occlusion_score(rooms, tiles, key_spawns),
+        )
+
+        return self._build_generated_map(
             tiles=tiles,
             floor_heights=floor_heights,
+            ceiling_heights=ceiling_heights,
             stair_mask=stair_mask,
             room_kinds=room_kinds,
+            sector_types=sector_types,
             loot_spawns=loot_spawns,
             enemy_spawns=enemy_spawns,
             door_spawns=door_spawns,
             key_spawns=key_spawns,
             exit_spawn=exit_spawn,
             spawn=spawn,
-            seed=self.seed,
+            macro_layout_type=macro_layout_type,
+            route_plan=layout.route_plan,
+            room_metadata=room_metadata,
+            progression_beats=progression_beats,
+            switch_spawns=switch_spawns,
+            trigger_spawns=trigger_spawns,
+            secret_spawns=secret_spawns,
+            encounter_events=encounter_events,
+            validation_report=validation_report,
+            quality_report=quality_report,
         )
 
     def _generate_structured_fallback(self) -> GeneratedMap | None:
         self.rng = random.Random(self.seed ^ 0x5F3759DF)
         tiles = [[1 for _ in range(self.width)] for _ in range(self.height)]
         floor_heights = [[0 for _ in range(self.width)] for _ in range(self.height)]
+        ceiling_heights = [[1 for _ in range(self.width)] for _ in range(self.height)]
         stair_mask = [[0 for _ in range(self.width)] for _ in range(self.height)]
         room_kinds = [[-1 for _ in range(self.width)] for _ in range(self.height)]
-
-        rooms = [
-            Room(2, 5, 6, 6, "start", 0),
-            Room(11, 5, 6, 6, "tech", 0),
-            Room(20, 5, 6, 6, "shrine", 0),
-            Room(20, 14, 8, 8, "arena", 0),
-            Room(11, 15, 6, 6, "cross", 0),
-            Room(2, 15, 6, 6, "tech", 0),
-            Room(2, 25, 7, 7, "shrine", 0),
-            Room(22, 24, 9, 9, "arena", 0),
-        ]
+        sector_types = [[SECTOR_SAFE for _ in range(self.width)] for _ in range(self.height)]
+        route_plan = self._build_macro_route_plan()
+        template_variant = (
+            get_skeleton_profile(self.generation_request.skeleton_profile_id).template_variant
+            if self.generation_request is not None
+            else "spine:balanced:direct:base"
+        )
+        rooms = self._build_template_rooms(route_plan, template_variant)
+        if rooms is None:
+            return None
         for room in rooms:
-            self._carve_room(tiles, floor_heights, room_kinds, room)
+            self._carve_room(tiles, floor_heights, ceiling_heights, room_kinds, sector_types, room)
 
-        progression = self._plan_progression_layout(rooms)
+        progression = self._plan_progression_layout(route_plan)
         if progression is None:
             return None
 
-        connections: list[CorridorConnection] = []
-        def append_connection(
-            room_a_index: int,
-            room_b_index: int,
-            segments: list[tuple[str, int, int, int]],
-            is_main_path: bool,
-            door_candidate: tuple[int, int, str] | None = None,
-        ) -> None:
-            path: list[tuple[int, int]] = []
-            for axis, start, end, fixed in segments:
-                if axis == "h":
-                    path.extend(self._carve_h_corridor(tiles, start, end, fixed, widen_chance=0.0))
-                else:
-                    path.extend(self._carve_v_corridor(tiles, start, end, fixed, widen_chance=0.0))
-            self._assign_path_heights(path, floor_heights, stair_mask, room_kinds)
-            connections.append(
-                CorridorConnection(
-                    index=len(connections),
-                    room_a_index=room_a_index,
-                    room_b_index=room_b_index,
-                    path=path,
-                    is_main_path=is_main_path,
-                    door_candidate=door_candidate,
-                )
-            )
+        connections = self._build_template_connections(
+            tiles,
+            floor_heights,
+            ceiling_heights,
+            stair_mask,
+            room_kinds,
+            sector_types,
+            route_plan,
+            template_variant,
+        )
+        if connections is None:
+            return None
 
-        append_connection(0, 1, [("h", 8, 10, 8)], True)
-        append_connection(1, 2, [("h", 17, 19, 8)], True)
-        append_connection(2, 3, [("v", 11, 13, 23)], True, door_candidate=(23, 12, "horizontal"))
-        append_connection(3, 4, [("h", 17, 19, 18)], True)
-        append_connection(4, 5, [("h", 8, 10, 18)], True, door_candidate=(9, 18, "vertical"))
-        append_connection(5, 6, [("v", 21, 24, 5)], True)
-        append_connection(6, 7, [("h", 9, 21, 28)], True, door_candidate=(20, 28, "vertical"))
-
-        self._decorate_rooms(tiles, floor_heights, stair_mask, room_kinds, rooms)
-        append_connection(0, 2, [("v", 11, 12, 14), ("h", 8, 19, 12)], False)
+        self._decorate_rooms(
+            tiles,
+            floor_heights,
+            ceiling_heights,
+            stair_mask,
+            room_kinds,
+            sector_types,
+            rooms,
+        )
 
         spawn = (rooms[0].center[0] + 0.5, rooms[0].center[1] + 0.5)
         locked_doors = self._place_locked_doors(
@@ -371,6 +599,7 @@ class MapGenerator:
         key_spawns = self._place_keys(
             tiles,
             stair_mask,
+            sector_types,
             rooms,
             spawn,
             connections,
@@ -378,33 +607,49 @@ class MapGenerator:
         )
         if key_spawns is None:
             return None
-        door_spawns = list(locked_doors)
+        normal_doors = self._place_optional_doors(
+            tiles,
+            stair_mask,
+            rooms,
+            connections,
+            spawn,
+            progression,
+            locked_doors,
+        )
+        if not normal_doors and any(edge.edge_kind == EDGE_SHORTCUT for edge in route_plan.edges):
+            return None
+        door_spawns = [*locked_doors, *normal_doors]
+        shortcut_closed_positions = {
+            connection.door_candidate[:2]
+            for connection in connections
+            if connection.edge_kind == EDGE_SHORTCUT and connection.door_candidate is not None
+        }
         exit_spawn = self._generate_exit_spawn(
             tiles,
             stair_mask,
+            sector_types,
             rooms,
             spawn,
             [(key.x, key.y) for key in key_spawns],
             set(progression.stage_rooms[-1]),
             locked_doors[-1].door_id,
             (locked_doors[-1].grid_x, locked_doors[-1].grid_y),
+            shortcut_closed_positions,
         )
+        if exit_spawn is None and self.generation_request is not None:
+            final_room = rooms[route_plan.final_room_index]
+            exit_spawn = ExitSpawn(
+                exit_id=f"exit-{self.seed}",
+                x=final_room.center[0] + 0.5,
+                y=final_room.center[1] + 0.5,
+                required_door_id=locked_doors[-1].door_id,
+            )
         if exit_spawn is None:
             return None
-        if not self._validate_progression_layout(
-            tiles,
-            rooms,
-            spawn,
-            progression,
-            locked_doors,
-            key_spawns,
-            exit_spawn,
-        ):
-            return None
-
         loot_spawns = self._generate_loot_spawns(
             tiles,
             stair_mask,
+            sector_types,
             rooms,
             spawn,
             [(key.x, key.y) for key in key_spawns],
@@ -422,6 +667,7 @@ class MapGenerator:
         enemy_spawns, guard_enemy_id = self._generate_enemy_spawns(
             tiles,
             stair_mask,
+            sector_types,
             rooms,
             spawn,
             enemy_reserved_positions,
@@ -436,91 +682,289 @@ class MapGenerator:
                     orientation=door.orientation,
                     door_type=door.door_type,
                     guard_enemy_id=guard_enemy_id if door.door_id == boss_guard_plan.guarded_door_id else door.guard_enemy_id,
+                    required_trigger_id=door.required_trigger_id,
+                    locked_message=door.locked_message,
+                    secret=door.secret,
                 )
                 for door in door_spawns
             ]
 
-        return GeneratedMap(
+        door_spawns, enemy_spawns, room_metadata, progression_beats, switch_spawns, trigger_spawns, secret_spawns, encounter_events, macro_layout_type = self._build_dynamic_layer(
+            rooms,
+            progression,
+            route_plan,
+            connections,
+            tiles,
+            stair_mask,
+            sector_types,
+            spawn,
+            key_spawns,
+            door_spawns,
+            enemy_spawns,
+            exit_spawn,
+        )
+        validation_report = self._build_validation_report(
+            progression_valid=self._validate_progression_layout(
+                tiles,
+                rooms,
+                spawn,
+                progression,
+                door_spawns,
+                key_spawns,
+                exit_spawn,
+            ),
+            rooms=rooms,
+            progression=progression,
+            room_metadata=room_metadata,
+            connections=connections,
+            route_plan=route_plan,
+            spawn=spawn,
+            tiles=tiles,
+            sector_types=sector_types,
+            door_spawns=door_spawns,
+            key_spawns=key_spawns,
+            exit_spawn=exit_spawn,
+            encounter_events=encounter_events,
+            secret_spawns=secret_spawns,
+        )
+        quality_report = self._build_quality_score(
+            room_metadata,
+            encounter_events,
+            validation_report,
+            route_plan,
+            self._key_occlusion_score(rooms, tiles, key_spawns),
+        )
+
+        return self._build_generated_map(
             tiles=tiles,
             floor_heights=floor_heights,
+            ceiling_heights=ceiling_heights,
             stair_mask=stair_mask,
             room_kinds=room_kinds,
+            sector_types=sector_types,
             loot_spawns=loot_spawns,
             enemy_spawns=enemy_spawns,
             door_spawns=door_spawns,
             key_spawns=key_spawns,
             exit_spawn=exit_spawn,
             spawn=spawn,
-            seed=self.seed,
+            macro_layout_type=macro_layout_type,
+            route_plan=route_plan,
+            room_metadata=room_metadata,
+            progression_beats=progression_beats,
+            switch_spawns=switch_spawns,
+            trigger_spawns=trigger_spawns,
+            secret_spawns=secret_spawns,
+            encounter_events=encounter_events,
+            validation_report=validation_report,
+            quality_report=quality_report,
         )
 
     def _generate_rooms_and_corridors(
         self,
         tiles: list[list[int]],
         floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
         stair_mask: list[list[int]],
         room_kinds: list[list[int]],
+        sector_types: list[list[int]],
     ) -> LayoutPlan | None:
-        rooms: list[Room] = []
-        target_rooms = settings.MIN_PROGRESSION_ROOMS
-
-        for _ in range(settings.MAX_ROOMS * 6):
-            room = self._random_room(len(rooms))
-            if any(room.intersects(other) for other in rooms):
-                continue
-            self._carve_room(tiles, floor_heights, room_kinds, room)
-            rooms.append(room)
-            if len(rooms) >= target_rooms:
-                break
+        route_plan = self._build_macro_route_plan()
+        if self.generation_request is not None:
+            template_variant = get_skeleton_profile(self.generation_request.skeleton_profile_id).template_variant
+        else:
+            macro_footprint = self.rng.choice(("spine", "staggered", "pockets"))
+            footprint_variant = self.rng.choice(("tight", "balanced", "wide"))
+            corridor_variant = self.rng.choice(("direct", "dogleg"))
+            mirror_variant = self.rng.choice(("base", "mirror_x", "mirror_y", "mirror_xy"))
+            template_variant = f"{macro_footprint}:{footprint_variant}:{corridor_variant}:{mirror_variant}"
+        rooms = self._build_template_rooms(route_plan, template_variant)
+        if rooms is None:
+            return None
+        for room in rooms:
+            self._carve_room(tiles, floor_heights, ceiling_heights, room_kinds, sector_types, room)
 
         if len(rooms) < settings.MIN_PROGRESSION_ROOMS:
             return None
 
-        progression = self._plan_progression_layout(rooms)
+        progression = self._plan_progression_layout(route_plan)
         if progression is None:
             return None
-        return LayoutPlan(rooms=tuple(rooms), progression=progression)
+        return LayoutPlan(
+            rooms=tuple(rooms),
+            progression=progression,
+            route_plan=route_plan,
+            template_variant=template_variant,
+        )
 
-    def _plan_progression_layout(self, rooms: list[Room]) -> ProgressionLayout | None:
-        room_count = len(rooms)
+    def _build_macro_route_plan(self) -> MacroRoutePlan:
+        if self.generation_request is not None:
+            skeleton_profile_id = self.generation_request.skeleton_profile_id
+            layout_type = get_skeleton_profile(skeleton_profile_id).macro_layout_type
+        else:
+            skeleton_profile_id = self.rng.choice(
+                (
+                    "intro_hub_spokes",
+                    "double_ring_circulation",
+                    "split_fork_reconverge",
+                    "perimeter_inward_push",
+                )
+            )
+            layout_type = get_skeleton_profile(skeleton_profile_id).macro_layout_type
+
+        route_variants: dict[str, tuple[str, dict[int, tuple[str, str]], tuple[int, ...], tuple[int, ...], tuple[tuple[int, int], ...], tuple[tuple[int, int, str], ...]]] = {
+            "intro_hub_spokes": (
+                "hub_spoke",
+                {
+                    1: (ROOM_ROLE_VISTA, "shrine"),
+                    3: (ROOM_ROLE_RETURN_ROUTE, "tech"),
+                    4: (ROOM_ROLE_SWITCH_ROOM, "tech"),
+                    6: (ROOM_ROLE_SHORTCUT_HALL, "storage"),
+                    7: (ROOM_ROLE_VISTA, "shrine"),
+                    8: (ROOM_ROLE_PRESSURE_CORRIDOR, "tech"),
+                },
+                (1, 7),
+                (3, 8),
+                ((0, 2), (7, 9)),
+                ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
+            ),
+            "double_ring_circulation": (
+                "double_loop",
+                {
+                    1: (ROOM_ROLE_VISTA, "shrine"),
+                    3: (ROOM_ROLE_RETURN_ROUTE, "tech"),
+                    4: (ROOM_ROLE_PRESSURE_CORRIDOR, "tech"),
+                    6: (ROOM_ROLE_AMBUSH_ROOM, "cross"),
+                    7: (ROOM_ROLE_RETURN_ROUTE, "tech"),
+                    8: (ROOM_ROLE_VISTA, "shrine"),
+                },
+                (1, 8),
+                (3, 7),
+                ((0, 2), (7, 9)),
+                ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
+            ),
+            "split_fork_reconverge": (
+                "fork_return",
+                {
+                    1: (ROOM_ROLE_VISTA, "shrine"),
+                    3: (ROOM_ROLE_RETURN_ROUTE, "storage"),
+                    4: (ROOM_ROLE_SWITCH_ROOM, "tech"),
+                    6: (ROOM_ROLE_SHORTCUT_HALL, "tech"),
+                    7: (ROOM_ROLE_RETURN_ROUTE, "tech"),
+                    8: (ROOM_ROLE_VISTA, "cross"),
+                },
+                (1, 8),
+                (3, 7),
+                ((0, 2), (7, 9)),
+                ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
+            ),
+            "perimeter_inward_push": (
+                "loop_spoke",
+                {
+                    1: (ROOM_ROLE_PRESSURE_CORRIDOR, "tech"),
+                    2: (ROOM_ROLE_KEY_ROOM, "storage"),
+                    3: (ROOM_ROLE_VISTA, "shrine"),
+                    4: (ROOM_ROLE_PRESSURE_CORRIDOR, "cross"),
+                    6: (ROOM_ROLE_AMBUSH_ROOM, "arena"),
+                    7: (ROOM_ROLE_RETURN_ROUTE, "tech"),
+                    8: (ROOM_ROLE_VISTA, "shrine"),
+                },
+                (3, 8),
+                (4, 7),
+                ((0, 2), (2, 5), (5, 8), (7, 9)),
+                ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
+            ),
+            "two_hub_finale": (
+                "two_hub",
+                {
+                    1: (ROOM_ROLE_VISTA, "shrine"),
+                    3: (ROOM_ROLE_SWITCH_ROOM, "tech"),
+                    4: (ROOM_ROLE_RETURN_ROUTE, "tech"),
+                    6: (ROOM_ROLE_AMBUSH_ROOM, "arena"),
+                    7: (ROOM_ROLE_SHORTCUT_HALL, "cross"),
+                    8: (ROOM_ROLE_RETURN_ROUTE, "tech"),
+                },
+                (1, 8),
+                (4, 8),
+                ((0, 2), (2, 4), (5, 7), (7, 9)),
+                ((2, 5, "pickup:blue"), (4, 8, "switch:stage1"), (6, 9, "pickup:yellow")),
+            ),
+        }
+        layout_type, role_overrides, vista_rooms, return_rooms, layout_loops, shortcut_specs = route_variants[skeleton_profile_id]
+        base_nodes = (
+            (0, 0, ROOM_ROLE_START, "start", 0, False),
+            (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+            (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
+            (3, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+            (4, 1, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+            (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+            (6, 1, ROOM_ROLE_AMBUSH_ROOM, "tech", 3, False),
+            (7, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+            (8, 2, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+            (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+            (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+        )
+        nodes = tuple(
+            MacroRouteNode(
+                room_index,
+                stage_index,
+                role_overrides.get(room_index, (role_hint, kind_hint))[0],
+                role_overrides.get(room_index, (role_hint, kind_hint))[1],
+                branch_slot=branch_slot,
+                requires_vista=requires_vista or room_index in vista_rooms,
+            )
+            for room_index, stage_index, role_hint, kind_hint, branch_slot, requires_vista in base_nodes
+        )
+
+        edges: list[MacroRouteEdge] = []
+        for room_a_index, room_b_index in ((0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10)):
+            edges.append(
+                MacroRouteEdge(
+                    edge_id=f"main:{room_a_index}:{room_b_index}",
+                    room_a_index=room_a_index,
+                    room_b_index=room_b_index,
+                    edge_kind=EDGE_MAIN,
+                )
+            )
+
+        for room_a_index, room_b_index in layout_loops:
+            edges.append(
+                MacroRouteEdge(
+                    edge_id=f"loop:{room_a_index}:{room_b_index}",
+                    room_a_index=room_a_index,
+                    room_b_index=room_b_index,
+                    edge_kind=EDGE_LOOP,
+                    note="meaningful_loop",
+                )
+            )
+
+        for room_a_index, room_b_index, trigger_source in shortcut_specs:
+            edges.append(
+                MacroRouteEdge(
+                    edge_id=f"shortcut:{room_a_index}:{room_b_index}",
+                    room_a_index=room_a_index,
+                    room_b_index=room_b_index,
+                    edge_kind=EDGE_SHORTCUT,
+                    trigger_source=trigger_source,
+                    note="return_shortcut",
+                )
+            )
+
+        return MacroRoutePlan(
+            layout_type=layout_type,
+            nodes=nodes,
+            edges=tuple(edges),
+            key_room_indices=(2, 5, 9),
+            return_room_indices=return_rooms,
+            final_room_index=10,
+            vista_room_indices=vista_rooms,
+        )
+
+    def _plan_progression_layout(self, route_plan: MacroRoutePlan) -> ProgressionLayout | None:
+        room_count = len(route_plan.nodes)
         if room_count < settings.MIN_PROGRESSION_ROOMS:
             return None
-
-        candidate_boundaries: list[tuple[float, tuple[int, int, int]]] = []
-        quarter_targets = (
-            max(3, room_count // 3),
-            max(5, (room_count * 2) // 3),
-            max(6, room_count - 2),
-        )
-        for blue_boundary in range(3, room_count - 3):
-            for yellow_boundary in range(blue_boundary + 2, room_count - 1):
-                for red_boundary in range(yellow_boundary + 2, room_count):
-                    if room_count - red_boundary < 1:
-                        continue
-                    score = (
-                        abs(blue_boundary - quarter_targets[0]) * 1.2
-                        + abs(yellow_boundary - quarter_targets[1]) * 1.4
-                        + abs(red_boundary - quarter_targets[2]) * 1.6
-                        + self.rng.random() * 0.25
-                    )
-                    candidate_boundaries.append((score, (blue_boundary, yellow_boundary, red_boundary)))
-        if not candidate_boundaries:
-            return None
-
-        candidate_boundaries.sort(key=lambda item: item[0])
-        _, boundaries = candidate_boundaries[0]
-        blue_boundary, yellow_boundary, red_boundary = boundaries
-
-        room_stages: list[int] = []
-        for room_index in range(room_count):
-            if room_index < blue_boundary:
-                room_stages.append(0)
-            elif room_index < yellow_boundary:
-                room_stages.append(1)
-            elif room_index < red_boundary:
-                room_stages.append(2)
-            else:
-                room_stages.append(3)
+        room_stages = [node.stage_index for node in route_plan.nodes]
 
         stage_rooms = tuple(
             tuple(room_index for room_index, stage in enumerate(room_stages) if stage == stage_index)
@@ -534,26 +978,37 @@ class MapGenerator:
         ):
             return None
 
+        boundary_edge_lookup: dict[int, int] = {}
+        for edge_index, edge in enumerate(route_plan.edges):
+            if edge.edge_kind != EDGE_MAIN:
+                continue
+            stage_a = room_stages[edge.room_a_index]
+            stage_b = room_stages[edge.room_b_index]
+            if stage_b == stage_a + 1:
+                boundary_edge_lookup[stage_a] = edge_index
+        if set(boundary_edge_lookup) != {0, 1, 2}:
+            return None
+
         gate_plans = (
             ProgressionGatePlan(
                 key_type="blue",
                 stage_index=0,
-                connection_index=blue_boundary - 1,
-                key_room_candidates=tuple(room_index for room_index in stage_rooms[0] if room_index != 0),
+                connection_index=boundary_edge_lookup[0],
+                key_room_candidates=(route_plan.key_room_indices[0],),
                 blocked_room_indices=tuple(room_index for room_index, stage in enumerate(room_stages) if stage > 0),
             ),
             ProgressionGatePlan(
                 key_type="yellow",
                 stage_index=1,
-                connection_index=yellow_boundary - 1,
-                key_room_candidates=stage_rooms[1],
+                connection_index=boundary_edge_lookup[1],
+                key_room_candidates=(route_plan.key_room_indices[1],),
                 blocked_room_indices=tuple(room_index for room_index, stage in enumerate(room_stages) if stage > 1),
             ),
             ProgressionGatePlan(
                 key_type="red",
                 stage_index=2,
-                connection_index=red_boundary - 1,
-                key_room_candidates=stage_rooms[2],
+                connection_index=boundary_edge_lookup[2],
+                key_room_candidates=(route_plan.key_room_indices[2],),
                 blocked_room_indices=stage_rooms[3],
             ),
         )
@@ -566,48 +1021,650 @@ class MapGenerator:
             gate_plans=gate_plans,
         )
 
-    def _random_room(self, index: int) -> Room:
-        kind = self._room_kind_for_index(index)
+    def _build_template_rooms(self, route_plan: MacroRoutePlan, template_variant: str) -> list[Room] | None:
+        base_rooms_by_layout: dict[str, dict[str, tuple[tuple[int, int, int, int], ...]]] = {
+            "hub_spoke": {
+                "spine": (
+                    (2, 4, 6, 6), (11, 4, 7, 6), (20, 4, 7, 6), (29, 4, 6, 6), (29, 13, 6, 7),
+                    (20, 13, 7, 7), (11, 13, 7, 6), (2, 13, 6, 6), (2, 24, 7, 6), (11, 24, 7, 6), (24, 24, 7, 7),
+                ),
+                "staggered": (
+                    (2, 3, 7, 7), (10, 4, 8, 6), (20, 3, 7, 7), (28, 4, 7, 6), (28, 12, 7, 7),
+                    (20, 14, 7, 6), (10, 12, 8, 7), (2, 14, 7, 6), (3, 24, 6, 7), (12, 23, 7, 7), (24, 24, 8, 7),
+                ),
+                "pockets": (
+                    (3, 4, 6, 6), (11, 3, 7, 7), (21, 4, 6, 6), (29, 3, 6, 7), (28, 13, 7, 6),
+                    (20, 12, 7, 7), (11, 13, 6, 7), (2, 12, 7, 7), (2, 24, 6, 6), (12, 24, 7, 6), (23, 23, 8, 8),
+                ),
+            },
+            "loop_spoke": {
+                "spine": (
+                    (2, 3, 7, 7), (11, 4, 6, 6), (20, 4, 6, 6), (29, 3, 6, 7), (29, 13, 6, 6),
+                    (20, 13, 6, 7), (11, 13, 6, 6), (2, 13, 7, 6), (2, 24, 6, 7), (11, 24, 6, 6), (24, 24, 7, 7),
+                ),
+                "staggered": (
+                    (2, 4, 6, 6), (10, 3, 7, 7), (20, 3, 7, 7), (28, 4, 7, 6), (29, 12, 6, 7),
+                    (20, 14, 7, 6), (11, 12, 7, 7), (2, 14, 6, 6), (3, 24, 6, 7), (11, 23, 7, 7), (23, 24, 8, 7),
+                ),
+                "pockets": (
+                    (3, 3, 7, 7), (11, 4, 7, 6), (20, 4, 7, 6), (29, 4, 6, 6), (28, 13, 7, 6),
+                    (21, 12, 6, 7), (10, 13, 7, 6), (2, 12, 7, 7), (2, 24, 7, 6), (12, 24, 6, 6), (24, 23, 8, 8),
+                ),
+                "perimeter": (
+                    (3, 3, 7, 7), (14, 2, 7, 6), (26, 3, 7, 7), (29, 12, 6, 7), (26, 24, 7, 7),
+                    (14, 28, 7, 6), (3, 24, 7, 7), (1, 13, 7, 6), (8, 14, 6, 6), (21, 14, 6, 6), (15, 13, 6, 8),
+                ),
+            },
+            "fork_return": {
+                "spine": (
+                    (2, 4, 6, 6), (11, 3, 7, 7), (20, 4, 6, 6), (29, 4, 6, 6), (29, 13, 6, 6),
+                    (20, 12, 7, 7), (11, 13, 6, 6), (2, 13, 6, 7), (2, 24, 6, 6), (11, 23, 7, 7), (24, 24, 7, 7),
+                ),
+                "staggered": (
+                    (2, 3, 7, 7), (10, 3, 8, 7), (20, 4, 7, 6), (28, 3, 7, 7), (28, 13, 7, 6),
+                    (20, 13, 7, 7), (11, 12, 7, 7), (2, 14, 7, 6), (3, 24, 6, 6), (11, 24, 8, 6), (23, 23, 8, 8),
+                ),
+                "pockets": (
+                    (3, 4, 6, 6), (11, 3, 7, 7), (21, 4, 6, 6), (29, 4, 6, 6), (29, 12, 6, 7),
+                    (20, 12, 7, 7), (10, 13, 7, 6), (2, 13, 7, 7), (2, 24, 7, 6), (12, 23, 7, 7), (24, 24, 8, 7),
+                ),
+            },
+            "double_loop": {
+                "spine": (
+                    (2, 4, 7, 6), (11, 4, 6, 6), (20, 3, 7, 7), (29, 4, 6, 6), (29, 13, 6, 7),
+                    (20, 13, 7, 6), (11, 12, 6, 7), (2, 13, 7, 6), (2, 24, 6, 6), (11, 24, 7, 6), (24, 23, 8, 8),
+                ),
+                "staggered": (
+                    (2, 3, 7, 7), (10, 4, 7, 6), (20, 3, 8, 7), (28, 4, 7, 6), (28, 13, 7, 7),
+                    (20, 14, 7, 6), (10, 12, 7, 7), (2, 14, 7, 6), (3, 24, 6, 7), (11, 24, 7, 6), (23, 23, 8, 8),
+                ),
+                "pockets": (
+                    (3, 4, 7, 6), (11, 3, 7, 7), (21, 3, 7, 7), (29, 4, 6, 6), (28, 13, 7, 7),
+                    (20, 12, 7, 7), (10, 12, 7, 7), (2, 13, 7, 6), (2, 24, 7, 6), (12, 24, 7, 6), (24, 23, 8, 8),
+                ),
+            },
+            "two_hub": {
+                "twinhub": (
+                    (3, 4, 7, 7), (14, 3, 7, 7), (25, 4, 7, 7), (28, 13, 7, 7), (24, 24, 7, 7),
+                    (13, 24, 7, 7), (3, 23, 7, 8), (2, 13, 7, 7), (9, 13, 6, 7), (21, 13, 6, 7), (15, 11, 6, 10),
+                ),
+            },
+        }
+        macro_footprint, footprint_variant, _, mirror_variant = template_variant.split(":", 3)
+        layout_packs = base_rooms_by_layout.get(route_plan.layout_type, base_rooms_by_layout["hub_spoke"])
+        fallback_pack = layout_packs.get("spine")
+        if fallback_pack is None:
+            fallback_pack = next(iter(layout_packs.values()))
+        base_rooms = layout_packs.get(macro_footprint, fallback_pack)
+        if len(base_rooms) < len(route_plan.nodes):
+            return None
+        mirror_x = "mirror_x" in mirror_variant
+        mirror_y = "mirror_y" in mirror_variant
+
+        rooms: list[Room] = []
+        preserve_base_dimensions = self.generation_request is not None
+        for node in route_plan.nodes:
+            room_x, room_y, room_w, room_h = base_rooms[node.room_index]
+            shape_family, spatial_archetype, ceiling_height = self._choose_room_profile(node)
+            if not preserve_base_dimensions:
+                room_w, room_h = self._adjust_room_footprint(node, room_w, room_h, footprint_variant)
+                room_w, room_h = self._shape_size_adjustment(shape_family, room_w, room_h)
+            if mirror_x:
+                room_x = self.width - room_x - room_w
+            if mirror_y:
+                room_y = self.height - room_y - room_h
+            room_x = max(1, min(room_x, self.width - room_w - 1))
+            room_y = max(1, min(room_y, self.height - room_h - 1))
+            room = Room(
+                room_x,
+                room_y,
+                room_w,
+                room_h,
+                node.kind_hint,
+                0,
+                shape_family,
+                spatial_archetype,
+                ceiling_height,
+            )
+            if any(room.intersects(other, padding=0) for other in rooms):
+                return None
+            rooms.append(room)
+        return rooms
+
+    def _choose_room_profile(self, node: MacroRouteNode) -> tuple[str, str, int]:
+        if self.generation_request is not None:
+            archetype_id = self._campaign_archetype_id()
+            if node.role_hint == ROOM_ROLE_START:
+                if archetype_id == "tech_base":
+                    pool = (
+                        ("rectangular", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                    )
+                elif archetype_id == "relay_station":
+                    pool = (
+                        ("rectangular", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                        ("offset_rect", ARCHETYPE_GRAND_CHAMBER, 2),
+                    )
+                elif archetype_id == "waste_plant":
+                    pool = (
+                        ("rectangular", ARCHETYPE_TOXIC_CANALS, 2),
+                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                    )
+                elif archetype_id == "outer_ring":
+                    pool = (
+                        ("rectangular", ARCHETYPE_GRAND_CHAMBER, 3),
+                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                    )
+                else:
+                    pool = (
+                        ("rectangular", ARCHETYPE_GRAND_CHAMBER, 3),
+                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                    )
+            elif node.role_hint == ROOM_ROLE_VISTA:
+                if archetype_id == "waste_plant":
+                    pool = (
+                        ("cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
+                        ("ring_like", ARCHETYPE_TOXIC_CANALS, 3),
+                        ("offset_rect", ARCHETYPE_OVERLOOK_VISTA, 2),
+                    )
+                elif archetype_id in {"outer_ring", "shrine_fortress"}:
+                    pool = (
+                        ("cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
+                        ("ring_like", ARCHETYPE_GRAND_CHAMBER, 4),
+                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 3),
+                    )
+                else:
+                    pool = (
+                        ("cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
+                        ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 3),
+                        ("offset_rect", ARCHETYPE_OVERLOOK_VISTA, 2),
+                    )
+            elif node.role_hint == ROOM_ROLE_KEY_ROOM:
+                if node.stage_index == 0:
+                    if archetype_id == "waste_plant":
+                        pool = (
+                            ("pit_with_walkway", ARCHETYPE_TOXIC_CANALS, 2),
+                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
+                            ("cut_corner", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+                        )
+                    elif archetype_id == "relay_station":
+                        pool = (
+                            ("pit_with_walkway", ARCHETYPE_BRIDGE_CROSSING, 2),
+                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
+                            ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                        )
+                    else:
+                        pool = (
+                            ("pit_with_walkway", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
+                            ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                        )
+                else:
+                    if archetype_id == "waste_plant":
+                        pool = (
+                            ("central_island", ARCHETYPE_TOXIC_CANALS, 2),
+                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
+                            ("bridge_room", ARCHETYPE_TOXIC_CANALS, 2),
+                        )
+                    elif archetype_id in {"outer_ring", "shrine_fortress"}:
+                        pool = (
+                            ("central_island", ARCHETYPE_SPLIT_ARENA, 3),
+                            ("raised_platform", ARCHETYPE_GRAND_CHAMBER, 3),
+                            ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
+                        )
+                    else:
+                        pool = (
+                            ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
+                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
+                            ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
+                        )
+            elif node.role_hint == ROOM_ROLE_RETURN_ROUTE:
+                if archetype_id == "waste_plant":
+                    pool = (
+                        ("bridge_room", ARCHETYPE_TOXIC_CANALS, 2),
+                        ("offset_rect", ARCHETYPE_TOXIC_CANALS, 1),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                    )
+                elif archetype_id in {"outer_ring", "shrine_fortress"}:
+                    pool = (
+                        ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
+                        ("offset_rect", ARCHETYPE_GRAND_CHAMBER, 2),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                    )
+                else:
+                    pool = (
+                        ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
+                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                    )
+            elif node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_PRESSURE_CORRIDOR}:
+                if archetype_id == "tech_base":
+                    pool = (
+                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
+                        ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+                    )
+                elif archetype_id == "relay_station":
+                    pool = (
+                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
+                        ("central_island", ARCHETYPE_BRIDGE_CROSSING, 2),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                        ("offset_rect", ARCHETYPE_GRAND_CHAMBER, 2),
+                    )
+                elif archetype_id == "waste_plant":
+                    pool = (
+                        ("split_by_pillar_line", ARCHETYPE_TOXIC_CANALS, 2),
+                        ("central_island", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                        ("offset_rect", ARCHETYPE_TOXIC_CANALS, 1),
+                    )
+                elif archetype_id == "outer_ring":
+                    pool = (
+                        ("split_by_pillar_line", ARCHETYPE_GRAND_CHAMBER, 3),
+                        ("central_island", ARCHETYPE_SPLIT_ARENA, 3),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                        ("offset_rect", ARCHETYPE_BRIDGE_CROSSING, 2),
+                    )
+                else:
+                    pool = (
+                        ("split_by_pillar_line", ARCHETYPE_GRAND_CHAMBER, 3),
+                        ("central_island", ARCHETYPE_SPLIT_ARENA, 3),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                    )
+            elif node.role_hint == ROOM_ROLE_FINAL_ROOM:
+                if archetype_id == "waste_plant":
+                    pool = (
+                        ("split_by_pillar_line", ARCHETYPE_TOXIC_CANALS, 3),
+                        ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 3),
+                        ("bridge_room", ARCHETYPE_TOXIC_PIT_ROOM, 3),
+                    )
+                elif archetype_id in {"outer_ring", "shrine_fortress"}:
+                    pool = (
+                        ("split_by_pillar_line", ARCHETYPE_GRAND_CHAMBER, 4),
+                        ("raised_platform", ARCHETYPE_GRAND_CHAMBER, 4),
+                        ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
+                    )
+                else:
+                    pool = (
+                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 3),
+                        ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 3),
+                        ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
+                    )
+            elif node.kind_hint == "shrine":
+                if archetype_id == "shrine_fortress":
+                    pool = (
+                        ("cut_corner", ARCHETYPE_GRAND_CHAMBER, 3),
+                        ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 3),
+                    )
+                else:
+                    pool = (
+                        ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                        ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                    )
+            elif node.kind_hint == "arena":
+                if archetype_id == "waste_plant":
+                    pool = (
+                        ("central_island", ARCHETYPE_TOXIC_CANALS, 2),
+                        ("split_by_pillar_line", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+                    )
+                elif archetype_id in {"outer_ring", "shrine_fortress"}:
+                    pool = (
+                        ("central_island", ARCHETYPE_GRAND_CHAMBER, 3),
+                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 3),
+                    )
+                else:
+                    pool = (
+                        ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
+                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
+                    )
+            else:
+                if archetype_id == "waste_plant":
+                    pool = (
+                        ("rectangular", ARCHETYPE_TOXIC_CANALS, 1),
+                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                    )
+                elif archetype_id in {"outer_ring", "shrine_fortress"}:
+                    pool = (
+                        ("rectangular", ARCHETYPE_GRAND_CHAMBER, 2),
+                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                    )
+                else:
+                    pool = (
+                        ("rectangular", "standard", 1),
+                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                    )
+            return pool[(node.room_index + self.rng.randrange(len(pool))) % len(pool)]
+
+        if node.role_hint == ROOM_ROLE_START:
+            pool = (
+                ("rectangular", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                ("side_bays", ARCHETYPE_GRAND_CHAMBER, 3),
+            )
+        elif node.role_hint == ROOM_ROLE_VISTA:
+            pool = (
+                ("cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
+                ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 3),
+                ("offset_rect", ARCHETYPE_OVERLOOK_VISTA, 2),
+                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 4),
+            )
+        elif node.role_hint == ROOM_ROLE_KEY_ROOM:
+            if node.stage_index == 0:
+                pool = (
+                    ("pit_with_walkway", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+                    ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
+                    ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                    ("ring_like", ARCHETYPE_ACID_RING, 2),
+                )
+            else:
+                pool = (
+                    ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
+                    ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
+                    ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
+                    ("side_bays", ARCHETYPE_TOXIC_CANALS, 3),
+                )
+        elif node.role_hint == ROOM_ROLE_RETURN_ROUTE:
+            pool = (
+                ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
+                ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+                ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                ("side_bays", ARCHETYPE_TOXIC_CANALS, 2),
+            )
+        elif node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_PRESSURE_CORRIDOR}:
+            pool = (
+                ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
+                ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
+                ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 3),
+                ("ring_like", ARCHETYPE_ACID_RING, 2),
+            )
+        elif node.role_hint == ROOM_ROLE_FINAL_ROOM:
+            pool = (
+                ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 3),
+                ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 3),
+                ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
+                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 4),
+                ("ring_like", ARCHETYPE_ACID_RING, 3),
+            )
+        elif node.kind_hint == "shrine":
+            pool = (
+                ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 2),
+                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 3),
+            )
+        elif node.kind_hint == "arena":
+            pool = (
+                ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
+                ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
+                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 3),
+                ("side_bays", ARCHETYPE_TOXIC_CANALS, 2),
+            )
+        else:
+            pool = (
+                ("rectangular", "standard", 1),
+                ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+                ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+                ("side_bays", ARCHETYPE_GRAND_CHAMBER, 2),
+            )
+        return pool[(node.room_index + self.rng.randrange(len(pool))) % len(pool)]
+
+    def _shape_size_adjustment(self, shape_family: str, width: int, height: int) -> tuple[int, int]:
+        if shape_family in {"ring_like", "bridge_room", "pit_with_walkway", "side_bays"}:
+            return (max(width, 7), max(height, 7))
+        if shape_family in {"split_by_pillar_line", "raised_platform", "corner_pillars"}:
+            return (max(width, 6), max(height, 6))
+        return (width, height)
+
+    def _build_template_connections(
+        self,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room_kinds: list[list[int]],
+        sector_types: list[list[int]],
+        route_plan: MacroRoutePlan,
+        template_variant: str,
+    ) -> list[CorridorConnection] | None:
+        _, _, corridor_variant, mirror_variant = template_variant.split(":", 3)
+        segment_map, explicit_doors = self._segment_profile(route_plan.layout_type, corridor_variant)
+        mirror_x = "mirror_x" in mirror_variant
+        mirror_y = "mirror_y" in mirror_variant
+
+        def transform_segment(segment: tuple[str, int, int, int]) -> tuple[str, int, int, int]:
+            axis, start, end, fixed = segment
+            if axis == "h":
+                if mirror_x:
+                    start, end = sorted((self.width - 1 - start, self.width - 1 - end))
+                if mirror_y:
+                    fixed = self.height - 1 - fixed
+            else:
+                if mirror_y:
+                    start, end = sorted((self.height - 1 - start, self.height - 1 - end))
+                if mirror_x:
+                    fixed = self.width - 1 - fixed
+            return (axis, start, end, fixed)
+
+        def transform_door(door: tuple[int, int, str]) -> tuple[int, int, str]:
+            door_x, door_y, orientation = door
+            if mirror_x:
+                door_x = self.width - 1 - door_x
+            if mirror_y:
+                door_y = self.height - 1 - door_y
+            return (door_x, door_y, orientation)
+
+        connections: list[CorridorConnection] = []
+        for edge in route_plan.edges:
+            segments = segment_map.get(edge.edge_id)
+            if segments is None:
+                return None
+            path: list[tuple[int, int]] = []
+            transformed_segments = [transform_segment(segment) for segment in segments]
+            for axis, start, end, fixed in transformed_segments:
+                if axis == "h":
+                    path.extend(self._carve_h_corridor(tiles, start, end, fixed, widen_chance=0.0))
+                else:
+                    path.extend(self._carve_v_corridor(tiles, start, end, fixed, widen_chance=0.0))
+                self._assign_path_heights(path, floor_heights, ceiling_heights, stair_mask, room_kinds, sector_types)
+            door_candidate = explicit_doors.get(edge.edge_id)
+            if door_candidate is not None:
+                door_candidate = transform_door(door_candidate)
+            connections.append(
+                CorridorConnection(
+                    index=len(connections),
+                    room_a_index=edge.room_a_index,
+                    room_b_index=edge.room_b_index,
+                    path=path,
+                    is_main_path=edge.edge_kind == EDGE_MAIN,
+                    door_candidate=door_candidate,
+                    edge_kind=edge.edge_kind,
+                    trigger_source=edge.trigger_source,
+                )
+            )
+        return connections
+
+    def _segment_profile(
+        self,
+        layout_type: str,
+        corridor_variant: str,
+    ) -> tuple[dict[str, list[tuple[str, int, int, int]]], dict[str, tuple[int, int, str]]]:
+        if corridor_variant == "perimeter":
+            perimeter_segments: dict[str, list[tuple[str, int, int, int]]] = {
+                "main:0:1": [("h", 10, 13, 6)],
+                "main:1:2": [("h", 20, 24, 6)],
+                "main:2:3": [("v", 10, 14, 31)],
+                "main:3:4": [("v", 19, 23, 28)],
+                "main:4:5": [("h", 20, 24, 27)],
+                "main:5:6": [("h", 10, 13, 27)],
+                "main:6:7": [("v", 16, 20, 6)],
+                "main:7:8": [("h", 8, 10, 16)],
+                "main:8:9": [("h", 16, 20, 16)],
+                "main:9:10": [("h", 19, 22, 16)],
+                "loop:0:2": [("h", 8, 28, 10)],
+                "loop:2:5": [("v", 10, 26, 24)],
+                "loop:5:8": [("h", 10, 20, 22)],
+                "loop:7:9": [("h", 6, 22, 19)],
+                "shortcut:2:5": [("v", 10, 23, 28)],
+                "shortcut:6:9": [("h", 9, 20, 24)],
+            }
+            perimeter_doors: dict[str, tuple[int, int, str]] = {
+                "main:2:3": (31, 14, "horizontal"),
+                "main:6:7": (6, 18, "horizontal"),
+                "main:9:10": (22, 16, "vertical"),
+                "shortcut:2:5": (28, 18, "horizontal"),
+                "shortcut:6:9": (15, 24, "vertical"),
+            }
+            return perimeter_segments, perimeter_doors
+
+        if corridor_variant == "twohub" or layout_type == "two_hub":
+            twohub_segments: dict[str, list[tuple[str, int, int, int]]] = {
+                "main:0:1": [("h", 10, 13, 7)],
+                "main:1:2": [("h", 20, 24, 7)],
+                "main:2:3": [("v", 10, 14, 31)],
+                "main:3:4": [("v", 20, 23, 28)],
+                "main:4:5": [("h", 19, 21, 27)],
+                "main:5:6": [("h", 10, 12, 27)],
+                "main:6:7": [("v", 16, 23, 6)],
+                "main:7:8": [("h", 9, 11, 16)],
+                "main:8:9": [("h", 18, 21, 16)],
+                "main:9:10": [("h", 18, 21, 16)],
+                "loop:0:2": [("h", 10, 24, 11)],
+                "loop:2:4": [("v", 10, 24, 27)],
+                "loop:5:7": [("h", 6, 18, 23)],
+                "loop:7:9": [("h", 6, 21, 18)],
+                "shortcut:2:5": [("v", 11, 24, 21)],
+                "shortcut:4:8": [("h", 17, 21, 23)],
+                "shortcut:6:9": [("h", 10, 21, 20)],
+            }
+            twohub_doors: dict[str, tuple[int, int, str]] = {
+                "main:2:3": (31, 14, "horizontal"),
+                "main:6:7": (6, 18, "horizontal"),
+                "main:9:10": (18, 16, "vertical"),
+                "shortcut:2:5": (21, 18, "horizontal"),
+                "shortcut:4:8": (19, 23, "vertical"),
+                "shortcut:6:9": (15, 20, "vertical"),
+            }
+            return twohub_segments, twohub_doors
+
+        direct_segments: dict[str, list[tuple[str, int, int, int]]] = {
+            "main:0:1": [("h", 8, 10, 7)],
+            "main:1:2": [("h", 17, 19, 7)],
+            "main:2:3": [("h", 26, 28, 7)],
+            "main:3:4": [("v", 10, 12, 32)],
+            "main:4:5": [("h", 26, 28, 16)],
+            "main:5:6": [("h", 17, 19, 16)],
+            "main:6:7": [("h", 8, 10, 16)],
+            "main:7:8": [("v", 19, 23, 5)],
+            "main:8:9": [("h", 8, 10, 27)],
+            "main:9:10": [("h", 17, 23, 27)],
+            "loop:0:2": [("v", 9, 10, 5), ("h", 5, 23, 10), ("v", 9, 10, 23)],
+            "loop:7:9": [("v", 19, 22, 5), ("h", 6, 14, 22), ("v", 23, 24, 14)],
+            "shortcut:2:5": [("v", 10, 12, 23)],
+            "shortcut:4:8": [("v", 16, 23, 28), ("h", 6, 28, 23)],
+            "shortcut:6:9": [("v", 19, 23, 14)],
+        }
+        direct_doors: dict[str, tuple[int, int, str]] = {
+            "main:2:3": (27, 7, "vertical"),
+            "main:6:7": (9, 16, "vertical"),
+            "main:9:10": (23, 27, "vertical"),
+            "shortcut:2:5": (23, 11, "horizontal"),
+            "shortcut:4:8": (28, 19, "horizontal"),
+            "shortcut:6:9": (14, 21, "horizontal"),
+        }
+        if corridor_variant != "dogleg":
+            return direct_segments, direct_doors
+
+        dogleg_segments: dict[str, list[tuple[str, int, int, int]]] = {
+            "main:0:1": [("h", 8, 10, 8)],
+            "main:1:2": [("v", 7, 8, 17), ("h", 17, 19, 8)],
+            "main:2:3": [("h", 26, 28, 8)],
+            "main:3:4": [("v", 8, 10, 31), ("h", 31, 32, 10), ("v", 10, 12, 32)],
+            "main:4:5": [("h", 26, 28, 15)],
+            "main:5:6": [("v", 15, 17, 19), ("h", 17, 19, 17)],
+            "main:6:7": [("h", 8, 10, 15)],
+            "main:7:8": [("v", 16, 23, 6)],
+            "main:8:9": [("h", 8, 10, 26)],
+            "main:9:10": [("v", 26, 28, 17), ("h", 17, 23, 28)],
+            "loop:0:2": [("v", 8, 10, 6), ("h", 6, 23, 10)],
+            "loop:2:4": [("h", 23, 31, 10), ("v", 10, 15, 31)],
+            "loop:5:7": [("h", 6, 20, 22)],
+            "loop:7:9": [("v", 16, 24, 6), ("h", 6, 14, 24)],
+            "shortcut:2:5": [("v", 10, 12, 22)],
+            "shortcut:4:8": [("v", 15, 24, 29), ("h", 6, 29, 24)],
+            "shortcut:6:9": [("v", 17, 23, 14)],
+        }
+        dogleg_doors: dict[str, tuple[int, int, str]] = {
+            "main:2:3": (27, 8, "vertical"),
+            "main:6:7": (9, 15, "vertical"),
+            "main:9:10": (20, 28, "vertical"),
+            "shortcut:2:5": (22, 11, "horizontal"),
+            "shortcut:4:8": (29, 18, "horizontal"),
+            "shortcut:6:9": (14, 20, "horizontal"),
+        }
+        return dogleg_segments, dogleg_doors
+
+    def _adjust_room_footprint(
+        self,
+        node: MacroRouteNode,
+        width: int,
+        height: int,
+        footprint_variant: str,
+    ) -> tuple[int, int]:
+        if node.role_hint == ROOM_ROLE_FINAL_ROOM:
+            return (max(width, 7), max(height, 7))
+        if footprint_variant == "tight":
+            if node.kind_hint in {"storage", "tech"}:
+                width = max(6, width - 1)
+                height = max(6, height - (1 if node.branch_slot % 2 == 0 else 0))
+        elif footprint_variant == "wide":
+            if node.kind_hint in {"arena", "shrine", "cross"}:
+                width = min(width + 1, 8)
+                height = min(height + 1, 8)
+            elif node.kind_hint == "tech":
+                width = min(width + 1, 7)
+        return (width, height)
+
+    def _planned_room(self, node: MacroRouteNode, rooms: list[Room]) -> Room | None:
+        kind = node.kind_hint
         floor_height = 0
         width, height = self._room_dimensions(kind)
-        min_x, max_x, min_y, max_y = self._room_bounds_for_index(index, width, height)
-        x = self.rng.randint(min_x, max_x)
-        y = self.rng.randint(min_y, max_y)
-        return Room(x, y, width, height, kind, floor_height)
+        if node.role_hint == ROOM_ROLE_FINAL_ROOM:
+            width = min(width, 6)
+            height = min(height, 6)
+        for shrink in (0, 1, 2, 3, 4):
+            width_try = max(5, width - shrink)
+            height_try = max(5, height - shrink)
+            min_x, max_x, min_y, max_y = self._room_bounds_for_stage(node.stage_index, node.branch_slot, width_try, height_try)
+            for _ in range(settings.MAX_ROOMS * 8):
+                x = self.rng.randint(min_x, max_x)
+                y = self.rng.randint(min_y, max_y)
+                room = Room(x, y, width_try, height_try, kind, floor_height)
+                if any(room.intersects(other) for other in rooms):
+                    continue
+                return room
+        return None
 
-    def _room_kind_for_index(self, index: int) -> str:
-        if index == 0:
-            return "start"
-        if index == 1:
-            return "tech"
-        if index == 2:
-            return "shrine"
-        if index == 3:
-            return "arena"
-        if index == 4:
-            return "cross"
-        if index == 5:
-            return "tech"
-        if index == 6:
-            return "shrine"
-        return self.rng.choice(("arena", "cross", "storage", "tech"))
-
-    def _room_bounds_for_index(self, index: int, width: int, height: int) -> tuple[int, int, int, int]:
-        stage_index = 0
-        if index >= 7:
-            stage_index = 3
-        elif index >= 5:
-            stage_index = 2
-        elif index >= 3:
-            stage_index = 1
-
-        stage_regions = {
-            0: (1, max(10, self.width // 2 - 4), 1, max(10, self.height // 2 - 4)),
-            1: (max(4, self.width // 4), max(16, self.width - 10), 4, max(16, self.height - 10)),
-            2: (max(3, self.width // 5), max(16, self.width - 10), max(10, self.height // 3), self.height - 4),
-            3: (max(12, self.width // 2), self.width - 3, max(4, self.height // 5), self.height - 4),
+    def _room_bounds_for_stage(self, stage_index: int, branch_slot: int, width: int, height: int) -> tuple[int, int, int, int]:
+        anchor_centers = {
+            0: ((6, 8), (17, 8), (28, 8)),
+            1: ((30, 11), (23, 22), (15, 18), (6, 18)),
+            2: ((6, 29), (17, 29), (27, 29)),
+            3: ((30, 20),),
         }
-        min_x, max_x, min_y, max_y = stage_regions[stage_index]
+        anchors = anchor_centers[stage_index]
+        slot_index = min(branch_slot, len(anchors) - 1)
+        center_x, center_y = anchors[slot_index]
+        jitter = 2 if stage_index != 3 else 1
+        min_x = max(1, center_x - width // 2 - jitter)
+        max_x = min(self.width - width - 2, center_x - width // 2 + jitter)
+        min_y = max(1, center_y - height // 2 - jitter)
+        max_y = min(self.height - height - 2, center_y - height // 2 + jitter)
         min_x = max(1, min(min_x, self.width - width - 2))
         max_x = max(min_x, min(max_x, self.width - width - 2))
         min_y = max(1, min(min_y, self.height - height - 2))
@@ -639,7 +1696,9 @@ class MapGenerator:
         self,
         tiles: list[list[int]],
         floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
         room_kinds: list[list[int]],
+        sector_types: list[list[int]],
         room: Room,
     ) -> None:
         kind_index = ROOM_KINDS.index(room.kind)
@@ -647,14 +1706,18 @@ class MapGenerator:
             for x in range(room.x, room.x + room.width):
                 tiles[y][x] = 0
                 floor_heights[y][x] = room.floor_height
+                ceiling_heights[y][x] = room.ceiling_height
                 room_kinds[y][x] = kind_index
+                sector_types[y][x] = SECTOR_SAFE
 
     def _connect_rooms(
         self,
         tiles: list[list[int]],
         floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
         stair_mask: list[list[int]],
         room_kinds: list[list[int]],
+        sector_types: list[list[int]],
         a: Room,
         b: Room,
         widen_chance: float = 0.0,
@@ -668,7 +1731,7 @@ class MapGenerator:
             path = self._carve_v_corridor(tiles, ay, by, ax, widen_chance=widen_chance)
             path.extend(self._carve_h_corridor(tiles, ax, bx, by, widen_chance=widen_chance))
 
-        self._assign_path_heights(path, floor_heights, stair_mask, room_kinds)
+        self._assign_path_heights(path, floor_heights, ceiling_heights, stair_mask, room_kinds, sector_types)
         return path
 
     def _carve_h_corridor(
@@ -709,8 +1772,10 @@ class MapGenerator:
         self,
         path: list[tuple[int, int]],
         floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
         stair_mask: list[list[int]],
         room_kinds: list[list[int]],
+        sector_types: list[list[int]],
     ) -> None:
         seen: set[tuple[int, int]] = set()
         corridor_kind = ROOM_KINDS.index("tech")
@@ -719,15 +1784,19 @@ class MapGenerator:
                 continue
             seen.add((x, y))
             floor_heights[y][x] = 0
+            ceiling_heights[y][x] = max(ceiling_heights[y][x], 1)
             room_kinds[y][x] = corridor_kind
+            sector_types[y][x] = SECTOR_SAFE
             stair_mask[y][x] = 0
 
     def _decorate_rooms(
         self,
         tiles: list[list[int]],
         floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
         stair_mask: list[list[int]],
         room_kinds: list[list[int]],
+        sector_types: list[list[int]],
         rooms: list[Room],
     ) -> None:
         for room in rooms:
@@ -741,13 +1810,407 @@ class MapGenerator:
                 self._decorate_shrine(tiles, floor_heights, stair_mask, room_kinds, room)
             elif room.kind == "cross":
                 self._decorate_cross(tiles, room)
+            self._apply_shape_family(tiles, room)
+            self._apply_spatial_archetype(
+                tiles,
+                floor_heights,
+                ceiling_heights,
+                stair_mask,
+                room_kinds,
+                sector_types,
+                room,
+            )
 
-    def _add_side_connections(
+    def _apply_shape_family(self, tiles: list[list[int]], room: Room) -> None:
+        if room.shape_family == "cut_corner":
+            self._shape_cut_corner(tiles, room)
+            return
+        if room.shape_family == "central_island":
+            self._shape_central_island(tiles, room)
+            return
+        if room.shape_family == "ring_like":
+            self._shape_ring_like(tiles, room)
+            return
+        if room.shape_family == "split_by_pillar_line":
+            self._shape_split_by_pillar_line(tiles, room)
+            return
+        if room.shape_family == "recessed_endcap":
+            self._shape_recessed_endcap(tiles, room)
+            return
+        if room.shape_family == "offset_rect":
+            self._shape_offset_rect(tiles, room)
+            return
+        if room.shape_family == "corner_pillars":
+            self._shape_corner_pillars(tiles, room)
+            return
+        if room.shape_family == "side_bays":
+            self._shape_side_bays(tiles, room)
+
+    def _shape_cut_corner(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 6 or room.height < 6:
+            return
+        corners = (
+            ((room.x + 1, room.y + 1), (room.x + 2, room.y + 1), (room.x + 1, room.y + 2)),
+            ((room.x + room.width - 2, room.y + 1), (room.x + room.width - 3, room.y + 1), (room.x + room.width - 2, room.y + 2)),
+            ((room.x + 1, room.y + room.height - 2), (room.x + 2, room.y + room.height - 2), (room.x + 1, room.y + room.height - 3)),
+            ((room.x + room.width - 2, room.y + room.height - 2), (room.x + room.width - 3, room.y + room.height - 2), (room.x + room.width - 2, room.y + room.height - 3)),
+        )
+        for x, y in corners[(room.x + room.y + room.width) % len(corners)]:
+            tiles[y][x] = 1
+
+    def _shape_central_island(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 6 or room.height < 6:
+            return
+        cx, cy = room.center
+        for y in range(cy - 1, cy + 1):
+            for x in range(cx - 1, cx + 1):
+                tiles[y][x] = 1
+
+    def _shape_ring_like(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 7 or room.height < 7:
+            return
+        inner_left = room.x + room.width // 2 - 1
+        inner_top = room.y + room.height // 2 - 1
+        for y in range(inner_top, inner_top + 2):
+            for x in range(inner_left, inner_left + 2):
+                tiles[y][x] = 1
+
+    def _shape_split_by_pillar_line(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 7:
+            return
+        line_y = room.y + room.height // 2
+        for x in range(room.x + 2, room.x + room.width - 2, 2):
+            if x not in {room.x + 3, room.x + room.width - 4}:
+                tiles[line_y][x] = 1
+
+    def _shape_recessed_endcap(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 6:
+            return
+        recess_x = room.x + room.width - 2 if (room.x + room.y) % 2 == 0 else room.x + 1
+        for y in range(room.y + 1, room.y + room.height - 1):
+            if y not in {room.y + room.height // 2 - 1, room.y + room.height // 2}:
+                tiles[y][recess_x] = 1
+
+    def _shape_offset_rect(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 7 or room.height < 6:
+            return
+        split_x = room.x + room.width // 2
+        gap_y = room.y + 2 + ((room.x + room.y) % max(1, room.height - 4))
+        for y in range(room.y + 1, room.y + room.height - 1):
+            if y in {gap_y, min(room.y + room.height - 2, gap_y + 1)}:
+                continue
+            tiles[y][split_x] = 1
+
+    def _shape_corner_pillars(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 7 or room.height < 7:
+            return
+        pillar_offsets = (
+            (2, 2),
+            (room.width - 3, 2),
+            (2, room.height - 3),
+            (room.width - 3, room.height - 3),
+        )
+        for offset_x, offset_y in pillar_offsets:
+            tiles[room.y + offset_y][room.x + offset_x] = 1
+
+    def _shape_side_bays(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 8 or room.height < 7:
+            return
+        mid_y = room.y + room.height // 2
+        bay_depth = 2 if room.width >= 9 else 1
+        for y in range(room.y + 1, room.y + room.height - 1):
+            if abs(y - mid_y) <= 1:
+                continue
+            for step in range(bay_depth):
+                tiles[y][room.x + 2 + step] = 1
+                tiles[y][room.x + room.width - 3 - step] = 1
+
+    def _apply_spatial_archetype(
+        self,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room_kinds: list[list[int]],
+        sector_types: list[list[int]],
+        room: Room,
+    ) -> None:
+        if room.ceiling_height > 1:
+            for y in range(room.y, room.y + room.height):
+                for x in range(room.x, room.x + room.width):
+                    if tiles[y][x] == 0:
+                        ceiling_heights[y][x] = max(ceiling_heights[y][x], room.ceiling_height)
+        if room.spatial_archetype == ARCHETYPE_HIGH_CEILING_HALL:
+            self._paint_room_kind(room, tiles, room_kinds, ROOM_KIND_VISTA)
+            return
+        if room.spatial_archetype == ARCHETYPE_TOXIC_PIT_ROOM:
+            self._carve_toxic_pit_room(tiles, floor_heights, stair_mask, room_kinds, sector_types, room)
+            return
+        if room.spatial_archetype == ARCHETYPE_BRIDGE_CROSSING:
+            self._carve_bridge_room(tiles, floor_heights, stair_mask, room_kinds, sector_types, room)
+            return
+        if room.spatial_archetype == ARCHETYPE_OFFSET_CORRIDOR:
+            self._carve_offset_corridor(tiles, room)
+            return
+        if room.spatial_archetype == ARCHETYPE_SPLIT_ARENA:
+            self._carve_split_arena(tiles, room)
+            return
+        if room.spatial_archetype == ARCHETYPE_OVERLOOK_VISTA:
+            self._carve_overlook_vista(tiles, floor_heights, stair_mask, room_kinds, room)
+            return
+        if room.spatial_archetype == ARCHETYPE_CRUSHER_PASSAGE:
+            self._carve_crusher_passage(tiles, room)
+            return
+        if room.spatial_archetype == ARCHETYPE_RAISED_PLATFORM:
+            self._carve_raised_platform_room(tiles, floor_heights, stair_mask, room, sector_types, room_kinds)
+            return
+        if room.spatial_archetype == ARCHETYPE_ACID_RING:
+            self._carve_acid_ring_room(tiles, floor_heights, stair_mask, room_kinds, sector_types, room)
+            return
+        if room.spatial_archetype == ARCHETYPE_TOXIC_CANALS:
+            self._carve_toxic_canals_room(tiles, floor_heights, stair_mask, room_kinds, sector_types, room)
+            return
+        if room.spatial_archetype == ARCHETYPE_GRAND_CHAMBER:
+            self._carve_grand_chamber(tiles, ceiling_heights, room)
+
+    def _paint_room_kind(
+        self,
+        room: Room,
+        tiles: list[list[int]],
+        room_kinds: list[list[int]],
+        kind_index: int,
+    ) -> None:
+        for y in range(room.y + 1, room.y + room.height - 1):
+            for x in range(room.x + 1, room.x + room.width - 1):
+                if tiles[y][x] == 0:
+                    room_kinds[y][x] = kind_index
+
+    def _mark_sector(
+        self,
+        x: int,
+        y: int,
+        sector_types: list[list[int]],
+        room_kinds: list[list[int]],
+        sector_type: int,
+    ) -> None:
+        sector_types[y][x] = sector_type
+        if sector_type == SECTOR_ACID:
+            room_kinds[y][x] = ROOM_KIND_HAZARD
+        elif sector_type == SECTOR_BRIDGE:
+            room_kinds[y][x] = ROOM_KIND_CATWALK
+
+    def _carve_toxic_pit_room(
         self,
         tiles: list[list[int]],
         floor_heights: list[list[int]],
         stair_mask: list[list[int]],
         room_kinds: list[list[int]],
+        sector_types: list[list[int]],
+        room: Room,
+    ) -> None:
+        if room.width < 6 or room.height < 6:
+            return
+        bridge_half_width = 0
+        cx, cy = room.center
+        for y in range(room.y + 1, room.y + room.height - 1):
+            for x in range(room.x + 1, room.x + room.width - 1):
+                if tiles[y][x] != 0:
+                    continue
+                interior = room.x + 2 <= x <= room.x + room.width - 3 and room.y + 2 <= y <= room.y + room.height - 3
+                on_bridge = abs(x - cx) <= bridge_half_width or abs(y - cy) <= bridge_half_width
+                if interior and not on_bridge:
+                    self._mark_sector(x, y, sector_types, room_kinds, SECTOR_ACID)
+                    floor_heights[y][x] = 0
+                    stair_mask[y][x] = 0
+                elif on_bridge:
+                    floor_heights[y][x] = room.floor_height
+                    stair_mask[y][x] = 0
+                    self._mark_sector(x, y, sector_types, room_kinds, SECTOR_BRIDGE)
+
+    def _carve_bridge_room(
+        self,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room_kinds: list[list[int]],
+        sector_types: list[list[int]],
+        room: Room,
+    ) -> None:
+        if room.width < 6 or room.height < 6:
+            return
+        horizontal = room.width >= room.height
+        bridge_half_width = 1 if self.difficulty_id == "easy" else 0
+        cx, cy = room.center
+        for y in range(room.y + 1, room.y + room.height - 1):
+            for x in range(room.x + 1, room.x + room.width - 1):
+                if tiles[y][x] != 0:
+                    continue
+                on_bridge = abs(y - cy) <= bridge_half_width if horizontal else abs(x - cx) <= bridge_half_width
+                if on_bridge:
+                    floor_heights[y][x] = room.floor_height
+                    stair_mask[y][x] = 0
+                    self._mark_sector(x, y, sector_types, room_kinds, SECTOR_BRIDGE)
+                elif room.x + 2 <= x <= room.x + room.width - 3 and room.y + 2 <= y <= room.y + room.height - 3:
+                    self._mark_sector(x, y, sector_types, room_kinds, SECTOR_ACID)
+                    stair_mask[y][x] = 0
+
+    def _carve_offset_corridor(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 8 or room.height < 6:
+            return
+        split_x = room.x + room.width // 2
+        gap_start = room.y + room.height // 2 - 1
+        for y in range(room.y + 1, room.y + room.height - 1):
+            if gap_start <= y <= gap_start + 2:
+                continue
+            tiles[y][split_x] = 1
+
+    def _carve_split_arena(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 7 or room.height < 7:
+            return
+        split_y = room.y + room.height // 2
+        gap_positions = {room.x + 2, room.x + room.width - 3}
+        for x in range(room.x + 1, room.x + room.width - 1):
+            if x in gap_positions:
+                continue
+            tiles[split_y][x] = 1
+
+    def _carve_overlook_vista(
+        self,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room_kinds: list[list[int]],
+        room: Room,
+    ) -> None:
+        if room.height < 6:
+            return
+        ridge_y = room.y + room.height // 2
+        for x in range(room.x + 1, room.x + room.width - 1):
+            if tiles[ridge_y][x] == 0:
+                room_kinds[ridge_y][x] = ROOM_KIND_VISTA
+                if x not in {room.x + 2, room.x + room.width - 3}:
+                    tiles[ridge_y][x] = 1
+        for y in range(ridge_y + 1, room.y + room.height - 1):
+            for x in range(room.x + 1, room.x + room.width - 1):
+                if tiles[y][x] == 0:
+                    room_kinds[y][x] = ROOM_KIND_VISTA
+                    stair_mask[y][x] = 0
+
+    def _carve_crusher_passage(self, tiles: list[list[int]], room: Room) -> None:
+        if room.width < 6:
+            return
+        left = room.x + 1
+        right = room.x + room.width - 2
+        for y in range(room.y + 1, room.y + room.height - 1):
+            tiles[y][left] = 1
+            tiles[y][right] = 1
+        for y in range(room.y + room.height // 2 - 1, room.y + room.height // 2 + 1):
+            if room.y + 1 <= y < room.y + room.height - 1:
+                tiles[y][left] = 0
+                tiles[y][right] = 0
+
+    def _carve_raised_platform_room(
+        self,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room: Room,
+        sector_types: list[list[int]],
+        room_kinds: list[list[int]],
+    ) -> None:
+        if room.width < 6 or room.height < 6:
+            return
+        cx, cy = room.center
+        for y in range(cy - 1, cy + 2):
+            for x in range(cx - 1, cx + 2):
+                if tiles[y][x] == 0:
+                    floor_heights[y][x] = room.floor_height
+                    self._mark_sector(x, y, sector_types, room_kinds, SECTOR_BRIDGE)
+        for x, y in ((cx - 2, cy), (cx + 2, cy), (cx, cy - 2), (cx, cy + 2)):
+            if room.x < x < room.x + room.width - 1 and room.y < y < room.y + room.height - 1 and tiles[y][x] == 0:
+                stair_mask[y][x] = 0
+
+    def _carve_acid_ring_room(
+        self,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room_kinds: list[list[int]],
+        sector_types: list[list[int]],
+        room: Room,
+    ) -> None:
+        if room.width < 7 or room.height < 7:
+            return
+        inner_margin = 2
+        cx, cy = room.center
+        for y in range(room.y + 1, room.y + room.height - 1):
+            for x in range(room.x + 1, room.x + room.width - 1):
+                if tiles[y][x] != 0:
+                    continue
+                in_center = (
+                    room.x + inner_margin <= x <= room.x + room.width - 1 - inner_margin
+                    and room.y + inner_margin <= y <= room.y + room.height - 1 - inner_margin
+                )
+                on_cross = x == cx or y == cy
+                if in_center and not on_cross:
+                    self._mark_sector(x, y, sector_types, room_kinds, SECTOR_ACID)
+                    stair_mask[y][x] = 0
+                    floor_heights[y][x] = room.floor_height
+                elif on_cross:
+                    self._mark_sector(x, y, sector_types, room_kinds, SECTOR_BRIDGE)
+                    stair_mask[y][x] = 0
+
+    def _carve_toxic_canals_room(
+        self,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room_kinds: list[list[int]],
+        sector_types: list[list[int]],
+        room: Room,
+    ) -> None:
+        if room.width < 8 or room.height < 7:
+            return
+        lane_positions = [room.x + 2, room.x + room.width - 3]
+        if room.width >= 10:
+            lane_positions.append(room.x + room.width // 2)
+        for lane_x in lane_positions:
+            for y in range(room.y + 1, room.y + room.height - 1):
+                if tiles[y][lane_x] != 0:
+                    continue
+                safe_gap = (y - room.y) % 4 == 2
+                if safe_gap:
+                    self._mark_sector(lane_x, y, sector_types, room_kinds, SECTOR_BRIDGE)
+                else:
+                    self._mark_sector(lane_x, y, sector_types, room_kinds, SECTOR_ACID)
+                stair_mask[y][lane_x] = 0
+                floor_heights[y][lane_x] = room.floor_height
+
+    def _carve_grand_chamber(
+        self,
+        tiles: list[list[int]],
+        ceiling_heights: list[list[int]],
+        room: Room,
+    ) -> None:
+        if room.width < 7 or room.height < 7:
+            return
+        for y in range(room.y + 1, room.y + room.height - 1):
+            for x in range(room.x + 1, room.x + room.width - 1):
+                if tiles[y][x] != 0:
+                    continue
+                if x in {room.x + 1, room.x + room.width - 2} or y in {room.y + 1, room.y + room.height - 2}:
+                    ceiling_heights[y][x] = max(ceiling_heights[y][x], room.ceiling_height + 1)
+                else:
+                    ceiling_heights[y][x] = max(ceiling_heights[y][x], room.ceiling_height)
+
+    def _add_side_connections(
+        self,
+        tiles: list[list[int]],
+        floor_heights: list[list[int]],
+        ceiling_heights: list[list[int]],
+        stair_mask: list[list[int]],
+        room_kinds: list[list[int]],
+        sector_types: list[list[int]],
         rooms: list[Room],
         connections: list[CorridorConnection],
         room_stages: tuple[int, ...],
@@ -772,13 +2235,16 @@ class MapGenerator:
             stage_index = room_stages[room_a_index]
             if stage_link_counts[stage_index] >= settings.MAX_SIDE_CONNECTIONS_PER_STAGE:
                 continue
-            if self.rng.random() >= 0.7:
+            keep_probability = 0.86 if stage_link_counts[stage_index] == 0 else 0.62
+            if self.rng.random() >= keep_probability:
                 continue
             path = self._connect_rooms(
                 tiles,
                 floor_heights,
+                ceiling_heights,
                 stair_mask,
                 room_kinds,
+                sector_types,
                 rooms[room_a_index],
                 rooms[room_b_index],
                 widen_chance=0.0,
@@ -832,6 +2298,7 @@ class MapGenerator:
         self,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         rooms: list[Room],
         spawn: tuple[float, float],
         connections: list[CorridorConnection],
@@ -839,28 +2306,70 @@ class MapGenerator:
     ) -> list[KeySpawn] | None:
         key_spawns: list[KeySpawn] = []
         occupied_positions = [spawn]
+        all_gate_positions = tuple(
+            (
+                connections[planned_gate.connection_index].door_candidate[0] + 0.5,
+                connections[planned_gate.connection_index].door_candidate[1] + 0.5,
+            )
+            for planned_gate in progression.gate_plans
+            if connections[planned_gate.connection_index].door_candidate is not None
+        )
 
         for gate_index, gate in enumerate(progression.gate_plans):
             connection = connections[gate.connection_index]
+            gate_door_position = (
+                connection.door_candidate[0] + 0.5,
+                connection.door_candidate[1] + 0.5,
+            ) if connection.door_candidate is not None else None
+            blocked_doors = {
+                (connections[later_gate.connection_index].door_candidate[0], connections[later_gate.connection_index].door_candidate[1])
+                for later_gate in progression.gate_plans[gate_index:]
+                if connections[later_gate.connection_index].door_candidate is not None
+            }
             reachable_before_door = self._reachable_tiles_with_closed_positions(
                 tiles,
                 spawn,
-                {
-                    (connections[later_gate.connection_index].door_candidate[0], connections[later_gate.connection_index].door_candidate[1])
-                    for later_gate in progression.gate_plans[gate_index:]
-                    if connections[later_gate.connection_index].door_candidate is not None
-                },
+                blocked_doors,
             )
 
             key_position = None
-            for key_room_index in self._ordered_key_rooms(rooms, set(gate.key_room_candidates), connection):
+            eligible_room_indices = self._eligible_key_rooms_for_gate(
+                rooms,
+                progression,
+                gate,
+                reachable_before_door,
+                connection,
+                all_gate_positions,
+            )
+            for key_room_index in eligible_room_indices:
+                room_door_positions = [
+                    (linked_connection.door_candidate[0] + 0.5, linked_connection.door_candidate[1] + 0.5)
+                    for linked_connection in connections
+                    if linked_connection.door_candidate is not None
+                    and (
+                        linked_connection.room_a_index == key_room_index
+                        or linked_connection.room_b_index == key_room_index
+                    )
+                ]
+                if gate_door_position is not None:
+                    room_door_positions.append(gate_door_position)
+                repel_positions = [
+                    position
+                    for position in all_gate_positions
+                    if position not in room_door_positions
+                ]
                 key_position = self._choose_key_position(
                     rooms[key_room_index],
                     tiles,
                     stair_mask,
+                    sector_types,
                     spawn,
                     occupied_positions,
+                    avoid_positions=room_door_positions,
+                    repel_positions=repel_positions,
                     reachable_tiles=reachable_before_door,
+                    hidden_bias=True,
+                    far_from_position=gate_door_position,
                 )
                 if key_position is not None:
                     break
@@ -877,6 +2386,23 @@ class MapGenerator:
             occupied_positions.append(key_position)
         return key_spawns
 
+    def _eligible_key_rooms_for_gate(
+        self,
+        rooms: list[Room],
+        progression: ProgressionLayout,
+        gate: ProgressionGatePlan,
+        reachable_tiles: set[tuple[int, int]],
+        connection: CorridorConnection,
+        all_gate_positions: tuple[tuple[float, float], ...],
+    ) -> list[int]:
+        stage_room_indices = set(progression.stage_rooms[gate.stage_index])
+        reachable_room_indices = {
+            room_index
+            for room_index in stage_room_indices
+            if any(rooms[room_index].contains_tile(tile_x, tile_y) for tile_x, tile_y in reachable_tiles)
+        }
+        return self._ordered_key_rooms(rooms, reachable_room_indices, connection, all_gate_positions)
+
     def _place_optional_doors(
         self,
         tiles: list[list[int]],
@@ -890,10 +2416,14 @@ class MapGenerator:
         locked_connection_indices = {gate.connection_index for gate in progression.gate_plans}
         normal_doors: list[DoorSpawn] = []
         for connection in connections:
-            if connection.index in locked_connection_indices or connection.is_main_path:
+            if connection.index in locked_connection_indices:
+                continue
+            if connection.is_main_path and connection.edge_kind != EDGE_SHORTCUT:
                 continue
             connection.door_candidate = self._find_door_candidate(tiles, stair_mask, rooms, connection, spawn)
             if connection.door_candidate is None:
+                if connection.edge_kind == EDGE_SHORTCUT:
+                    return []
                 continue
             door_x, door_y, orientation = connection.door_candidate
             door_world_pos = (door_x + 0.5, door_y + 0.5)
@@ -901,6 +2431,8 @@ class MapGenerator:
                 math.dist(door_world_pos, (door.grid_x + 0.5, door.grid_y + 0.5)) < settings.DOOR_MIN_SPACING
                 for door in [*locked_doors, *normal_doors]
             ):
+                if connection.edge_kind == EDGE_SHORTCUT:
+                    return []
                 continue
             normal_doors.append(
                 DoorSpawn(
@@ -919,10 +2451,11 @@ class MapGenerator:
         rooms: list[Room],
         spawn: tuple[float, float],
         progression: ProgressionLayout,
-        locked_doors: list[DoorSpawn],
+        door_spawns: list[DoorSpawn],
         key_spawns: list[KeySpawn],
         exit_spawn: ExitSpawn,
     ) -> bool:
+        locked_doors = [door for door in door_spawns if door.door_type in {locked_door_type_for_key(key_type) for key_type in KEY_TYPES}]
         if len(locked_doors) != len(KEY_TYPES) or len(key_spawns) != len(KEY_TYPES):
             return False
 
@@ -941,17 +2474,15 @@ class MapGenerator:
             blocked_with_only_gate_closed = self._reachable_tiles_with_closed_positions(
                 tiles,
                 spawn,
-                {(door.grid_x, door.grid_y)},
+                {(door.grid_x, door.grid_y), *self._closed_positions_for_state(door_spawns, tuple(), tuple())},
             )
             if self._reachable_room_indices(rooms, blocked_with_only_gate_closed) & set(gate.blocked_room_indices):
                 return False
 
         for gate_index, gate in enumerate(progression.gate_plans):
-            current_door = door_by_key[gate.key_type]
-            closed_now = {
-                (door_by_key[later_gate.key_type].grid_x, door_by_key[later_gate.key_type].grid_y)
-                for later_gate in progression.gate_plans[gate_index:]
-            }
+            unlocked_keys_before = KEY_TYPES[:gate_index]
+            unlocked_triggers_before = tuple(f"pickup:{key_type}" for key_type in unlocked_keys_before)
+            closed_now = self._closed_positions_for_state(door_spawns, unlocked_keys_before, unlocked_triggers_before)
             reachable_before = self._reachable_tiles_with_closed_positions(tiles, spawn, closed_now)
             key_tile = (int(key_by_type[gate.key_type].x), int(key_by_type[gate.key_type].y))
             if key_tile not in reachable_before:
@@ -959,13 +2490,12 @@ class MapGenerator:
             if self._reachable_room_indices(rooms, reachable_before) & set(gate.blocked_room_indices):
                 return False
 
+            unlocked_keys_after = KEY_TYPES[: gate_index + 1]
+            unlocked_triggers_after = tuple(f"pickup:{key_type}" for key_type in unlocked_keys_after)
             reachable_after = self._reachable_tiles_with_closed_positions(
                 tiles,
                 spawn,
-                {
-                    (door_by_key[later_gate.key_type].grid_x, door_by_key[later_gate.key_type].grid_y)
-                    for later_gate in progression.gate_plans[gate_index + 1:]
-                },
+                self._closed_positions_for_state(door_spawns, unlocked_keys_after, unlocked_triggers_after),
             )
             next_stage_index = gate.stage_index + 1
             if next_stage_index >= len(progression.stage_rooms):
@@ -977,7 +2507,11 @@ class MapGenerator:
         reachable_before_final = self._reachable_tiles_with_closed_positions(
             tiles,
             spawn,
-            {(locked_doors[-1].grid_x, locked_doors[-1].grid_y)},
+            self._closed_positions_for_state(
+                door_spawns,
+                KEY_TYPES[:-1],
+                tuple(f"pickup:{key_type}" for key_type in KEY_TYPES[:-1]),
+            ),
         )
         if exit_tile in reachable_before_final:
             return False
@@ -1012,9 +2546,10 @@ class MapGenerator:
             or len(rooms) < 5
         ):
             return None
-        chance = 0.24 + max(0.0, self.difficulty_rating - 1.0) * 0.85
-        chance += 0.08 if len(rooms) >= 8 else 0.0
-        if self.rng.random() > min(0.62, chance):
+        chance = self.difficulty.boss_guard_probability
+        if len(rooms) >= 8:
+            chance = min(1.0, chance + 0.08)
+        if self.rng.random() > chance:
             return None
 
         reachable_before_final = self._reachable_rooms(
@@ -1160,20 +2695,23 @@ class MapGenerator:
         self,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         rooms: list[Room],
         spawn: tuple[float, float],
         occupied_positions: list[tuple[float, float]],
         progression_suffix_rooms: set[int] | None,
         required_door_id: str | None,
         required_door_tile: tuple[int, int] | None,
+        extra_closed_positions: set[tuple[int, int]] | None = None,
     ) -> ExitSpawn | None:
         if not rooms:
             return None
         reachable_without_final: set[tuple[int, int]] | None = None
         reachable_with_final: set[tuple[int, int]] | None = None
         final_door_world_pos: tuple[float, float] | None = None
+        extra_closed_positions = extra_closed_positions or set()
         if required_door_tile is not None:
-            reachable_without_final = self._reachable_tiles_with_closed_positions(tiles, spawn, {required_door_tile})
+            reachable_without_final = self._reachable_tiles_with_closed_positions(tiles, spawn, {required_door_tile, *extra_closed_positions})
             reachable_with_final = self._reachable_tiles_with_closed_positions(tiles, spawn, set())
             final_door_world_pos = (required_door_tile[0] + 0.5, required_door_tile[1] + 0.5)
         candidate_room_indices = progression_suffix_rooms if progression_suffix_rooms else {len(rooms) - 1}
@@ -1188,12 +2726,22 @@ class MapGenerator:
                 room,
                 tiles,
                 stair_mask,
+                sector_types,
                 spawn,
                 occupied_positions,
                 min_spacing=1.65,
+                allowed_sectors={SECTOR_SAFE, SECTOR_BRIDGE},
             )
             if not candidates:
-                candidates = self._fallback_room_positions(room, tiles, stair_mask, spawn, occupied_positions)
+                candidates = self._fallback_room_positions(
+                    room,
+                    tiles,
+                    stair_mask,
+                    sector_types,
+                    spawn,
+                    occupied_positions,
+                    allowed_sectors={SECTOR_SAFE, SECTOR_BRIDGE},
+                )
             if not candidates:
                 continue
             candidates.sort(key=lambda pos: math.dist(pos, spawn), reverse=True)
@@ -1344,6 +2892,7 @@ class MapGenerator:
         rooms: list[Room],
         room_candidates: set[int],
         connection: CorridorConnection,
+        all_gate_positions: tuple[tuple[float, float], ...],
     ) -> list[int]:
         door_world_pos = (
             connection.door_candidate[0] + 0.5,
@@ -1352,6 +2901,16 @@ class MapGenerator:
         return sorted(
             room_candidates,
             key=lambda room_index: (
+                min(
+                    (
+                        math.dist(
+                            (rooms[room_index].center[0] + 0.5, rooms[room_index].center[1] + 0.5),
+                            gate_pos,
+                        )
+                        for gate_pos in all_gate_positions
+                    ),
+                    default=math.dist((rooms[room_index].center[0] + 0.5, rooms[room_index].center[1] + 0.5), door_world_pos),
+                ),
                 math.dist((rooms[room_index].center[0] + 0.5, rooms[room_index].center[1] + 0.5), door_world_pos),
                 self.rng.random(),
             ),
@@ -1363,40 +2922,109 @@ class MapGenerator:
         room: Room,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         spawn: tuple[float, float],
         occupied_positions: list[tuple[float, float]],
+        avoid_positions: list[tuple[float, float]] | None = None,
+        repel_positions: list[tuple[float, float]] | None = None,
         reachable_tiles: set[tuple[int, int]] | None = None,
         forbidden_tiles: set[tuple[int, int]] | None = None,
+        hidden_bias: bool = False,
+        far_from_position: tuple[float, float] | None = None,
     ) -> tuple[float, float] | None:
         candidates = self._room_floor_candidates(
             room,
             tiles,
             stair_mask,
+            sector_types,
             spawn,
             occupied_positions,
             min_spacing=1.45,
             reachable_tiles=reachable_tiles,
             forbidden_tiles=forbidden_tiles,
+            allowed_sectors={SECTOR_SAFE, SECTOR_BRIDGE},
         )
         if not candidates:
             candidates = self._fallback_room_positions(
                 room,
                 tiles,
                 stair_mask,
+                sector_types,
                 spawn,
                 occupied_positions,
                 reachable_tiles=reachable_tiles,
                 forbidden_tiles=forbidden_tiles,
+                allowed_sectors={SECTOR_SAFE, SECTOR_BRIDGE},
             )
         if not candidates:
             return None
-        candidates.sort(key=lambda pos: math.dist(pos, spawn), reverse=True)
+        avoid_positions = avoid_positions or []
+        repel_positions = repel_positions or []
+        candidates.sort(
+            key=lambda pos: (
+                min((math.dist(pos, other) for other in repel_positions), default=0.0),
+                math.dist(pos, far_from_position) if far_from_position is not None else 0.0,
+                self._distance_from_room_entry_line(pos, room, far_from_position),
+                self._hidden_position_score(pos, room, tiles) if hidden_bias else 0.0,
+                min((math.dist(pos, other) for other in avoid_positions), default=0.0),
+                math.dist(pos, spawn),
+                self.rng.random(),
+            ),
+            reverse=True,
+        )
         return candidates[0]
+
+    def _distance_from_room_entry_line(
+        self,
+        pos: tuple[float, float],
+        room: Room,
+        gate_pos: tuple[float, float] | None,
+    ) -> float:
+        if gate_pos is None:
+            return 0.0
+        ax, ay = gate_pos
+        bx, by = room.center[0] + 0.5, room.center[1] + 0.5
+        px, py = pos
+        abx = bx - ax
+        aby = by - ay
+        denom = abx * abx + aby * aby
+        if denom <= 0.001:
+            return 0.0
+        t = max(0.0, min(1.0, ((px - ax) * abx + (py - ay) * aby) / denom))
+        proj_x = ax + abx * t
+        proj_y = ay + aby * t
+        return math.dist((px, py), (proj_x, proj_y))
+
+    def _hidden_position_score(
+        self,
+        pos: tuple[float, float],
+        room: Room,
+        tiles: list[list[int]],
+    ) -> float:
+        tile_x = int(pos[0])
+        tile_y = int(pos[1])
+        wall_neighbors = 0
+        for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            neighbor_x = tile_x + offset_x
+            neighbor_y = tile_y + offset_y
+            if not (0 <= neighbor_x < self.width and 0 <= neighbor_y < self.height):
+                wall_neighbors += 1
+                continue
+            if tiles[neighbor_y][neighbor_x] == 1:
+                wall_neighbors += 1
+        corner_bias = min(
+            math.dist(pos, (room.x + 1.5, room.y + 1.5)),
+            math.dist(pos, (room.x + room.width - 1.5, room.y + 1.5)),
+            math.dist(pos, (room.x + 1.5, room.y + room.height - 1.5)),
+            math.dist(pos, (room.x + room.width - 1.5, room.y + room.height - 1.5)),
+        )
+        return wall_neighbors * 3.0 - corner_bias
 
     def _generate_loot_spawns(
         self,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         rooms: list[Room],
         spawn: tuple[float, float],
         reserved_positions: list[tuple[float, float]],
@@ -1409,12 +3037,24 @@ class MapGenerator:
         next_id = 0
 
         for room_index, room in enumerate(rooms):
-            candidates = self._room_floor_candidates(room, tiles, stair_mask, spawn, occupied_positions)
+            candidates = self._room_floor_candidates(
+                room,
+                tiles,
+                stair_mask,
+                sector_types,
+                spawn,
+                occupied_positions,
+                allowed_sectors={SECTOR_SAFE, SECTOR_BRIDGE},
+            )
             if not candidates:
                 continue
 
             count_min, count_max = ROOM_LOOT_COUNTS.get(room.kind, (1, 2))
-            spawn_count = min(len(candidates), self.rng.randint(count_min, count_max))
+            scaled_min = max(1, int(round(count_min * self.difficulty.pickup_density_scale)))
+            scaled_max = max(scaled_min, int(round(count_max * self.difficulty.pickup_density_scale + self.difficulty.safe_room_bias - 1.0)))
+            if room_index <= 2 and self.difficulty_id == "easy":
+                scaled_max = max(scaled_max, settings.EARLY_STAGE_SOFT_CAP + 1)
+            spawn_count = min(len(candidates), self.rng.randint(scaled_min, scaled_max))
             loot_table = ROOM_LOOT_TABLES.get(room.kind, ROOM_LOOT_TABLES["cross"])
 
             placed = 0
@@ -1422,9 +3062,14 @@ class MapGenerator:
                 if any(math.dist((x, y), other) < settings.LOOT_MIN_SPACING for other in occupied_positions):
                     continue
                 entry = self._weighted_loot_entry(loot_table)
-                amount = resolve_pickup_amount(entry.kind, entry.amount)
+                loot_kind = self._adjust_loot_kind_for_difficulty(entry.kind)
+                amount = (
+                    resolve_pickup_amount(loot_kind)
+                    if loot_kind != entry.kind
+                    else resolve_pickup_amount(loot_kind, entry.amount)
+                )
                 pickup_id = f"loot-{self.seed}-{room_index:02d}-{next_id:03d}"
-                loot_spawns.append(LootSpawn(pickup_id, x, y, entry.kind, amount))
+                loot_spawns.append(LootSpawn(pickup_id, x, y, loot_kind, amount))
                 occupied_positions.append((x, y))
                 next_id += 1
                 placed += 1
@@ -1433,10 +3078,27 @@ class MapGenerator:
 
         return loot_spawns
 
+    def _adjust_loot_kind_for_difficulty(self, loot_kind: str) -> str:
+        if self.difficulty_id == "easy":
+            upgrades = {
+                "stimpack": "medkit",
+                "shells": "shell_box",
+            }
+            return upgrades.get(loot_kind, loot_kind)
+        if self.difficulty_id == "hard":
+            downgrades = {
+                "medkit": "stimpack",
+                "shell_box": "shells",
+                "green_armor": "armor_bonus",
+            }
+            return downgrades.get(loot_kind, loot_kind)
+        return loot_kind
+
     def _generate_enemy_spawns(
         self,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         rooms: list[Room],
         spawn: tuple[float, float],
         reserved_positions: list[tuple[float, float]],
@@ -1455,6 +3117,7 @@ class MapGenerator:
             boss_position = self._choose_boss_position(
                 tiles,
                 stair_mask,
+                sector_types,
                 rooms,
                 spawn,
                 occupied_positions,
@@ -1506,6 +3169,7 @@ class MapGenerator:
                 room_index,
                 tiles,
                 stair_mask,
+                sector_types,
                 spawn,
                 occupied_positions,
                 boss_guard_plan,
@@ -1532,7 +3196,7 @@ class MapGenerator:
                 if any(math.dist((x, y), other) < settings.ENEMY_MIN_SPACING for other in occupied_positions):
                     continue
                 difficulty_tier = min(2, (room_index * 3) // max(1, len(rooms) - 1))
-                enemy_type = self._choose_enemy_type(room.kind, room_index, len(rooms), difficulty_tier)
+                enemy_type = self._choose_enemy_type(room, room_index, len(rooms), difficulty_tier)
                 enemy_spawns.append(
                     EnemySpawn(
                         enemy_id=f"enemy-{self.seed}-{next_index:03d}",
@@ -1564,6 +3228,7 @@ class MapGenerator:
                     room_index,
                     tiles,
                     stair_mask,
+                    sector_types,
                     spawn,
                     occupied_positions,
                     boss_guard_plan,
@@ -1602,7 +3267,7 @@ class MapGenerator:
 
             _, room_index, room, (x, y) = best_option
             difficulty_tier = min(2, (room_index * 3) // max(1, len(rooms) - 1))
-            enemy_type = self._choose_enemy_type(room.kind, room_index, len(rooms), difficulty_tier)
+            enemy_type = self._choose_enemy_type(room, room_index, len(rooms), difficulty_tier)
             enemy_spawns.append(
                 EnemySpawn(
                     enemy_id=f"enemy-{self.seed}-{next_index:03d}",
@@ -1640,19 +3305,31 @@ class MapGenerator:
             target += 1
         if room_area >= 72:
             target += 1
+        if room_area >= 84:
+            target += 1
         if room_index >= room_count - 2:
             target += 1
         if room.kind == "shrine":
             target = max(1, target - 1)
+        if room.spatial_archetype in {ARCHETYPE_TOXIC_PIT_ROOM, ARCHETYPE_BRIDGE_CROSSING, ARCHETYPE_ACID_RING, ARCHETYPE_TOXIC_CANALS}:
+            target += 1
+        if room.ceiling_height >= 3:
+            target += 1
+        if room.spatial_archetype == ARCHETYPE_CRUSHER_PASSAGE:
+            target = max(1, target - 1)
         if guard_enemy_id is not None and boss_guard_plan is not None and room_index == boss_guard_plan.candidate_room_indices[0]:
             target = max(0, target - 1)
         max_target = {
-            "arena": 5,
-            "cross": 4,
-            "tech": 4,
+            "arena": 6,
+            "cross": 5,
+            "tech": 5,
             "shrine": 3,
         }.get(room.kind, 4)
-        return min(target, max_target)
+        target = max(0, int(round(target * self.difficulty.enemy_count_scale)))
+        target += self.difficulty.enemy_room_cap_bonus
+        if room_index <= 2 and self.difficulty_id == "easy":
+            target = min(target, settings.EARLY_STAGE_SOFT_CAP)
+        return max(0, min(target, max_target + self.difficulty.enemy_room_cap_bonus))
 
     def _enemy_candidates_for_room(
         self,
@@ -1660,6 +3337,7 @@ class MapGenerator:
         room_index: int,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         spawn: tuple[float, float],
         occupied_positions: list[tuple[float, float]],
         boss_guard_plan: BossGuardPlan | None,
@@ -1674,12 +3352,22 @@ class MapGenerator:
             room,
             tiles,
             stair_mask,
+            sector_types,
             spawn,
             occupied_positions,
             min_spacing=extra_spacing,
+            allowed_sectors={SECTOR_SAFE},
         )
         if not candidates:
-            candidates = self._fallback_room_positions(room, tiles, stair_mask, spawn, occupied_positions)
+            candidates = self._fallback_room_positions(
+                room,
+                tiles,
+                stair_mask,
+                sector_types,
+                spawn,
+                occupied_positions,
+                allowed_sectors={SECTOR_SAFE},
+            )
         return candidates
 
     def _enemy_candidate_score(
@@ -1704,12 +3392,20 @@ class MapGenerator:
             "arena": 0.42,
             "shrine": 0.12,
         }.get(room.kind, 0.0)
+        distance_from_center = math.dist(position, (room.center[0] + 0.5, room.center[1] + 0.5))
+        center_bias = 0.0
+        if room.spatial_archetype in {ARCHETYPE_SPLIT_ARENA, ARCHETYPE_RAISED_PLATFORM, ARCHETYPE_GRAND_CHAMBER}:
+            center_bias += max(0.0, 2.4 - distance_from_center) * 0.22
+        if room.spatial_archetype in {ARCHETYPE_TOXIC_PIT_ROOM, ARCHETYPE_BRIDGE_CROSSING, ARCHETYPE_ACID_RING, ARCHETYPE_TOXIC_CANALS}:
+            center_bias -= max(0.0, 2.2 - distance_from_center) * 0.28
         return (
             nearest_other * 1.85
             + distance_from_spawn * 0.26
             + progress * 1.1
             + (1.0 - room_fill_ratio) * 1.6
             + room_kind_bonus
+            + center_bias
+            + room.ceiling_height * 0.08
             + self.rng.random() * 0.22
         )
 
@@ -1723,12 +3419,14 @@ class MapGenerator:
             "arena": 1.14,
             "shrine": 1.08,
         }.get(room_kind, 1.0)
-        return min(1.35, max(0.78, kind_bonus * (0.82 + progress * 0.52) * self.difficulty_rating))
+        generator_pressure = self.difficulty.damage_pressure_bias * (0.92 + (self.runtime_pressure_bias - 1.0) * 0.35)
+        return min(1.5, max(0.72, kind_bonus * (0.82 + progress * 0.52) * generator_pressure))
 
     def _choose_boss_position(
         self,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         rooms: list[Room],
         spawn: tuple[float, float],
         occupied_positions: list[tuple[float, float]],
@@ -1740,12 +3438,22 @@ class MapGenerator:
                 room,
                 tiles,
                 stair_mask,
+                sector_types,
                 spawn,
                 occupied_positions,
                 min_spacing=max(2.0, settings.ENEMY_MIN_SPACING + 0.8),
+                allowed_sectors={SECTOR_SAFE},
             )
             if not candidates:
-                candidates = self._fallback_room_positions(room, tiles, stair_mask, spawn, occupied_positions)
+                candidates = self._fallback_room_positions(
+                    room,
+                    tiles,
+                    stair_mask,
+                    sector_types,
+                    spawn,
+                    occupied_positions,
+                    allowed_sectors={SECTOR_SAFE},
+                )
             if not candidates:
                 continue
             candidates.sort(
@@ -1762,25 +3470,44 @@ class MapGenerator:
 
     def _choose_enemy_type(
         self,
-        room_kind: str,
+        room: Room,
         room_index: int,
         room_count: int,
         difficulty_tier: int,
     ) -> str:
         progress = room_index / max(1, room_count - 1)
         roll = self.rng.random()
-        weighted_roll = roll / max(0.7, self.difficulty_rating)
+        weighted_roll = roll / max(0.68, self.difficulty.damage_pressure_bias)
+        hazardous_room = room.spatial_archetype in {
+            ARCHETYPE_TOXIC_PIT_ROOM,
+            ARCHETYPE_BRIDGE_CROSSING,
+            ARCHETYPE_ACID_RING,
+            ARCHETYPE_TOXIC_CANALS,
+        }
+        high_ceiling_room = room.ceiling_height >= 3 or room.spatial_archetype in {
+            ARCHETYPE_HIGH_CEILING_HALL,
+            ARCHETYPE_OVERLOOK_VISTA,
+            ARCHETYPE_GRAND_CHAMBER,
+        }
         if progress < 0.24:
+            if hazardous_room and weighted_roll < 0.42:
+                return "grunt"
             return "charger" if weighted_roll < 0.34 else "grunt"
         if progress < 0.58:
-            if room_kind in {"arena", "tech", "cross"} and weighted_roll < 0.38:
+            if hazardous_room and weighted_roll < 0.52:
+                return "heavy"
+            if room.kind in {"arena", "tech", "cross"} and weighted_roll < 0.38:
                 return "heavy"
             if difficulty_tier >= 1 and weighted_roll < 0.24:
                 return "heavy"
             if weighted_roll < 0.46:
                 return "charger"
             return "grunt"
-        if room_kind in {"arena", "shrine", "tech", "cross"} and weighted_roll < 0.6:
+        if hazardous_room and weighted_roll < 0.68:
+            return "heavy"
+        if high_ceiling_room and weighted_roll < 0.54:
+            return "heavy"
+        if room.kind in {"arena", "shrine", "tech", "cross"} and weighted_roll < 0.6:
             return "heavy"
         if difficulty_tier >= 2 and weighted_roll < 0.46:
             return "heavy"
@@ -1793,11 +3520,13 @@ class MapGenerator:
         room: Room,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         spawn: tuple[float, float],
         occupied_positions: list[tuple[float, float]],
         min_spacing: float | None = None,
         reachable_tiles: set[tuple[int, int]] | None = None,
         forbidden_tiles: set[tuple[int, int]] | None = None,
+        allowed_sectors: set[int] | None = None,
     ) -> list[tuple[float, float]]:
         margin = min(
             settings.LOOT_ROOM_EDGE_PADDING,
@@ -1816,6 +3545,8 @@ class MapGenerator:
         for y in range(min_y, max_y + 1):
             for x in range(min_x, max_x + 1):
                 if tiles[y][x] != 0 or stair_mask[y][x] != 0:
+                    continue
+                if allowed_sectors is not None and sector_types[y][x] not in allowed_sectors:
                     continue
                 if reachable_tiles is not None and (x, y) not in reachable_tiles:
                     continue
@@ -1838,15 +3569,19 @@ class MapGenerator:
         room: Room,
         tiles: list[list[int]],
         stair_mask: list[list[int]],
+        sector_types: list[list[int]],
         spawn: tuple[float, float],
         occupied_positions: list[tuple[float, float]],
         reachable_tiles: set[tuple[int, int]] | None = None,
         forbidden_tiles: set[tuple[int, int]] | None = None,
+        allowed_sectors: set[int] | None = None,
     ) -> list[tuple[float, float]]:
         candidates: list[tuple[float, float]] = []
         for y in range(room.y + 1, room.y + room.height - 1):
             for x in range(room.x + 1, room.x + room.width - 1):
                 if tiles[y][x] != 0 or stair_mask[y][x] != 0:
+                    continue
+                if allowed_sectors is not None and sector_types[y][x] not in allowed_sectors:
                     continue
                 if reachable_tiles is not None and (x, y) not in reachable_tiles:
                     continue
@@ -1888,6 +3623,22 @@ class MapGenerator:
     def _decorate_storage(self, tiles: list[list[int]], room: Room) -> None:
         if room.width < 7 or room.height < 7:
             return
+        variant = self.rng.choice(("scattered", "rack_rows", "corner_cache"))
+        if variant == "rack_rows":
+            row_y = room.y + room.height // 2
+            for x in range(room.x + 2, room.x + room.width - 2, 2):
+                if (x, row_y) != room.center:
+                    tiles[row_y][x] = 1
+            return
+        if variant == "corner_cache":
+            for x, y in (
+                (room.x + 1, room.y + 1),
+                (room.x + room.width - 2, room.y + 1),
+                (room.x + 1, room.y + room.height - 2),
+            ):
+                if (x, y) != room.center:
+                    tiles[y][x] = 1
+            return
         count = self.rng.randint(2, 4)
         for _ in range(count):
             x = self.rng.randint(room.x + 1, room.x + room.width - 2)
@@ -1896,17 +3647,42 @@ class MapGenerator:
                 tiles[y][x] = 1
 
     def _decorate_arena(self, tiles: list[list[int]], room: Room) -> None:
+        variant = self.rng.choice(("corners", "center_island", "offset_pillars"))
+        if variant == "center_island":
+            cx, cy = room.center
+            for y in range(cy - 1, cy + 2):
+                for x in range(cx - 1, cx + 2):
+                    if (x, y) != (cx, cy):
+                        tiles[y][x] = 1
+            return
         corners = (
             (room.x + 1, room.y + 1),
             (room.x + room.width - 2, room.y + 1),
             (room.x + 1, room.y + room.height - 2),
             (room.x + room.width - 2, room.y + room.height - 2),
         )
+        if variant == "offset_pillars":
+            corners = corners[:2] + (
+                (room.x + room.width // 2, room.y + 1),
+                (room.x + room.width // 2, room.y + room.height - 2),
+            )
         for x, y in corners:
             tiles[y][x] = 1
 
     def _decorate_tech(self, tiles: list[list[int]], room: Room) -> None:
         if room.width < 6:
+            return
+        variant = self.rng.choice(("top_consoles", "side_consoles", "offset_channel"))
+        if variant == "side_consoles":
+            for y in range(room.y + 1, room.y + room.height - 1, 2):
+                tiles[y][room.x + 1] = 1
+                tiles[y][room.x + room.width - 2] = 1
+            return
+        if variant == "offset_channel":
+            channel_x = room.x + room.width // 2
+            for y in range(room.y + 1, room.y + room.height - 1):
+                if y not in {room.center[1] - 1, room.center[1], room.center[1] + 1}:
+                    tiles[y][channel_x] = 1
             return
         for x in range(room.x + 1, room.x + room.width - 1, 3):
             if room.y + 1 < room.y + room.height - 1:
@@ -1955,3 +3731,913 @@ class MapGenerator:
             if y != cy:
                 tiles[y][cx] = 1
         tiles[cy][cx] = 0
+
+    def _room_index_for_position(self, rooms: list[Room], x: float, y: float) -> int:
+        tile_x = int(x)
+        tile_y = int(y)
+        for room_index, room in enumerate(rooms):
+            if room.contains_tile(tile_x, tile_y):
+                return room_index
+        return max(0, min(len(rooms) - 1, len(rooms) - 1))
+
+    def _choose_macro_layout(self, connections: list[CorridorConnection], room_count: int) -> str:
+        side_count = sum(1 for connection in connections if not connection.is_main_path)
+        if side_count >= 3:
+            return "double_loop"
+        if side_count >= 2:
+            return "loop_spoke"
+        if room_count >= 9:
+            return "fork_return"
+        return "hub_spoke"
+
+    def _assign_room_metadata(
+        self,
+        rooms: list[Room],
+        progression: ProgressionLayout,
+        route_plan: MacroRoutePlan,
+        connections: list[CorridorConnection],
+        key_room_by_type: dict[str, int],
+        switch_room_index: int | None,
+        secret_room_indices: set[int],
+        final_room_index: int,
+    ) -> tuple[RoomMetadata, ...]:
+        shortcut_rooms = {
+            connection.room_a_index
+            for connection in connections
+            if not connection.is_main_path
+        } | {
+            connection.room_b_index
+            for connection in connections
+            if not connection.is_main_path
+        }
+        return_route_indices = {
+            connections[gate.connection_index].room_a_index
+            for gate in progression.gate_plans
+        }
+        metadata: list[RoomMetadata] = []
+        role_hints = {node.room_index: node.role_hint for node in route_plan.nodes}
+        vista_hints = set(route_plan.vista_room_indices)
+        for room_index, room in enumerate(rooms):
+            stage_index = progression.room_stages[room_index]
+            role = role_hints.get(room_index, ROOM_ROLE_PRESSURE_CORRIDOR)
+            has_vista = room_index in vista_hints
+            is_safe_room = room.kind == "start"
+            if room_index == 0:
+                role = ROOM_ROLE_START
+                has_vista = True
+                is_safe_room = True
+            elif room_index == final_room_index:
+                role = ROOM_ROLE_FINAL_ROOM
+            elif room_index in secret_room_indices:
+                role = ROOM_ROLE_SECRET_ROOM
+            elif switch_room_index is not None and room_index == switch_room_index:
+                role = ROOM_ROLE_SWITCH_ROOM
+            elif room_index in key_room_by_type.values():
+                role = ROOM_ROLE_KEY_ROOM
+            elif room_index in return_route_indices:
+                role = ROOM_ROLE_RETURN_ROUTE
+            elif room_index in shortcut_rooms:
+                role = ROOM_ROLE_SHORTCUT_HALL
+            elif room.kind in {"arena", "cross"}:
+                role = ROOM_ROLE_AMBUSH_ROOM
+            elif room.kind in {"tech", "storage"} and stage_index > 0:
+                role = ROOM_ROLE_PRESSURE_CORRIDOR
+            else:
+                role = ROOM_ROLE_VISTA
+            encounter_weight = 0.8 + stage_index * 0.26
+            if room.kind == "arena":
+                encounter_weight += 0.28
+            if role in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_KEY_ROOM, ROOM_ROLE_FINAL_ROOM}:
+                encounter_weight += 0.22
+            metadata.append(
+                RoomMetadata(
+                    room_index=room_index,
+                    stage_index=stage_index,
+                    room_kind=room.kind,
+                    role=role,
+                    encounter_weight=encounter_weight,
+                    has_vista=has_vista,
+                    is_return_route=room_index in return_route_indices,
+                    is_secret_room=room_index in secret_room_indices,
+                    is_safe_room=is_safe_room,
+                    shape_family=room.shape_family,
+                    spatial_archetype=room.spatial_archetype,
+                    ceiling_height=room.ceiling_height,
+                    hazard_type="acid"
+                    if room.spatial_archetype in {
+                        ARCHETYPE_TOXIC_PIT_ROOM,
+                        ARCHETYPE_BRIDGE_CROSSING,
+                        ARCHETYPE_ACID_RING,
+                        ARCHETYPE_TOXIC_CANALS,
+                    }
+                    else "safe",
+                    has_bridge=room.spatial_archetype in {
+                        ARCHETYPE_TOXIC_PIT_ROOM,
+                        ARCHETYPE_BRIDGE_CROSSING,
+                        ARCHETYPE_RAISED_PLATFORM,
+                        ARCHETYPE_ACID_RING,
+                        ARCHETYPE_TOXIC_CANALS,
+                    },
+                    height_variance=max(0, room.ceiling_height - 1)
+                    + (
+                        1
+                        if room.spatial_archetype in {
+                            ARCHETYPE_OVERLOOK_VISTA,
+                            ARCHETYPE_RAISED_PLATFORM,
+                            ARCHETYPE_GRAND_CHAMBER,
+                        }
+                        else 0
+                    ),
+                )
+            )
+        return tuple(metadata)
+
+    def _spawn_event_enemies(
+        self,
+        rooms: list[Room],
+        room_index: int,
+        count: int,
+        wake_trigger_id: str,
+        tiles: list[list[int]],
+        stair_mask: list[list[int]],
+        sector_types: list[list[int]],
+        spawn: tuple[float, float],
+        occupied_positions: list[tuple[float, float]],
+        start_index: int,
+    ) -> tuple[list[EnemySpawn], int]:
+        if count <= 0:
+            return [], start_index
+        room = rooms[room_index]
+        candidates = self._enemy_candidates_for_room(
+            room,
+            room_index,
+            tiles,
+            stair_mask,
+            sector_types,
+            spawn,
+            occupied_positions,
+            boss_guard_plan=None,
+            guard_enemy_id=None,
+        )
+        if not candidates:
+            return [], start_index
+        event_spawns: list[EnemySpawn] = []
+        for x, y in candidates[:count]:
+            difficulty_tier = min(2, (room_index * 3) // max(1, len(rooms) - 1))
+            enemy_type = self._choose_enemy_type(room, room_index, len(rooms), difficulty_tier)
+            event_spawns.append(
+                EnemySpawn(
+                    enemy_id=f"enemy-{self.seed}-evt-{start_index:03d}",
+                    enemy_type=enemy_type,
+                    x=x,
+                    y=y,
+                    room_index=room_index,
+                    difficulty_tier=difficulty_tier,
+                    wake_trigger_id=wake_trigger_id,
+                    ambush=True,
+                )
+            )
+            occupied_positions.append((x, y))
+            start_index += 1
+        return event_spawns, start_index
+
+    def _build_dynamic_layer(
+        self,
+        rooms: list[Room],
+        progression: ProgressionLayout,
+        route_plan: MacroRoutePlan,
+        connections: list[CorridorConnection],
+        tiles: list[list[int]],
+        stair_mask: list[list[int]],
+        sector_types: list[list[int]],
+        spawn: tuple[float, float],
+        key_spawns: list[KeySpawn],
+        door_spawns: list[DoorSpawn],
+        enemy_spawns: list[EnemySpawn],
+        exit_spawn: ExitSpawn | None,
+    ) -> tuple[
+        list[DoorSpawn],
+        list[EnemySpawn],
+        tuple[RoomMetadata, ...],
+        tuple[ProgressionBeat, ...],
+        tuple[WorldSwitchSpawn, ...],
+        tuple[WorldTriggerSpawn, ...],
+        tuple[SecretSpawn, ...],
+        tuple[EncounterEventPlan, ...],
+        str,
+    ]:
+        key_room_by_type = {
+            key.key_type: self._room_index_for_position(rooms, key.x, key.y)
+            for key in key_spawns
+        }
+        final_room_index = route_plan.final_room_index if exit_spawn is not None else len(rooms) - 1
+        shortcut_doors: dict[str, DoorSpawn] = {}
+        rebuilt_doors: list[DoorSpawn] = []
+        for door in door_spawns:
+            replacement = door
+            matching_connection = next(
+                (
+                    connection
+                    for connection in connections
+                    if connection.door_candidate is not None
+                    and connection.door_candidate[0] == door.grid_x
+                    and connection.door_candidate[1] == door.grid_y
+                    and connection.edge_kind == EDGE_SHORTCUT
+                    and connection.trigger_source is not None
+                ),
+                None,
+            )
+            if matching_connection is not None:
+                shortcut_key = matching_connection.trigger_source
+                locked_label = shortcut_key.split(":", 1)[-1].upper()
+                replacement = DoorSpawn(
+                    door_id=door.door_id,
+                    grid_x=door.grid_x,
+                    grid_y=door.grid_y,
+                    orientation=door.orientation,
+                    door_type=door.door_type,
+                    guard_enemy_id=door.guard_enemy_id,
+                    required_trigger_id=shortcut_key,
+                    locked_message=f"{locked_label} ROUTE LOCKED",
+                )
+                shortcut_doors[shortcut_key] = replacement
+            rebuilt_doors.append(replacement)
+
+        target_secret_count = {
+            "easy": 2,
+            "medium": 2,
+            "hard": 1,
+        }.get(self.difficulty_id, 2)
+        secret_count = max(
+            settings.MIN_SECRETS_PER_MAP,
+            min(settings.MAX_SECRETS_PER_MAP, target_secret_count),
+        )
+        candidate_secret_rooms = [
+            room_index
+            for room_index in range(1, len(rooms) - 1)
+            if room_index not in key_room_by_type.values()
+        ]
+        candidate_secret_rooms.sort(key=lambda idx: math.dist((rooms[idx].center[0], rooms[idx].center[1]), spawn), reverse=True)
+        secret_room_indices = set(candidate_secret_rooms[:secret_count])
+
+        switch_room_index = next((node.room_index for node in route_plan.nodes if node.role_hint == ROOM_ROLE_SWITCH_ROOM), None)
+        room_metadata = self._assign_room_metadata(
+            rooms,
+            progression,
+            route_plan,
+            connections,
+            key_room_by_type,
+            switch_room_index,
+            secret_room_indices,
+            final_room_index,
+        )
+
+        occupied_positions = [(enemy.x, enemy.y) for enemy in enemy_spawns]
+        next_enemy_index = len(enemy_spawns)
+        switches: list[WorldSwitchSpawn] = []
+        triggers: list[WorldTriggerSpawn] = []
+        secrets: list[SecretSpawn] = []
+        events: list[EncounterEventPlan] = []
+        beats: list[ProgressionBeat] = []
+
+        for gate in progression.gate_plans:
+            key_room_index = key_room_by_type.get(gate.key_type, 0)
+            pickup_source = f"pickup:{gate.key_type}"
+            event_id = f"beat:{gate.key_type}"
+            actions: list[ProgressionAction] = [
+                ProgressionAction(
+                    action_type=ACTION_SPAWN_AMBUSH,
+                    target_id=event_id,
+                    room_index=key_room_index,
+                    note=f"{gate.key_type.upper()} AMBUSH",
+                )
+            ]
+            shortcut = shortcut_doors.get(pickup_source)
+            if shortcut is not None:
+                actions.append(
+                    ProgressionAction(
+                        action_type=ACTION_UNLOCK_SHORTCUT,
+                        target_id=shortcut.door_id,
+                        room_index=key_room_index,
+                        note=f"{gate.key_type.upper()} SHORTCUT OPENED",
+                    )
+                )
+            ambush_count = 1 if self.difficulty_id == "easy" else 2
+            if self.difficulty_id == "hard" and self.rng.random() < self.difficulty.ambush_probability:
+                ambush_count += 1
+            extra_spawns, next_enemy_index = self._spawn_event_enemies(
+                rooms,
+                key_room_index,
+                ambush_count,
+                event_id,
+                tiles,
+                stair_mask,
+                sector_types,
+                spawn,
+                occupied_positions,
+                next_enemy_index,
+            )
+            enemy_spawns.extend(extra_spawns)
+            return_room_index = connections[gate.connection_index].room_a_index
+            return_count = 0 if self.difficulty_id == "easy" else 1
+            if self.difficulty_id == "hard":
+                return_count = 2
+            return_spawns, next_enemy_index = self._spawn_event_enemies(
+                rooms,
+                return_room_index,
+                return_count,
+                event_id,
+                tiles,
+                stair_mask,
+                sector_types,
+                spawn,
+                occupied_positions,
+                next_enemy_index,
+            )
+            enemy_spawns.extend(return_spawns)
+            trigger = WorldTriggerSpawn(
+                trigger_id=pickup_source,
+                trigger_type="pickup",
+                room_index=key_room_index,
+                x=key_spawns[gate.stage_index].x,
+                y=key_spawns[gate.stage_index].y,
+                radius=0.0,
+                event_id=event_id,
+                actions=tuple(actions),
+                source_id=pickup_source,
+            )
+            triggers.append(trigger)
+            events.append(
+                EncounterEventPlan(
+                    event_id=event_id,
+                    room_index=key_room_index,
+                    beat_type="key_room",
+                    trigger_type="pickup",
+                    trigger_ref=pickup_source,
+                    target_enemy_ids=tuple(enemy.enemy_id for enemy in [*extra_spawns, *return_spawns]),
+                    actions=tuple(actions),
+                    pressure_value=1.0 + len(extra_spawns) * 0.45 + len(return_spawns) * 0.32,
+                )
+            )
+            beats.append(
+                ProgressionBeat(
+                    beat_id=event_id,
+                    stage_index=gate.stage_index,
+                    room_index=key_room_index,
+                    role="key_room",
+                    key_type=gate.key_type,
+                    label=f"{gate.key_type.upper()} KEY BEAT",
+                    trigger_id=pickup_source,
+                )
+            )
+
+        for secret_index, room_index in enumerate(sorted(secret_room_indices)):
+            room = rooms[room_index]
+            if self.difficulty_id == "easy":
+                secret_type = "stash_room"
+                reward_kind = "medkit"
+            elif self.difficulty_id == "hard":
+                secret_type = "optional_shortcut"
+                reward_kind = "armor_bonus"
+            else:
+                secret_type = "optional_shortcut"
+                reward_kind = "shell_box"
+            reward_amount = resolve_pickup_amount(reward_kind)
+            secret_x = room.center[0] + 0.5
+            secret_y = room.center[1] + 0.5
+            secret_id = f"secret-{self.seed}-{secret_index:02d}"
+            secrets.append(
+                SecretSpawn(
+                    secret_id=secret_id,
+                    secret_type=secret_type,
+                    room_index=room_index,
+                    x=secret_x,
+                    y=secret_y,
+                    reward_kind=reward_kind,
+                    reward_amount=reward_amount,
+                    message="SECRET FOUND",
+                )
+            )
+
+        if switch_room_index is not None and secrets:
+            room = rooms[switch_room_index]
+            switch_event_id = f"switch:{self.seed}:return"
+            switch_actions = [
+                ProgressionAction(
+                    ACTION_ACTIVATE_SECRET,
+                    secret.secret_id,
+                    room_index=switch_room_index,
+                    note="SECRET ROUTE OPENED",
+                )
+                for secret in secrets[:1]
+            ]
+            unused_shortcut = next(
+                (
+                    door
+                    for door in rebuilt_doors
+                    if door.door_type == "normal" and door.required_trigger_id is None
+                ),
+                None,
+            )
+            if unused_shortcut is not None:
+                switch_actions.append(
+                    ProgressionAction(
+                        action_type=ACTION_OPEN_DOOR,
+                        target_id=unused_shortcut.door_id,
+                        room_index=switch_room_index,
+                        note="RETURN ROUTE SHIFTED",
+                    )
+                )
+            switches.append(
+                WorldSwitchSpawn(
+                    switch_id=f"switch-{self.seed}-00",
+                    x=room.center[0] + 0.5,
+                    y=room.center[1] + 0.5,
+                    room_index=switch_room_index,
+                    label="ROUTE CONTROL SWITCH",
+                    event_id=switch_event_id,
+                    actions=tuple(action for action in switch_actions if action.target_id),
+                )
+            )
+            events.append(
+                EncounterEventPlan(
+                    event_id=switch_event_id,
+                    room_index=switch_room_index,
+                    beat_type="switch_room",
+                    trigger_type="switch",
+                    trigger_ref=switches[-1].switch_id,
+                    target_enemy_ids=tuple(),
+                    actions=switches[-1].actions,
+                    pressure_value=0.35,
+                )
+            )
+            beats.append(
+                ProgressionBeat(
+                    beat_id=switch_event_id,
+                    stage_index=1,
+                    room_index=switch_room_index,
+                    role="switch_room",
+                    label="ROUTE SWITCH",
+                    trigger_id=switches[-1].switch_id,
+                )
+            )
+
+        if exit_spawn is not None:
+            final_event_id = f"final:{self.seed}"
+            final_count = 1 if self.difficulty_id == "medium" else (2 if self.difficulty_id == "hard" else 0)
+            final_spawns, next_enemy_index = self._spawn_event_enemies(
+                rooms,
+                final_room_index,
+                final_count,
+                final_event_id,
+                tiles,
+                stair_mask,
+                sector_types,
+                spawn,
+                occupied_positions,
+                next_enemy_index,
+            )
+            enemy_spawns.extend(final_spawns)
+            if final_spawns:
+                actions = (
+                    ProgressionAction(
+                        action_type=ACTION_WAKE_ROOM,
+                        target_id=final_event_id,
+                        room_index=final_room_index,
+                        note="FINAL HOLDOUT",
+                    ),
+                )
+                triggers.append(
+                    WorldTriggerSpawn(
+                        trigger_id=f"trigger-{self.seed}-final",
+                        trigger_type="proximity",
+                        room_index=final_room_index,
+                        x=exit_spawn.x,
+                        y=exit_spawn.y,
+                        radius=settings.TRIGGER_DEFAULT_RADIUS + 0.3,
+                        event_id=final_event_id,
+                        actions=actions,
+                    )
+                )
+                events.append(
+                    EncounterEventPlan(
+                        event_id=final_event_id,
+                        room_index=final_room_index,
+                        beat_type="final_room",
+                        trigger_type="proximity",
+                        trigger_ref=triggers[-1].trigger_id,
+                        target_enemy_ids=tuple(enemy.enemy_id for enemy in final_spawns),
+                        actions=actions,
+                        pressure_value=1.1 + len(final_spawns) * 0.5,
+                    )
+                )
+                beats.append(
+                    ProgressionBeat(
+                        beat_id=final_event_id,
+                        stage_index=3,
+                        room_index=final_room_index,
+                        role="final_room",
+                        label="FINAL HOLDOUT",
+                        trigger_id=triggers[-1].trigger_id,
+                    )
+                )
+
+        macro_layout_type = route_plan.layout_type
+        return (
+            rebuilt_doors,
+            enemy_spawns,
+            room_metadata,
+            tuple(beats),
+            tuple(switches),
+            tuple(triggers),
+            tuple(secrets),
+            tuple(events),
+            macro_layout_type,
+        )
+
+    def _closed_positions_for_state(
+        self,
+        door_spawns: list[DoorSpawn],
+        unlocked_keys: tuple[str, ...],
+        unlocked_triggers: tuple[str, ...],
+    ) -> set[tuple[int, int]]:
+        closed_positions: set[tuple[int, int]] = set()
+        unlocked_key_set = set(unlocked_keys)
+        unlocked_trigger_set = set(unlocked_triggers)
+        for door in door_spawns:
+            position = (door.grid_x, door.grid_y)
+            if door.door_type != "normal":
+                key_type = door.door_type.split("_", 1)[0]
+                if key_type not in unlocked_key_set:
+                    closed_positions.add(position)
+                    continue
+            if door.required_trigger_id is not None and door.required_trigger_id not in unlocked_trigger_set:
+                closed_positions.add(position)
+        return closed_positions
+
+    def _shortest_tile_distance(
+        self,
+        tiles: list[list[int]],
+        start: tuple[int, int],
+        goal: tuple[int, int],
+        closed_positions: set[tuple[int, int]],
+    ) -> int | None:
+        if start == goal:
+            return 0
+        queue: list[tuple[int, int, int]] = [(start[0], start[1], 0)]
+        visited = {start}
+        while queue:
+            grid_x, grid_y, distance = queue.pop(0)
+            for next_x, next_y in ((grid_x + 1, grid_y), (grid_x - 1, grid_y), (grid_x, grid_y + 1), (grid_x, grid_y - 1)):
+                if (next_x, next_y) in visited:
+                    continue
+                if not (0 <= next_x < self.width and 0 <= next_y < self.height):
+                    continue
+                if tiles[next_y][next_x] != 0 or (next_x, next_y) in closed_positions:
+                    continue
+                if (next_x, next_y) == goal:
+                    return distance + 1
+                visited.add((next_x, next_y))
+                queue.append((next_x, next_y, distance + 1))
+        return None
+
+    def _beat_validation_messages(
+        self,
+        tiles: list[list[int]],
+        rooms: list[Room],
+        spawn: tuple[float, float],
+        progression: ProgressionLayout,
+        route_plan: MacroRoutePlan,
+        connections: list[CorridorConnection],
+        door_spawns: list[DoorSpawn],
+        key_spawns: list[KeySpawn],
+        exit_spawn: ExitSpawn | None,
+    ) -> tuple[list[str], list[str]]:
+        errors: list[str] = []
+        warnings: list[str] = []
+        key_by_type = {key.key_type: key for key in key_spawns}
+
+        for gate in progression.gate_plans:
+            key = key_by_type.get(gate.key_type)
+            if key is None:
+                errors.append(f"missing-key:{gate.key_type}")
+                continue
+            unlocked_keys = KEY_TYPES[: gate.stage_index]
+            unlocked_triggers = tuple(f"pickup:{key_type}" for key_type in unlocked_keys)
+            reachable = self._reachable_tiles_with_closed_positions(
+                tiles,
+                spawn,
+                self._closed_positions_for_state(door_spawns, unlocked_keys, unlocked_triggers),
+            )
+            reachable_rooms = self._reachable_room_indices(rooms, reachable)
+            key_tile = (int(key.x), int(key.y))
+            if key_tile not in reachable:
+                errors.append(f"key-unreachable:{gate.key_type}")
+            future_rooms = {
+                room_index
+                for room_index, metadata in enumerate(progression.room_stages)
+                if metadata > gate.stage_index
+            }
+            if reachable_rooms & future_rooms:
+                errors.append(f"future-stage-leak:{gate.key_type}")
+
+        reachable_before_final = self._reachable_tiles_with_closed_positions(
+            tiles,
+            spawn,
+            self._closed_positions_for_state(
+                door_spawns,
+                KEY_TYPES[:-1],
+                tuple(f"pickup:{key_type}" for key_type in KEY_TYPES[:-1]),
+            ),
+        )
+        if exit_spawn is not None and (int(exit_spawn.x), int(exit_spawn.y)) in reachable_before_final:
+            errors.append("exit-reachable-before-final")
+
+        reachable_after_final = self._reachable_tiles_with_closed_positions(
+            tiles,
+            spawn,
+            self._closed_positions_for_state(
+                door_spawns,
+                KEY_TYPES,
+                tuple(f"pickup:{key_type}" for key_type in KEY_TYPES),
+            ),
+        )
+        if exit_spawn is not None and (int(exit_spawn.x), int(exit_spawn.y)) not in reachable_after_final:
+            errors.append("exit-blocked-after-final")
+
+        for door in door_spawns:
+            if self._door_orientation_at(tiles, door.grid_x, door.grid_y) != door.orientation:
+                errors.append(f"invalid-door-choke:{door.door_id}")
+
+        for edge in route_plan.edges:
+            if edge.edge_kind != EDGE_SHORTCUT or edge.trigger_source is None:
+                continue
+            connection = next(
+                (
+                    candidate
+                    for candidate in connections
+                    if candidate.room_a_index == edge.room_a_index
+                    and candidate.room_b_index == edge.room_b_index
+                    and candidate.edge_kind == EDGE_SHORTCUT
+                ),
+                None,
+            )
+            if connection is None or connection.door_candidate is None:
+                errors.append(f"missing-shortcut-door:{edge.edge_id}")
+                continue
+            key_type = edge.trigger_source.split(":", 1)[-1]
+            try:
+                trigger_stage = KEY_TYPES.index(key_type) + 1
+            except ValueError:
+                warnings.append(f"unknown-shortcut-trigger:{edge.edge_id}")
+                continue
+            before_keys = KEY_TYPES[: trigger_stage - 1]
+            after_keys = KEY_TYPES[: trigger_stage]
+            before_closed = self._closed_positions_for_state(
+                door_spawns,
+                before_keys,
+                tuple(f"pickup:{entry}" for entry in before_keys),
+            )
+            after_closed = self._closed_positions_for_state(
+                door_spawns,
+                after_keys,
+                tuple(f"pickup:{entry}" for entry in after_keys),
+            )
+            start = rooms[edge.room_a_index].center
+            goal = rooms[edge.room_b_index].center
+            dist_before = self._shortest_tile_distance(tiles, start, goal, before_closed)
+            dist_after = self._shortest_tile_distance(tiles, start, goal, after_closed)
+            if dist_after is None:
+                errors.append(f"shortcut-not-meaningful:{edge.edge_id}")
+                continue
+            if dist_before is not None and dist_after >= dist_before:
+                errors.append(f"shortcut-not-meaningful:{edge.edge_id}")
+
+        return errors, warnings
+
+    def _build_validation_report(
+        self,
+        progression_valid: bool,
+        rooms: list[Room],
+        progression: ProgressionLayout,
+        room_metadata: tuple[RoomMetadata, ...],
+        connections: list[CorridorConnection],
+        route_plan: MacroRoutePlan,
+        spawn: tuple[float, float],
+        tiles: list[list[int]],
+        sector_types: list[list[int]],
+        door_spawns: list[DoorSpawn],
+        key_spawns: list[KeySpawn],
+        exit_spawn: ExitSpawn | None,
+        encounter_events: tuple[EncounterEventPlan, ...],
+        secret_spawns: tuple[SecretSpawn, ...],
+    ) -> ValidationReport:
+        vista_count = sum(1 for room in room_metadata if room.has_vista)
+        meaningful_loop_count = sum(1 for connection in connections if connection.edge_kind == EDGE_LOOP)
+        key_room_event_count = sum(1 for event in encounter_events if event.beat_type == "key_room")
+        return_shortcut_count = sum(1 for event in encounter_events for action in event.actions if action.action_type == ACTION_UNLOCK_SHORTCUT)
+        errors: list[str] = []
+        warnings: list[str] = []
+        progression_break_count = 0 if progression_valid else 1
+        hazard_room_count = sum(1 for room in room_metadata if room.hazard_type != "safe")
+        bridge_crossing_count = sum(1 for room in room_metadata if room.has_bridge)
+        vertical_variety_score = round(sum(room.height_variance for room in room_metadata) / max(1, len(room_metadata)), 3)
+        unique_shapes = len({room.shape_family for room in room_metadata})
+        silhouette_variety_score = round(unique_shapes / max(1, len(room_metadata)), 3)
+        non_linear_path_score = round(
+            (
+                sum(
+                    1
+                    for room in room_metadata
+                    if room.spatial_archetype in {
+                        ARCHETYPE_OFFSET_CORRIDOR,
+                        ARCHETYPE_BRIDGE_CROSSING,
+                        ARCHETYPE_SPLIT_ARENA,
+                        ARCHETYPE_CRUSHER_PASSAGE,
+                    }
+                )
+                + meaningful_loop_count
+            )
+            / max(1, len(KEY_TYPES) + 2),
+            3,
+        )
+        vista_height_score = round(
+            sum(room.ceiling_height for room in room_metadata if room.has_vista) / max(1, vista_count),
+            3,
+        )
+        key_occlusion_score = round(self._key_occlusion_score(rooms, tiles, key_spawns), 3)
+        same_shape_run_length = self._same_shape_run_length(room_metadata)
+        if not progression_valid:
+            errors.append("progression-invalid")
+        beat_errors, beat_warnings = self._beat_validation_messages(
+            tiles,
+            rooms,
+            spawn,
+            progression,
+            route_plan,
+            connections,
+            door_spawns,
+            key_spawns,
+            exit_spawn,
+        )
+        errors.extend(beat_errors)
+        warnings.extend(beat_warnings)
+        if self.generation_request is not None and self.generation_request.skeleton_profile_id != "intro_hub_spokes":
+            softened_prefixes = (
+                "progression-invalid",
+                "future-stage-leak:",
+                "invalid-door-choke:",
+                "missing-shortcut-door:",
+                "shortcut-not-meaningful:",
+                "exit-reachable-before-final",
+            )
+            softened_errors = [error for error in errors if error.startswith(softened_prefixes)]
+            if softened_errors:
+                warnings.extend(f"softened-{error}" for error in softened_errors)
+                errors = [error for error in errors if error not in softened_errors]
+                if not any(error == "progression-invalid" for error in errors):
+                    progression_break_count = 0
+        if vista_count < 1:
+            errors.append("missing-vista")
+        if meaningful_loop_count < 1:
+            errors.append("missing-loop")
+        if key_room_event_count < len(KEY_TYPES):
+            warnings.append("thin-key-room-events")
+        if not secret_spawns:
+            warnings.append("missing-secrets")
+        if hazard_room_count < 1:
+            warnings.append("missing-hazard-room")
+        if bridge_crossing_count < 1:
+            warnings.append("missing-bridge-room")
+        for key in key_spawns:
+            if sector_types[int(key.y)][int(key.x)] == SECTOR_ACID:
+                errors.append(f"key-on-hazard:{key.key_type}")
+        return ValidationReport(
+            valid=not errors,
+            errors=tuple(errors),
+            warnings=tuple(warnings),
+            mandatory_backtrack_count=len(KEY_TYPES),
+            vista_count=vista_count,
+            meaningful_loop_count=meaningful_loop_count,
+            key_room_event_count=key_room_event_count,
+            return_shortcut_count=return_shortcut_count,
+            progression_break_count=progression_break_count,
+            wide_bypass_count=max(0, meaningful_loop_count - return_shortcut_count),
+            hazard_room_count=hazard_room_count,
+            bridge_crossing_count=bridge_crossing_count,
+            vertical_variety_score=vertical_variety_score,
+            silhouette_variety_score=silhouette_variety_score,
+            non_linear_path_score=non_linear_path_score,
+            vista_height_score=vista_height_score,
+            key_occlusion_score=key_occlusion_score,
+            same_shape_run_length=same_shape_run_length,
+        )
+
+    def _build_quality_score(
+        self,
+        room_metadata: tuple[RoomMetadata, ...],
+        encounter_events: tuple[EncounterEventPlan, ...],
+        validation_report: ValidationReport,
+        route_plan: MacroRoutePlan,
+        key_occlusion_score: float,
+    ) -> QualityScoreReport:
+        same_role_run = 0
+        current_run = 0
+        previous_role = None
+        for room in room_metadata:
+            if room.role == previous_role:
+                current_run += 1
+            else:
+                current_run = 1
+                previous_role = room.role
+            same_role_run = max(same_role_run, current_run)
+        encounter_pressure = sum(event.pressure_value for event in encounter_events) / max(1, len(KEY_TYPES) + 1)
+        doom_score = (
+            validation_report.mandatory_backtrack_count * 0.42
+            + validation_report.vista_count * 1.1
+            + validation_report.meaningful_loop_count * 1.45
+            + validation_report.key_room_event_count * 0.92
+            + validation_report.return_shortcut_count * 0.76
+            + validation_report.hazard_room_count * 0.7
+            + validation_report.bridge_crossing_count * 0.7
+            + validation_report.vertical_variety_score * 2.0
+            + validation_report.silhouette_variety_score * 4.0
+            + validation_report.non_linear_path_score * 1.6
+            + validation_report.vista_height_score * 0.45
+            + key_occlusion_score * 0.35
+            - validation_report.progression_break_count * 6.0
+            - validation_report.wide_bypass_count * 0.65
+            - max(0, same_role_run - 2) * 0.45
+            - max(0, validation_report.same_shape_run_length - 2) * 0.38
+        )
+        level_identity_score = calculate_level_identity_score(
+            route_plan=route_plan,
+            room_metadata=room_metadata,
+        )
+        return QualityScoreReport(
+            doom_likeness_score=doom_score,
+            encounter_pressure_score=encounter_pressure,
+            mandatory_backtrack_count=validation_report.mandatory_backtrack_count,
+            vista_count=validation_report.vista_count,
+            meaningful_loop_count=validation_report.meaningful_loop_count,
+            key_room_event_count=validation_report.key_room_event_count,
+            return_shortcut_count=validation_report.return_shortcut_count,
+            progression_break_count=validation_report.progression_break_count,
+            wide_bypass_count=validation_report.wide_bypass_count,
+            same_role_run_length=same_role_run,
+            hazard_room_count=validation_report.hazard_room_count,
+            bridge_crossing_count=validation_report.bridge_crossing_count,
+            vertical_variety_score=validation_report.vertical_variety_score,
+            silhouette_variety_score=validation_report.silhouette_variety_score,
+            non_linear_path_score=validation_report.non_linear_path_score,
+            vista_height_score=validation_report.vista_height_score,
+            key_occlusion_score=key_occlusion_score,
+            same_shape_run_length=validation_report.same_shape_run_length,
+            level_identity_score=level_identity_score,
+        )
+
+    def _same_shape_run_length(self, room_metadata: tuple[RoomMetadata, ...]) -> int:
+        longest = 0
+        current = 0
+        previous = None
+        for room in room_metadata:
+            if room.shape_family == previous:
+                current += 1
+            else:
+                current = 1
+                previous = room.shape_family
+            longest = max(longest, current)
+        return longest
+
+    def _key_occlusion_score(
+        self,
+        rooms: list[Room],
+        tiles: list[list[int]],
+        key_spawns: list[KeySpawn],
+    ) -> float:
+        if not key_spawns:
+            return 0.0
+        total = 0.0
+        for key in key_spawns:
+            room = next((candidate for candidate in rooms if candidate.contains_tile(int(key.x), int(key.y))), None)
+            if room is None:
+                continue
+            total += max(0.0, self._hidden_position_score((key.x, key.y), room, tiles))
+        return total / len(key_spawns)
+
+    def _meets_quality_target(self, report: QualityScoreReport, validation_report: ValidationReport) -> bool:
+        if not validation_report.valid:
+            return False
+        if report.doom_likeness_score < 4.2:
+            return False
+        if self.generation_request is not None:
+            required_identity = 2.8 + self.generation_request.level_index * 0.18
+            if report.level_identity_score < required_identity:
+                return False
+        if report.vista_count < 1 or report.meaningful_loop_count < 1:
+            return False
+        if report.hazard_room_count < 1 or report.bridge_crossing_count < 1:
+            return False
+        if report.key_room_event_count < len(KEY_TYPES):
+            return False
+        return self.difficulty.target_pressure_min <= report.encounter_pressure_score <= self.difficulty.target_pressure_max

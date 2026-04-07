@@ -125,6 +125,9 @@ class DoorSpawn:
     orientation: str
     door_type: str
     guard_enemy_id: str | None = None
+    required_trigger_id: str | None = None
+    locked_message: str | None = None
+    secret: bool = False
 
 
 @dataclass(frozen=True)
@@ -162,12 +165,18 @@ class WorldDoor:
     orientation: str
     door_type: str
     guard_enemy_id: str | None = None
+    required_trigger_id: str | None = None
+    locked_message: str | None = None
+    secret: bool = False
     state: str = "closed"
     open_progress: float = 0.0
+    trigger_unlocked: bool = False
 
     def __post_init__(self) -> None:
         required = self.definition.required_key_type
         if required is not None and self.state == "closed":
+            self.state = "locked"
+        if self.required_trigger_id is not None and not self.trigger_unlocked:
             self.state = "locked"
 
     @property
@@ -195,13 +204,20 @@ class WorldDoor:
     def can_open(self, owned_keys: set[str], guard_defeated: bool = True) -> bool:
         if not guard_defeated:
             return False
+        if self.required_trigger_id is not None and not self.trigger_unlocked:
+            return False
         required = self.definition.required_key_type
         if required is None:
             return True
         return required in owned_keys
 
     def unlock(self) -> None:
-        if self.definition.required_key_type is not None and self.state == "locked":
+        if self.required_trigger_id is not None:
+            self.trigger_unlocked = True
+        if self.state == "locked" and (
+            self.definition.required_key_type is not None
+            or self.required_trigger_id is not None
+        ):
             self.state = "closed"
 
     def begin_open(self) -> bool:

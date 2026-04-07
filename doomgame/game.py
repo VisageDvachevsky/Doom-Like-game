@@ -7,11 +7,19 @@ import pygame
 
 from doomgame import settings
 from doomgame.audio import DoomAudio
+from doomgame.debug_log import append_debug_log, clear_debug_log
 from doomgame.doors import KEY_DEFINITIONS, KEY_TYPES
 from doomgame.loot import get_pickup_definition
 from doomgame.mapgen import MapGenerator
 from doomgame.music import DoomMusicPlayer
 from doomgame.player import Player
+from doomgame.progression import (
+    CampaignSequenceDirector,
+    DIFFICULTY_IDS,
+    LevelGenerationRequest,
+    RunState,
+    get_difficulty_definition,
+)
 from doomgame.raycaster import Raycaster
 from doomgame.world import World
 
@@ -42,13 +50,18 @@ class DoomGame:
         self.music = DoomMusicPlayer()
         self.mouse_captured = False
         self.mouse_delta_x = 0.0
-        self._set_mouse_capture(True)
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("arial", 20, bold=True)
         self.small_font = pygame.font.SysFont("arial", 14, bold=True)
+        self.title_font = pygame.font.SysFont("arial", 42, bold=True)
         self.raycaster = Raycaster(settings.INTERNAL_RENDER_WIDTH, settings.INTERNAL_RENDER_HEIGHT)
         self.show_minimap = True
         self.running = True
+        self.awaiting_difficulty_selection = True
+        self.difficulty_ids = list(DIFFICULTY_IDS)
+        default_id = settings.DEFAULT_DIFFICULTY_ID if settings.DEFAULT_DIFFICULTY_ID in self.difficulty_ids else "medium"
+        self.difficulty_index = self.difficulty_ids.index(default_id)
+        self.difficulty_id = self.difficulty_ids[self.difficulty_index]
         self.time_seconds = 0.0
         self.walk_time = 0.0
         self.move_amount = 0.0
@@ -66,14 +79,25 @@ class DoomGame:
         self.pickup_flash_timer = 0.0
         self.pickup_flash_color = (255, 220, 160)
         self.level_complete_timer = 0.0
+        self.intermission_timer = 0.0
+        self.intermission_data: dict[str, str | int] = {}
         self.damage_flash_timer = 0.0
         self.damage_flash_color = (255, 76, 58)
         self.player_death_timer = 0.0
+        self.campaign_complete = False
+        self.run_state: RunState | None = None
+        self.sequence_director = CampaignSequenceDirector()
         self.ammo_pools = {
             "BULL": 0,
             "SHEL": self.ammo,
             "RCKT": 0,
             "CELL": 0,
+        }
+        self.level_start_snapshot = {
+            "health": self.health,
+            "armor": self.armor,
+            "ammo": self.ammo,
+            "ammo_pools": dict(self.ammo_pools),
         }
         self.selected_weapon_slot = 3
         self.keys_owned: set[str] = set()
@@ -93,10 +117,8 @@ class DoomGame:
         self.face_hit_timer = 0.0
         self.face_hit_state = "hit_light"
 
-        self.world = self._generate_world()
-        self.raycaster.set_world(self.world)
-        spawn_z = self.world.get_floor_height(*self.world.spawn)
-        self.player = Player(*self.world.spawn, angle=math.radians(15), z=float(spawn_z))
+        self.world: World | None = None
+        self.player: Player | None = None
         self.audio.start()
         self.music.start()
 
@@ -112,9 +134,125 @@ class DoomGame:
         self.music.stop()
         pygame.quit()
 
-    def _generate_world(self, seed: int | None = None) -> World:
-        generator = MapGenerator(seed=seed, difficulty_rating=self._enemy_difficulty_rating())
+    def _generate_world(
+        self,
+        seed: int | None = None,
+        generation_request: LevelGenerationRequest | None = None,
+    ) -> World:
+        generator = MapGenerator(
+            seed=seed,
+            difficulty_id=self.difficulty_id,
+            runtime_pressure_bias=self._enemy_difficulty_rating(),
+            generation_request=generation_request,
+        )
         return World.from_generated_map(generator.generate())
+
+    def start_run(self, difficulty_id: str, run_seed: int | None = None) -> None:
+        self.difficulty_id = difficulty_id
+        self.difficulty_index = self.difficulty_ids.index(difficulty_id)
+        self.awaiting_difficulty_selection = False
+        self.campaign_complete = False
+        self._set_mouse_capture(True)
+        self.health = settings.MAX_HEALTH
+        self.armor = 50
+        self.ammo = 32
+        self.ammo_pools = {
+            "BULL": 0,
+            "SHEL": self.ammo,
+            "RCKT": 0,
+            "CELL": 0,
+        }
+        resolved_run_seed = run_seed if run_seed is not None else random.randrange(1, 999_999)
+        self.run_state = self.sequence_director.build_run_state(difficulty_id, resolved_run_seed)
+        self.load_campaign_level(1, preserve_player_state=False, show_intermission=False)
+
+    def load_campaign_level(
+        self,
+        level_index: int,
+        preserve_player_state: bool = True,
+        show_intermission: bool = True,
+    ) -> None:
+        if self.run_state is None:
+            raise RuntimeError("Campaign run state is not initialized.")
+        if not preserve_player_state:
+            self.health = settings.MAX_HEALTH
+            self.armor = 50
+            self.ammo = 32
+            self.ammo_pools = {
+                "BULL": 0,
+                "SHEL": self.ammo,
+                "RCKT": 0,
+                "CELL": 0,
+            }
+
+        generation_request = self.sequence_director.build_generation_request(self.run_state, level_index)
+        clear_debug_log()
+        self.world = self._generate_world(generation_request=generation_request)
+        self.raycaster.set_world(self.world)
+        spawn_z = self.world.get_floor_height(*self.world.spawn)
+        self.player = Player(*self.world.spawn, angle=math.radians(15), z=float(spawn_z))
+        self.run_state.current_level_index = level_index
+        self.run_state.current_level_seed = generation_request.per_level_seed
+        self.keys_owned.clear()
+        self.pickup_message = ""
+        self.pickup_message_timer = 0.0
+        self.pickup_flash_timer = 0.0
+        self.level_complete_timer = 0.0
+        self.intermission_timer = 1.6 if show_intermission else 0.0
+        self.intermission_data = {
+            "level_index": level_index,
+            "total_level_count": self.run_state.total_level_count,
+            "title": self.world.level_title,
+            "subtitle": self.world.level_subtitle,
+            "difficulty": self.difficulty_id.upper(),
+            "seed": self.world.per_level_seed,
+        }
+        self.damage_flash_timer = 0.0
+        self.player_death_timer = 0.0
+        self.face_hit_timer = 0.0
+        self.face_hit_state = "hit_light"
+        self._reset_weapon_state()
+        self.level_start_snapshot = {
+            "health": self.health,
+            "armor": self.armor,
+            "ammo": self.ammo,
+            "ammo_pools": dict(self.ammo_pools),
+        }
+        append_debug_log(
+            "campaign-level-load "
+            f"run_seed={self.run_state.run_seed} "
+            f"level={self.world.level_index}/{self.run_state.total_level_count} "
+            f"archetype={self.world.level_archetype_id} "
+            f"skeleton={self.world.skeleton_profile_id} "
+            f"seed={self.world.per_level_seed}"
+        )
+
+    def advance_to_next_level(self) -> None:
+        if self.run_state is None or self.world is None:
+            return
+        current_level = self.run_state.current_level_index
+        if current_level not in self.run_state.completed_levels:
+            self.run_state.completed_levels.append(current_level)
+        if current_level >= self.run_state.total_level_count:
+            self.campaign_complete = True
+            self.intermission_timer = 0.0
+            self._set_mouse_capture(False)
+            self._show_message("CAMPAIGN CLEAR", (120, 255, 168))
+            return
+        self.load_campaign_level(current_level + 1, preserve_player_state=True, show_intermission=True)
+
+    def restart_current_level_after_death(self) -> None:
+        if self.run_state is None:
+            return
+        self.health = self.level_start_snapshot["health"]
+        self.armor = self.level_start_snapshot["armor"]
+        self.ammo = self.level_start_snapshot["ammo"]
+        self.ammo_pools = dict(self.level_start_snapshot["ammo_pools"])
+        self.load_campaign_level(
+            self.run_state.current_level_index,
+            preserve_player_state=True,
+            show_intermission=False,
+        )
 
     def _enemy_difficulty_rating(self) -> float:
         health = getattr(self, "health", settings.MAX_HEALTH) / max(1, settings.MAX_HEALTH)
@@ -160,18 +298,78 @@ class DoomGame:
             or self.face_panel_sprites.get("dead")
         )
 
+    def _begin_run_with_difficulty(self, difficulty_id: str) -> None:
+        self.start_run(difficulty_id)
+
+    def _draw_difficulty_menu(self) -> None:
+        self.screen.fill((10, 8, 12))
+        panel = pygame.Rect(settings.SCREEN_WIDTH // 2 - 260, settings.SCREEN_HEIGHT // 2 - 180, 520, 360)
+        pygame.draw.rect(self.screen, (28, 16, 16), panel, border_radius=8)
+        pygame.draw.rect(self.screen, (146, 108, 72), panel, 3, border_radius=8)
+
+        title = self.title_font.render("SELECT DIFFICULTY", True, (244, 218, 160))
+        subtitle = self.small_font.render("Difficulty changes encounter pressure, ambush density, and resources.", True, (204, 188, 152))
+        self.screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 44)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(panel.centerx, panel.y + 82)))
+
+        for idx, difficulty_id in enumerate(self.difficulty_ids):
+            definition = get_difficulty_definition(difficulty_id)
+            row = pygame.Rect(panel.x + 34, panel.y + 118 + idx * 68, panel.width - 68, 54)
+            active = idx == self.difficulty_index
+            fill = (96, 34, 26) if active else (44, 26, 24)
+            border = (236, 188, 132) if active else (122, 96, 80)
+            pygame.draw.rect(self.screen, fill, row, border_radius=6)
+            pygame.draw.rect(self.screen, border, row, 2, border_radius=6)
+            label = self.font.render(f"{idx + 1}. {definition.label}", True, (255, 236, 186))
+            pressure = self.small_font.render(
+                f"Enemies x{definition.enemy_count_scale:.2f}  |  ambush {int(definition.ambush_probability * 100)}%  |  pickups x{definition.pickup_density_scale:.2f}",
+                True,
+                (214, 198, 164),
+            )
+            self.screen.blit(label, (row.x + 14, row.y + 8))
+            self.screen.blit(pressure, (row.x + 14, row.y + 30))
+
+        footer = self.small_font.render("Arrow keys / 1-3 to choose, Enter to start", True, (188, 170, 136))
+        self.screen.blit(footer, footer.get_rect(center=(panel.centerx, panel.bottom - 24)))
+
     def _handle_events(self) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+            elif self.awaiting_difficulty_selection:
+                if event.type != pygame.KEYDOWN:
+                    continue
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+                elif event.key in (pygame.K_UP, pygame.K_w):
+                    self.difficulty_index = (self.difficulty_index - 1) % len(self.difficulty_ids)
+                    self.difficulty_id = self.difficulty_ids[self.difficulty_index]
+                elif event.key in (pygame.K_DOWN, pygame.K_s):
+                    self.difficulty_index = (self.difficulty_index + 1) % len(self.difficulty_ids)
+                    self.difficulty_id = self.difficulty_ids[self.difficulty_index]
+                elif event.key in (pygame.K_1, pygame.K_KP1):
+                    self._begin_run_with_difficulty(self.difficulty_ids[0])
+                elif event.key in (pygame.K_2, pygame.K_KP2):
+                    self._begin_run_with_difficulty(self.difficulty_ids[1])
+                elif event.key in (pygame.K_3, pygame.K_KP3):
+                    self._begin_run_with_difficulty(self.difficulty_ids[2])
+                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self._begin_run_with_difficulty(self.difficulty_id)
             elif event.type == pygame.MOUSEMOTION and self.mouse_captured:
                 self.mouse_delta_x += event.rel[0]
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
+                elif event.key == pygame.K_F2:
+                    self.awaiting_difficulty_selection = True
+                    self.campaign_complete = False
+                    self.run_state = None
+                    self._set_mouse_capture(False)
                 elif event.key == pygame.K_r:
-                    self._reset_level(random.randrange(1, 999_999), reroll_stats=True)
+                    self.restart_current_level_after_death()
                 elif event.key == pygame.K_e:
+                    if self.campaign_complete:
+                        continue
                     self._try_use_door()
                 elif event.key == pygame.K_TAB:
                     self.show_minimap = not self.show_minimap
@@ -185,19 +383,22 @@ class DoomGame:
                 self._try_fire()
 
     def _update(self, delta_time: float) -> None:
+        if self.awaiting_difficulty_selection or self.world is None or self.player is None:
+            return
+        if self.campaign_complete:
+            return
+        if self.intermission_timer > 0.0:
+            self.intermission_timer = max(0.0, self.intermission_timer - delta_time)
         if self.player_death_timer > 0.0:
             self.player_death_timer = max(0.0, self.player_death_timer - delta_time)
             self.damage_flash_timer = max(0.0, self.damage_flash_timer - delta_time * 2.6)
             if self.player_death_timer <= 0.0:
-                self.health = settings.MAX_HEALTH
-                self.armor = 25
-                self.ammo = max(self.ammo, 16)
-                self._reset_level(random.randrange(1, 999_999), reroll_stats=False)
+                self.restart_current_level_after_death()
             return
         if self.level_complete_timer > 0.0:
             self.level_complete_timer = max(0.0, self.level_complete_timer - delta_time)
             if self.level_complete_timer <= 0.0:
-                self._reset_level(random.randrange(1, 999_999), reroll_stats=False)
+                self.advance_to_next_level()
             return
         keys = pygame.key.get_pressed()
 
@@ -228,6 +429,10 @@ class DoomGame:
             self.ammo = max(0, self.ammo - 0)
 
     def _render(self) -> None:
+        if self.awaiting_difficulty_selection or self.world is None or self.player is None:
+            self._draw_difficulty_menu()
+            pygame.display.flip()
+            return
         self.scene_surface.fill((0, 0, 0))
         self.raycaster.render(
             self.scene_surface,
@@ -250,6 +455,11 @@ class DoomGame:
             self._draw_minimap()
         self._draw_pickup_message()
         self._draw_hud()
+        self._draw_interact_debug()
+        if self.intermission_timer > 0.0:
+            self._draw_intermission_overlay()
+        if self.campaign_complete:
+            self._draw_campaign_complete_overlay()
         pygame.display.flip()
 
     def _draw_minimap(self) -> None:
@@ -266,7 +476,12 @@ class DoomGame:
                     color = (148, 76, 54)
                 else:
                     level = self.world.floor_heights[y][x]
-                    if self.world.is_stair_at(x, y):
+                    sector_type = self.world.get_sector_type_at(x, y)
+                    if sector_type == 1:
+                        color = (72, 182, 96)
+                    elif sector_type == 2:
+                        color = (202, 186, 118)
+                    elif self.world.is_stair_at(x, y):
                         color = (196, 176, 84)
                     else:
                         shade = min(220, 34 + level * 38)
@@ -303,6 +518,17 @@ class DoomGame:
             pygame.draw.circle(minimap, loot_color, (lx, ly), max(2, scale // 3))
             pygame.draw.circle(minimap, (255, 244, 220), (lx, ly), max(2, scale // 3), 1)
 
+        for switch in self.world.active_switches():
+            sx = int(switch.x * scale)
+            sy = int(switch.y * scale)
+            pygame.draw.rect(minimap, (98, 232, 176), (sx - 2, sy - 2, 5, 5))
+
+        if settings.DEV_MODE:
+            for secret in self.world.secrets:
+                sx = int(secret.x * scale)
+                sy = int(secret.y * scale)
+                pygame.draw.circle(minimap, (228, 194, 98), (sx, sy), max(2, scale // 3), 1)
+
         px = self.player.x * scale
         py = self.player.y * scale
         pygame.draw.circle(minimap, (255, 230, 164), (int(px), int(py)), max(2, scale // 3))
@@ -322,7 +548,7 @@ class DoomGame:
         self.weapon_recoil = 0.0
 
     def _try_fire(self) -> None:
-        if self.player_death_timer > 0.0:
+        if self.player_death_timer > 0.0 or self.campaign_complete:
             return
         if self.shot_cooldown > 0.0 or self.ammo <= 0:
             if self.ammo <= 0:
@@ -393,6 +619,8 @@ class DoomGame:
             self.audio.play_pickup()
 
     def _collect_keys(self) -> None:
+        if self.world is None or self.player is None:
+            return
         for key in self.world.active_keys():
             if math.hypot(key.x - self.player.x, key.y - self.player.y) > settings.PICKUP_RADIUS:
                 continue
@@ -403,10 +631,32 @@ class DoomGame:
                 continue
             key.collected = True
             self.keys_owned.add(key.key_type)
+            append_debug_log(
+                "key-picked "
+                f"key_id={key.key_id} "
+                f"key_type={key.key_type} "
+                f"pos=({key.x:.2f},{key.y:.2f}) "
+                f"owned={sorted(self.keys_owned)}"
+            )
             self._show_message(key.definition.pickup_message, key.definition.visual.glow_color)
             self.audio.play_key_pickup()
+            for message in self.world.handle_key_pickup(key.key_type, audio=self.audio):
+                self._show_message(message, key.definition.visual.glow_color)
 
     def _try_use_door(self) -> None:
+        if self.world is None or self.player is None:
+            return
+        switch, switch_messages, activated = self.world.interact_with_switch(
+            self.player.x,
+            self.player.y,
+            self.player.angle,
+            audio=self.audio,
+        )
+        if activated and switch is not None:
+            self._show_message(switch.label, (120, 240, 176))
+            for message in switch_messages:
+                self._show_message(message, (236, 210, 140))
+            return
         door, message, opened = self.world.interact_with_door(
             self.player.x,
             self.player.y,
@@ -414,7 +664,24 @@ class DoomGame:
             self.keys_owned,
         )
         if door is None:
+            append_debug_log(
+                "door-interact-none "
+                f"player=({self.player.x:.2f},{self.player.y:.2f}) "
+                f"angle={self.player.angle:.3f} "
+                f"owned={sorted(self.keys_owned)}"
+            )
             return
+        append_debug_log(
+            "door-interact-result "
+            f"door_id={door.door_id} "
+            f"door_type={door.door_type} "
+            f"state={door.state} "
+            f"trigger_unlocked={door.trigger_unlocked} "
+            f"required_trigger_id={door.required_trigger_id} "
+            f"opened={opened} "
+            f"message={message!r} "
+            f"owned={sorted(self.keys_owned)}"
+        )
         if opened:
             self.audio.play_door_open()
             return
@@ -428,26 +695,24 @@ class DoomGame:
         if not self.world.is_player_in_exit(self.player.x, self.player.y):
             return
         self.level_complete_timer = 0.7
-        self._show_message("LEVEL CLEAR", (120, 255, 168))
+        if self.run_state is not None and self.run_state.current_level_index >= self.run_state.total_level_count:
+            self._show_message("FINAL GATE CLEARED", (120, 255, 168))
+        else:
+            self._show_message("LEVEL CLEAR", (120, 255, 168))
 
     def _reset_level(self, seed: int, reroll_stats: bool) -> None:
-        self.world = self._generate_world(seed)
-        self.raycaster.set_world(self.world)
-        spawn_z = self.world.get_floor_height(*self.world.spawn)
-        self.player = Player(*self.world.spawn, angle=math.radians(15), z=float(spawn_z))
         if reroll_stats:
             self.ammo = random.randint(18, 48)
             self.armor = random.choice((0, 25, 50, 100))
-        self.ammo_pools["SHEL"] = self.ammo
+            self.ammo_pools["SHEL"] = self.ammo
+        self.world = self._generate_world(seed=seed)
+        self.raycaster.set_world(self.world)
+        spawn_z = self.world.get_floor_height(*self.world.spawn)
+        self.player = Player(*self.world.spawn, angle=math.radians(15), z=float(spawn_z))
         self.keys_owned.clear()
-        self.pickup_message = ""
-        self.pickup_message_timer = 0.0
-        self.pickup_flash_timer = 0.0
         self.level_complete_timer = 0.0
-        self.damage_flash_timer = 0.0
+        self.intermission_timer = 0.0
         self.player_death_timer = 0.0
-        self.face_hit_timer = 0.0
-        self.face_hit_state = "hit_light"
         self._reset_weapon_state()
 
     def _apply_loot(self, kind: str, amount: int) -> str | None:
@@ -500,13 +765,16 @@ class DoomGame:
         damage_taken = max(0, amount - absorbed)
         self.health = max(0, self.health - damage_taken)
         self.audio.play_player_hit()
+        if source == "acid":
+            self._show_message("ACID BURNS", (132, 236, 118))
         if damage_taken >= 18:
             self.face_hit_state = "hit_heavy"
             self.face_hit_timer = 0.32
         else:
             self.face_hit_state = "hit_light"
             self.face_hit_timer = 0.18
-        self._trigger_damage_flash((255, 72, 52), settings.PLAYER_DAMAGE_FLASH_TIME)
+        flash_color = (148, 236, 88) if source == "acid" else (255, 72, 52)
+        self._trigger_damage_flash(flash_color, settings.PLAYER_DAMAGE_FLASH_TIME)
         if self.health > 0:
             return
         self.player_death_timer = settings.PLAYER_DEATH_RESET_TIME
@@ -566,6 +834,70 @@ class DoomGame:
         self._draw_key_panel(pygame.Rect(left_panel_x, hud_y + 62, 120, 44))
         self._draw_status_text(pygame.Rect(face_rect.right + 12, hud_y + 62, 132, 44))
         self._draw_ammo_reserves(pygame.Rect(252, hud_y + 18, 150, 88))
+
+    def _draw_interact_debug(self) -> None:
+        if self.world is None or self.player is None:
+            return
+        lines = self._current_interact_debug_lines()
+        if not lines:
+            return
+        panel_width = 438
+        line_height = 18
+        panel_height = 10 + len(lines) * line_height
+        panel = pygame.Rect(
+            settings.SCREEN_WIDTH - panel_width - 14,
+            14,
+            panel_width,
+            panel_height,
+        )
+        overlay = pygame.Surface(panel.size, pygame.SRCALPHA)
+        overlay.fill((8, 8, 10, 210))
+        self.screen.blit(overlay, panel.topleft)
+        pygame.draw.rect(self.screen, (186, 154, 104), panel, 2, border_radius=4)
+        for index, line in enumerate(lines):
+            color = (250, 224, 176) if index == 0 else (220, 202, 164)
+            text = self.small_font.render(line, True, color)
+            self.screen.blit(text, (panel.x + 10, panel.y + 6 + index * line_height))
+
+    def _current_interact_debug_lines(self) -> list[str]:
+        if self.world is None or self.player is None:
+            return []
+        switch = self.world.find_interactable_switch(
+            self.player.x,
+            self.player.y,
+            self.player.angle,
+        )
+        if switch is not None:
+            return [
+                "TARGET SWITCH",
+                switch.label,
+            ]
+
+        door = self.world.find_interactable_door(
+            self.player.x,
+            self.player.y,
+            self.player.angle,
+        )
+        if door is None:
+            return []
+        required_key = door.definition.required_key_type
+        if required_key is not None:
+            title = f"{required_key.upper()} DOOR"
+        elif door.required_trigger_id is not None:
+            title = "LOCKED SHORTCUT"
+        else:
+            title = "DOOR"
+        state_parts: list[str] = [f"state={door.state}"]
+        if required_key is not None:
+            state_parts.append(f"key={'YES' if required_key in self.keys_owned else 'NO'}")
+        if door.required_trigger_id is not None:
+            state_parts.append(f"route={'OPEN' if door.trigger_unlocked else 'LOCKED'}")
+        if door.guard_enemy_id is not None:
+            state_parts.append("warden-lock")
+        return [
+            f"TARGET {title}",
+            " | ".join(state_parts),
+        ]
 
     def _draw_hud_panel(self, rect: pygame.Rect) -> None:
         pygame.draw.rect(self.screen, (62, 56, 52), rect)
@@ -703,9 +1035,72 @@ class DoomGame:
         pygame.draw.rect(self.screen, (18, 12, 12), rect.inflate(-6, -6), border_radius=3)
         pygame.draw.rect(self.screen, (142, 136, 126), rect, 2, border_radius=4)
         label = self.small_font.render("LEVEL", True, (208, 192, 148))
-        seed = self.small_font.render(str(self.world.seed), True, (238, 212, 166))
+        level_text = (
+            f"L{self.world.level_index}/{self.run_state.total_level_count}"
+            if self.run_state is not None
+            else f"SEED {self.world.seed}"
+        )
+        seed = self.small_font.render(level_text, True, (238, 212, 166))
+        difficulty = self.small_font.render(self.difficulty_id.upper(), True, (188, 104, 92))
+        subtitle = self.small_font.render(self.world.level_subtitle[:14], True, (198, 176, 138))
         self.screen.blit(label, (rect.x + 8, rect.y + 4))
         self.screen.blit(seed, (rect.x + 8, rect.y + 20))
+        self.screen.blit(difficulty, difficulty.get_rect(topright=(rect.right - 8, rect.y + 20)))
+        self.screen.blit(subtitle, (rect.x + 8, rect.y + 32))
+
+    def _draw_intermission_overlay(self) -> None:
+        if not self.intermission_data:
+            return
+        overlay = pygame.Surface((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((6, 4, 8, 176))
+        self.screen.blit(overlay, (0, 0))
+        panel = pygame.Rect(settings.SCREEN_WIDTH // 2 - 250, settings.SCREEN_HEIGHT // 2 - 120, 500, 240)
+        pygame.draw.rect(self.screen, (28, 16, 16), panel, border_radius=8)
+        pygame.draw.rect(self.screen, (186, 144, 90), panel, 3, border_radius=8)
+        level_line = self.title_font.render(
+            f"LEVEL {self.intermission_data['level_index']}",
+            True,
+            (248, 226, 172),
+        )
+        title = self.font.render(str(self.intermission_data["title"]).upper(), True, (236, 208, 152))
+        subtitle = self.font.render(str(self.intermission_data["subtitle"]), True, (206, 188, 156))
+        meta = self.small_font.render(
+            f"{self.intermission_data['difficulty']}  |  seed {self.intermission_data['seed']}",
+            True,
+            (188, 170, 136),
+        )
+        total_line = self.small_font.render(
+            f"{self.intermission_data['level_index']}/{self.intermission_data['total_level_count']}",
+            True,
+            (188, 104, 92),
+        )
+        self.screen.blit(level_line, level_line.get_rect(center=(panel.centerx, panel.y + 56)))
+        self.screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 106)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(panel.centerx, panel.y + 140)))
+        self.screen.blit(meta, meta.get_rect(center=(panel.centerx, panel.y + 178)))
+        self.screen.blit(total_line, total_line.get_rect(center=(panel.centerx, panel.y + 204)))
+
+    def _draw_campaign_complete_overlay(self) -> None:
+        overlay = pygame.Surface((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((8, 4, 8, 208))
+        self.screen.blit(overlay, (0, 0))
+        panel = pygame.Rect(settings.SCREEN_WIDTH // 2 - 280, settings.SCREEN_HEIGHT // 2 - 150, 560, 300)
+        pygame.draw.rect(self.screen, (30, 14, 14), panel, border_radius=8)
+        pygame.draw.rect(self.screen, (210, 176, 112), panel, 3, border_radius=8)
+        title = self.title_font.render("CAMPAIGN CLEAR", True, (255, 234, 182))
+        difficulty = self.font.render(f"DIFFICULTY: {self.difficulty_id.upper()}", True, (236, 208, 152))
+        completed = self.font.render(
+            f"COMPLETED: {len(self.run_state.completed_levels)}/{self.run_state.total_level_count}",
+            True,
+            (236, 208, 152),
+        )
+        seed = self.font.render(f"RUN SEED: {self.run_state.run_seed}", True, (188, 104, 92))
+        footer = self.small_font.render("F2 to return to difficulty select", True, (188, 170, 136))
+        self.screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 64)))
+        self.screen.blit(difficulty, difficulty.get_rect(center=(panel.centerx, panel.y + 136)))
+        self.screen.blit(completed, completed.get_rect(center=(panel.centerx, panel.y + 176)))
+        self.screen.blit(seed, seed.get_rect(center=(panel.centerx, panel.y + 216)))
+        self.screen.blit(footer, footer.get_rect(center=(panel.centerx, panel.y + 258)))
 
     def _draw_ammo_reserves(self, rect: pygame.Rect) -> None:
         pygame.draw.rect(self.screen, (42, 40, 42), rect, border_radius=4)

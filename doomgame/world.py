@@ -4,11 +4,28 @@ from dataclasses import dataclass
 import math
 import random
 
+from doomgame.debug_log import append_debug_log
 from doomgame.enemies import EnemyProjectile, EnemySpawn, WorldEnemy, build_enemy_runtime
 from doomgame import settings
 from doomgame.doors import DoorSpawn, KeyPickup, KeySpawn, WorldDoor
 from doomgame.loot import PickupDefinition, get_pickup_definition
-from doomgame.mapgen import ExitSpawn, GeneratedMap, LootSpawn
+from doomgame.mapgen import GeneratedMap
+from doomgame.progression import (
+    ACTION_ACTIVATE_EXIT_ROUTE,
+    ACTION_ACTIVATE_SECRET,
+    ACTION_OPEN_DOOR,
+    ACTION_SPAWN_AMBUSH,
+    ACTION_UNLOCK_SHORTCUT,
+    ACTION_WAKE_ROOM,
+    EncounterEventPlan,
+    ProgressionAction,
+    QualityScoreReport,
+    RoomMetadata,
+    SecretSpawn,
+    ValidationReport,
+    WorldSwitchSpawn,
+    WorldTriggerSpawn,
+)
 
 
 @dataclass
@@ -43,11 +60,63 @@ class HitscanImpact:
 
 
 @dataclass
+class WorldSwitch:
+    switch_id: str
+    x: float
+    y: float
+    room_index: int
+    label: str
+    event_id: str
+    actions: tuple[ProgressionAction, ...]
+    once: bool = True
+    activated: bool = False
+
+    @property
+    def sprite_kind(self) -> str:
+        return "switch_on" if self.activated else "switch_off"
+
+
+@dataclass
+class WorldTrigger:
+    trigger_id: str
+    trigger_type: str
+    room_index: int
+    x: float
+    y: float
+    radius: float
+    event_id: str
+    actions: tuple[ProgressionAction, ...]
+    source_id: str | None = None
+    once: bool = True
+    activated: bool = False
+
+
+@dataclass
+class WorldSecret:
+    secret_id: str
+    secret_type: str
+    room_index: int
+    x: float
+    y: float
+    reward_kind: str | None = None
+    reward_amount: int = 0
+    door_id: str | None = None
+    message: str = ""
+    discovered: bool = False
+
+    @property
+    def sprite_kind(self) -> str:
+        return "secret"
+
+
+@dataclass
 class World:
     tiles: list[list[int]]
     floor_heights: list[list[int]]
+    ceiling_heights: list[list[int]]
     stair_mask: list[list[int]]
     room_kinds: list[list[int]]
+    sector_types: list[list[int]]
     loot: list[LootPickup]
     enemies: list[WorldEnemy]
     enemy_projectiles: list[EnemyProjectile]
@@ -56,18 +125,42 @@ class World:
     exit_zone: "LevelExit | None"
     spawn: tuple[float, float]
     seed: int
+    run_seed: int
+    per_level_seed: int
+    difficulty_id: str
+    level_index: int
+    level_archetype_id: str
+    skeleton_profile_id: str
+    level_title: str
+    level_subtitle: str
+    macro_layout_type: str
+    macro_signature: str
+    room_metadata: tuple[RoomMetadata, ...]
+    switches: list[WorldSwitch]
+    triggers: list[WorldTrigger]
+    secrets: list[WorldSecret]
+    encounter_events: tuple[EncounterEventPlan, ...]
+    validation_report: ValidationReport
+    quality_report: QualityScoreReport
     combat_rng: random.Random = None
     noise_position: tuple[float, float] | None = None
     noise_radius: float = 0.0
     noise_timer: float = 0.0
+    activated_events: set[str] = None
+    activated_triggers: set[str] = None
+    player_hazard_exposure: float = 0.0
+    player_hazard_tick_timer: float = 0.0
+    enemy_hazard_timers: dict[str, float] = None
 
     @classmethod
     def from_generated_map(cls, generated: GeneratedMap) -> "World":
         world = cls(
             tiles=generated.tiles,
             floor_heights=generated.floor_heights,
+            ceiling_heights=generated.ceiling_heights,
             stair_mask=generated.stair_mask,
             room_kinds=generated.room_kinds,
+            sector_types=generated.sector_types,
             loot=[cls._loot_from_generated(entry) for entry in generated.loot_spawns],
             enemies=[cls._enemy_from_generated(entry) for entry in generated.enemy_spawns],
             enemy_projectiles=[],
@@ -76,8 +169,28 @@ class World:
             exit_zone=cls._exit_from_generated(generated.exit_spawn),
             spawn=generated.spawn,
             seed=generated.seed,
+            run_seed=generated.run_seed,
+            per_level_seed=generated.per_level_seed,
+            difficulty_id=generated.difficulty_id,
+            level_index=generated.level_index,
+            level_archetype_id=generated.level_archetype_id,
+            skeleton_profile_id=generated.skeleton_profile_id,
+            level_title=generated.level_title,
+            level_subtitle=generated.level_subtitle,
+            macro_layout_type=generated.macro_layout_type,
+            macro_signature=generated.macro_signature,
+            room_metadata=generated.room_metadata,
+            switches=[cls._switch_from_generated(entry) for entry in generated.switch_spawns],
+            triggers=[cls._trigger_from_generated(entry) for entry in generated.trigger_spawns],
+            secrets=[cls._secret_from_generated(entry) for entry in generated.secret_spawns],
+            encounter_events=generated.encounter_events,
+            validation_report=generated.validation_report,
+            quality_report=generated.quality_report,
         )
         world.combat_rng = random.Random(generated.seed ^ 0xE61F)
+        world.activated_events = set()
+        world.activated_triggers = set()
+        world.enemy_hazard_timers = {}
         return world
 
     @staticmethod
@@ -106,6 +219,9 @@ class World:
             orientation=entry.orientation,
             door_type=entry.door_type,
             guard_enemy_id=entry.guard_enemy_id,
+            required_trigger_id=entry.required_trigger_id,
+            locked_message=entry.locked_message,
+            secret=entry.secret,
         )
 
     @staticmethod
@@ -119,6 +235,48 @@ class World:
         key.bob_phase = ((entry.x * 1.67) + (entry.y * 1.19)) % math.tau
         key.scale = key.definition.visual.world_scale
         return key
+
+    @staticmethod
+    def _switch_from_generated(entry: WorldSwitchSpawn) -> WorldSwitch:
+        return WorldSwitch(
+            switch_id=entry.switch_id,
+            x=entry.x,
+            y=entry.y,
+            room_index=entry.room_index,
+            label=entry.label,
+            event_id=entry.event_id,
+            actions=entry.actions,
+            once=entry.once,
+        )
+
+    @staticmethod
+    def _trigger_from_generated(entry: WorldTriggerSpawn) -> WorldTrigger:
+        return WorldTrigger(
+            trigger_id=entry.trigger_id,
+            trigger_type=entry.trigger_type,
+            room_index=entry.room_index,
+            x=entry.x,
+            y=entry.y,
+            radius=entry.radius,
+            event_id=entry.event_id,
+            actions=entry.actions,
+            source_id=entry.source_id,
+            once=entry.once,
+        )
+
+    @staticmethod
+    def _secret_from_generated(entry: SecretSpawn) -> WorldSecret:
+        return WorldSecret(
+            secret_id=entry.secret_id,
+            secret_type=entry.secret_type,
+            room_index=entry.room_index,
+            x=entry.x,
+            y=entry.y,
+            reward_kind=entry.reward_kind,
+            reward_amount=entry.reward_amount,
+            door_id=entry.door_id,
+            message=entry.message,
+        )
 
     @staticmethod
     def _exit_from_generated(entry: ExitSpawn | None) -> "LevelExit | None":
@@ -154,11 +312,13 @@ class World:
             self.noise_radius = 0.0
         if player is None or damage_player is None or audio is None:
             return
+        self._process_proximity_triggers(player, audio)
         for enemy in self.enemies:
             enemy.update(self, player, delta_time, self.combat_rng, damage_player, audio)
         for projectile in self.enemy_projectiles:
             projectile.update(self, player, delta_time, damage_player, audio)
         self.enemy_projectiles = [projectile for projectile in self.enemy_projectiles if not projectile.removed]
+        self._update_environmental_hazards(delta_time, player, damage_player, audio)
         self.resolve_enemy_separation(player)
 
     def is_wall(self, grid_x: int, grid_y: int) -> bool:
@@ -195,6 +355,19 @@ class World:
     def get_floor_height(self, x: float, y: float) -> int:
         return self.get_floor_height_at(int(x), int(y))
 
+    def get_ceiling_height_at(self, grid_x: int, grid_y: int) -> int:
+        if grid_x < 0 or grid_y < 0 or grid_x >= self.width or grid_y >= self.height:
+            return 1
+        return self.ceiling_heights[grid_y][grid_x]
+
+    def get_sector_type_at(self, grid_x: int, grid_y: int) -> int:
+        if grid_x < 0 or grid_y < 0 or grid_x >= self.width or grid_y >= self.height:
+            return 0
+        return self.sector_types[grid_y][grid_x]
+
+    def get_sector_type(self, x: float, y: float) -> int:
+        return self.get_sector_type_at(int(x), int(y))
+
     def get_local_floor_height(self, x: float, y: float, radius: float) -> int:
         points = (
             (x, y),
@@ -228,6 +401,8 @@ class World:
         for enemy in self.enemies:
             if enemy.removed:
                 continue
+            if not enemy.active:
+                continue
             if include_corpses:
                 result.append(enemy)
             elif enemy.alive and not enemy.dead:
@@ -236,6 +411,157 @@ class World:
 
     def active_enemy_projectiles(self) -> list[EnemyProjectile]:
         return [projectile for projectile in self.enemy_projectiles if not projectile.removed]
+
+    def active_switches(self) -> list[WorldSwitch]:
+        return [switch for switch in self.switches if not switch.activated]
+
+    def visible_secrets(self) -> list[WorldSecret]:
+        return [secret for secret in self.secrets if secret.discovered]
+
+    def _update_environmental_hazards(self, delta_time: float, player, damage_player, audio=None) -> None:
+        if self.get_sector_type(player.x, player.y) == 1:
+            self.player_hazard_exposure += delta_time
+            self.player_hazard_tick_timer = max(0.0, self.player_hazard_tick_timer - delta_time)
+            if self.player_hazard_exposure >= settings.ACID_GRACE_TIME and self.player_hazard_tick_timer <= 0.0:
+                self.player_hazard_tick_timer = settings.ACID_DAMAGE_INTERVAL
+                damage_player(settings.ACID_DAMAGE, "acid")
+        else:
+            self.player_hazard_exposure = 0.0
+            self.player_hazard_tick_timer = 0.0
+
+        active_enemy_ids: set[str] = set()
+        for enemy in self.active_enemies(include_corpses=False):
+            active_enemy_ids.add(enemy.enemy_id)
+            if self.get_sector_type(enemy.x, enemy.y) != 1:
+                self.enemy_hazard_timers.pop(enemy.enemy_id, None)
+                continue
+            timer = self.enemy_hazard_timers.get(enemy.enemy_id, settings.ACID_GRACE_TIME * 0.75) - delta_time
+            if timer <= 0.0:
+                enemy.take_damage(settings.ACID_ENEMY_DAMAGE, self.combat_rng)
+                timer = settings.ACID_DAMAGE_INTERVAL
+            self.enemy_hazard_timers[enemy.enemy_id] = timer
+        for enemy_id in tuple(self.enemy_hazard_timers):
+            if enemy_id not in active_enemy_ids:
+                self.enemy_hazard_timers.pop(enemy_id, None)
+
+    def handle_key_pickup(self, key_type: str, audio=None) -> tuple[str, ...]:
+        return self.activate_trigger_source(f"pickup:{key_type}", audio=audio)
+
+    def activate_trigger_source(self, source_id: str, audio=None) -> tuple[str, ...]:
+        messages: list[str] = []
+        for trigger in self.triggers:
+            if trigger.source_id != source_id:
+                continue
+            if trigger.once and trigger.activated:
+                continue
+            messages.extend(self._activate_trigger(trigger, audio))
+        return tuple(messages)
+
+    def _process_proximity_triggers(self, player, audio=None) -> None:
+        for trigger in self.triggers:
+            if trigger.trigger_type != "proximity":
+                continue
+            if trigger.once and trigger.activated:
+                continue
+            if math.hypot(trigger.x - player.x, trigger.y - player.y) > trigger.radius:
+                continue
+            self._activate_trigger(trigger, audio)
+
+    def _activate_trigger(self, trigger: WorldTrigger, audio=None) -> list[str]:
+        if trigger.once and trigger.activated:
+            return []
+        trigger.activated = True
+        self.activated_triggers.add(trigger.trigger_id)
+        return self.activate_event(trigger.event_id, trigger.actions, audio=audio)
+
+    def activate_event(
+        self,
+        event_id: str,
+        actions: tuple[ProgressionAction, ...],
+        audio=None,
+    ) -> list[str]:
+        if event_id in self.activated_events:
+            append_debug_log(f"event-skip event_id={event_id} reason=already-activated")
+            return []
+        append_debug_log(
+            f"event-activate event_id={event_id} "
+            f"actions={[action.action_type + ':' + str(action.target_id) for action in actions]}"
+        )
+        self.activated_events.add(event_id)
+        messages: list[str] = []
+        for action in actions:
+            messages.extend(self._apply_progression_action(action, audio))
+        self._wake_enemies_for_trigger(event_id)
+        self._wake_enemies_for_trigger(f"event:{event_id}")
+        return messages
+
+    def _apply_progression_action(self, action: ProgressionAction, audio=None) -> list[str]:
+        messages: list[str] = []
+        append_debug_log(
+            "action-apply "
+            f"type={action.action_type} "
+            f"target_id={action.target_id} "
+            f"room_index={action.room_index} "
+            f"note={action.note!r}"
+        )
+        if action.action_type in {ACTION_OPEN_DOOR, ACTION_UNLOCK_SHORTCUT, ACTION_ACTIVATE_EXIT_ROUTE}:
+            for door in self.doors:
+                if door.door_id != action.target_id:
+                    continue
+                append_debug_log(
+                    "action-door-before "
+                    f"door_id={door.door_id} "
+                    f"door_type={door.door_type} "
+                    f"state={door.state} "
+                    f"trigger_unlocked={door.trigger_unlocked}"
+                )
+                door.unlock()
+                if action.action_type != ACTION_UNLOCK_SHORTCUT:
+                    door.begin_open()
+                append_debug_log(
+                    "action-door-after "
+                    f"door_id={door.door_id} "
+                    f"door_type={door.door_type} "
+                    f"state={door.state} "
+                    f"trigger_unlocked={door.trigger_unlocked}"
+                )
+                if audio is not None:
+                    audio.play_door_open()
+                if action.note:
+                    messages.append(action.note)
+                break
+        elif action.action_type in {ACTION_SPAWN_AMBUSH, ACTION_WAKE_ROOM}:
+            self._wake_enemies_for_trigger(action.target_id, room_index=action.room_index)
+            if action.note:
+                messages.append(action.note)
+        elif action.action_type == ACTION_ACTIVATE_SECRET:
+            for secret in self.secrets:
+                if secret.secret_id != action.target_id:
+                    continue
+                secret.discovered = True
+                if secret.reward_kind is not None and secret.reward_amount > 0:
+                    self.add_loot_drop(secret.reward_kind, secret.reward_amount, secret.x, secret.y)
+                if secret.door_id is not None:
+                    for door in self.doors:
+                        if door.door_id == secret.door_id:
+                            door.unlock()
+                            break
+                messages.append(secret.message or action.note or "SECRET REVEALED")
+                break
+        return messages
+
+    def _wake_enemies_for_trigger(self, trigger_id: str, room_index: int = -1) -> None:
+        for enemy in self.enemies:
+            if enemy.active:
+                continue
+            if room_index >= 0 and enemy.room_index != room_index:
+                continue
+            if enemy.wake_trigger_id not in {trigger_id, f"event:{trigger_id}"}:
+                continue
+            enemy.active = True
+            enemy.ai_state = "alert" if enemy.ambush else "wander"
+            enemy.state_timer = enemy.definition.reaction_time
+            enemy.memory_timer = max(enemy.memory_timer, enemy.definition.memory_time * (1.0 if enemy.ambush else 0.5))
 
     def emit_noise(self, x: float, y: float, radius: float, duration: float) -> None:
         self.noise_position = (x, y)
@@ -484,17 +810,60 @@ class World:
         door = self.find_interactable_door(player_x, player_y, player_angle)
         if door is None:
             return None, None, False
+        append_debug_log(
+            "door-target "
+            f"door_id={door.door_id} "
+            f"door_type={door.door_type} "
+            f"state={door.state} "
+            f"required_key={door.definition.required_key_type} "
+            f"trigger_unlocked={door.trigger_unlocked} "
+            f"required_trigger_id={door.required_trigger_id} "
+            f"owned={sorted(owned_keys)}"
+        )
         if door.state in {"opening", "open"}:
             return door, None, False
         if door.guard_enemy_id is not None and not self.is_enemy_defeated(door.guard_enemy_id):
             door.state = "locked"
             return door, "FINAL DOOR LOCKED - WARDEN ALIVE", False
+        if door.required_trigger_id is not None and not door.trigger_unlocked:
+            door.state = "locked"
+            return door, door.locked_message or "ACCESS ROUTE LOCKED", False
         if not door.can_open(owned_keys, guard_defeated=True):
             door.state = "locked"
             return door, door.definition.visual.locked_message, False
         door.unlock()
         opened = door.begin_open()
         return door, None, opened
+
+    def find_interactable_switch(self, player_x: float, player_y: float, player_angle: float) -> WorldSwitch | None:
+        nearest: WorldSwitch | None = None
+        best_score = float("inf")
+        for switch in self.active_switches():
+            distance = math.hypot(switch.x - player_x, switch.y - player_y)
+            if distance > settings.SWITCH_INTERACT_DISTANCE:
+                continue
+            direction = math.atan2(switch.y - player_y, switch.x - player_x)
+            angle_delta = self._normalize_angle(direction - player_angle)
+            if abs(angle_delta) > settings.SWITCH_INTERACT_HALF_ANGLE:
+                continue
+            if not self.has_line_of_sight(player_x, player_y, switch.x, switch.y):
+                continue
+            score = distance + abs(angle_delta) * 0.45
+            if score < best_score:
+                best_score = score
+                nearest = switch
+        return nearest
+
+    def interact_with_switch(self, player_x: float, player_y: float, player_angle: float, audio=None) -> tuple[WorldSwitch | None, tuple[str, ...], bool]:
+        switch = self.find_interactable_switch(player_x, player_y, player_angle)
+        if switch is None:
+            return None, tuple(), False
+        if switch.once and switch.activated:
+            return switch, tuple(), False
+        switch.activated = True
+        messages = self.activate_event(switch.event_id, switch.actions, audio=audio)
+        self.activated_triggers.add(switch.switch_id)
+        return switch, tuple(messages), True
 
     def is_enemy_defeated(self, enemy_id: str) -> bool:
         for enemy in self.enemies:

@@ -618,7 +618,7 @@ class Raycaster:
         eye_z = player.z + 0.5
 
         visible: list[tuple[float, float, float, object]] = []
-        for pickup in [*world.active_loot(), *world.active_keys()]:
+        for pickup in [*world.active_loot(), *world.active_keys(), *world.active_switches(), *world.visible_secrets()]:
             dx = pickup.x - player.x
             dy = pickup.y - player.y
             distance = math.hypot(dx, dy)
@@ -631,15 +631,29 @@ class Raycaster:
                 continue
             visible.append((transform_y, transform_x, distance, pickup))
 
-        for transform_y, transform_x, distance, pickup in sorted(visible, reverse=True):
+        for transform_y, transform_x, distance, pickup in sorted(
+            visible,
+            key=lambda item: (item[0], item[2], item[1]),
+            reverse=True,
+        ):
             sprite = self.pickup_sprites.get(pickup.sprite_kind)
             if sprite is None:
                 continue
-            definition = pickup.definition
-            bob = math.sin(time_seconds * 2.8 + pickup.bob_phase) * 0.055
-            floor_z = world.get_floor_height(pickup.x, pickup.y) + definition.visual.hover_height + bob
+            if hasattr(pickup, "definition"):
+                definition = pickup.definition
+                bob_phase = getattr(pickup, "bob_phase", 0.0)
+                pickup_scale = getattr(pickup, "scale", definition.visual.world_scale)
+                hover_height = definition.visual.hover_height
+                glow_color = definition.visual.glow_color
+            else:
+                bob_phase = 0.0
+                pickup_scale = 0.82
+                hover_height = 0.22 if pickup.sprite_kind.startswith("switch") else 0.16
+                glow_color = (116, 224, 168) if pickup.sprite_kind.startswith("switch") else (188, 162, 92)
+            bob = math.sin(time_seconds * 2.8 + bob_phase) * 0.055
+            floor_z = world.get_floor_height(pickup.x, pickup.y) + hover_height + bob
             screen_x = int((self.width / 2) * (1 + transform_x / transform_y))
-            sprite_height = max(18, int(self.height / transform_y * (0.84 * pickup.scale)))
+            sprite_height = max(18, int(self.height / transform_y * (0.84 * pickup_scale)))
             sprite_width = max(10, int(sprite_height * sprite.get_width() / max(1, sprite.get_height())))
             scaled = self._get_scaled_sprite(sprite, sprite_width, sprite_height)
             bottom_y = self._project_z(eye_z, floor_z, transform_y)
@@ -652,7 +666,7 @@ class Raycaster:
                 continue
 
             glow_rect = sprite_rect.inflate(14, 10)
-            glow = self._make_pickup_glow(glow_rect.size, definition.visual.glow_color, distance)
+            glow = self._make_pickup_glow(glow_rect.size, glow_color, distance)
             outline = pygame.mask.from_surface(scaled).to_surface(
                 setcolor=(255, 244, 210, 120),
                 unsetcolor=(0, 0, 0, 0),
@@ -1164,6 +1178,9 @@ class Raycaster:
             "medkit": self._make_med_sprite((198, 236, 208), small=False),
             "armor_bonus": self._make_armor_bonus_sprite(),
             "green_armor": self._make_armor_sprite(),
+            "switch_off": self._make_switch_sprite(active=False),
+            "switch_on": self._make_switch_sprite(active=True),
+            "secret": self._make_secret_sprite(),
         }
         for key_type, definition in KEY_DEFINITIONS.items():
             sprites[f"{key_type}_key"] = self._make_key_sprite(
@@ -1356,6 +1373,26 @@ class Raycaster:
         pygame.draw.ellipse(sprite, (72, 168, 112, 110), (1, 4, 32, 12))
         pygame.draw.ellipse(sprite, (180, 255, 214, 180), (6, 7, 22, 6))
         pygame.draw.ellipse(sprite, (34, 72, 52, 180), (0, 3, 34, 12), 2)
+        return sprite
+
+    def _make_switch_sprite(self, active: bool) -> pygame.Surface:
+        sprite = pygame.Surface((26, 30), pygame.SRCALPHA)
+        frame = (66, 74, 84) if not active else (58, 108, 82)
+        panel = (192, 178, 132) if not active else (166, 238, 184)
+        lamp = (218, 112, 84) if not active else (122, 255, 176)
+        pygame.draw.rect(sprite, frame, (3, 3, 20, 24), border_radius=4)
+        pygame.draw.rect(sprite, (28, 20, 18), (5, 5, 16, 20), border_radius=3)
+        pygame.draw.rect(sprite, panel, (8, 8, 10, 4), border_radius=1)
+        pygame.draw.rect(sprite, panel, (8, 14, 10, 4), border_radius=1)
+        pygame.draw.circle(sprite, lamp, (13, 22), 4)
+        pygame.draw.rect(sprite, (36, 28, 24), (3, 3, 20, 24), 2, border_radius=4)
+        return sprite
+
+    def _make_secret_sprite(self) -> pygame.Surface:
+        sprite = pygame.Surface((24, 24), pygame.SRCALPHA)
+        pygame.draw.polygon(sprite, (184, 156, 86), [(12, 2), (22, 12), (12, 22), (2, 12)])
+        pygame.draw.polygon(sprite, (248, 226, 144), [(12, 4), (20, 12), (12, 20), (4, 12)], 2)
+        pygame.draw.circle(sprite, (94, 42, 18), (12, 12), 3)
         return sprite
 
     def _enemy_sprite(self, enemy, player_distance: float | None = None) -> pygame.Surface | None:
@@ -1562,6 +1599,8 @@ class Raycaster:
         ceiling_color = self.ceiling_texture.get_at((tex_x, tex_y))
         room_kind = max(0, world.room_kinds[grid_y][grid_x])
         level = world.floor_heights[grid_y][grid_x]
+        ceiling_height = world.get_ceiling_height_at(grid_x, grid_y)
+        sector_type = world.get_sector_type_at(grid_x, grid_y)
         edge_tile = False
         for nx, ny in ((grid_x + 1, grid_y), (grid_x - 1, grid_y), (grid_x, grid_y + 1), (grid_x, grid_y - 1)):
             if 0 <= nx < world.width and 0 <= ny < world.height and not world.is_wall(nx, ny):
@@ -1590,10 +1629,22 @@ class Raycaster:
             min(255, floor_color.b + level * 6 + floor_bias[2] + (6 if edge_tile else 0)),
         )
         ceiling_tint = (
-            min(255, ceiling_color.r + level * 4 + ceiling_bias[0]),
-            min(255, ceiling_color.g + level * 5 + ceiling_bias[1]),
-            min(255, ceiling_color.b + level * 10 + ceiling_bias[2]),
+            min(255, ceiling_color.r + level * 4 + ceiling_bias[0] + max(0, ceiling_height - 1) * 6),
+            min(255, ceiling_color.g + level * 5 + ceiling_bias[1] + max(0, ceiling_height - 1) * 10),
+            min(255, ceiling_color.b + level * 10 + ceiling_bias[2] + max(0, ceiling_height - 1) * 16),
         )
+        if sector_type == 1:
+            floor_tint = (
+                max(18, floor_tint[0] // 2),
+                min(255, floor_tint[1] + 56),
+                max(22, floor_tint[2] // 2),
+            )
+        elif sector_type == 2:
+            floor_tint = (
+                min(255, floor_tint[0] + 34),
+                min(255, floor_tint[1] + 28),
+                min(255, floor_tint[2] + 10),
+            )
         return pygame.Color(*floor_tint), pygame.Color(*ceiling_tint)
 
 

@@ -1,1 +1,8 @@
 /doomgame/__pycache__
+/__pycache__
+/.venv
+/.venv313
+/build
+*.pyc
+*.pyo
+*.log

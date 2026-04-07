@@ -68,6 +68,8 @@ class EnemySpawn:
     y: float
     room_index: int
     difficulty_tier: int
+    wake_trigger_id: str | None = None
+    ambush: bool = False
 
 
 @dataclass
@@ -143,6 +145,9 @@ class WorldEnemy:
     radius: float
     hp: int
     max_hp: int
+    wake_trigger_id: str | None = None
+    ambush: bool = False
+    active: bool = True
     ai_state: str = "idle"
     alive: bool = True
     dead: bool = False
@@ -183,11 +188,11 @@ class WorldEnemy:
 
     @property
     def blocks_movement(self) -> bool:
-        return self.alive and not self.dead and not self.removed
+        return self.active and self.alive and not self.dead and not self.removed
 
     @property
     def can_take_damage(self) -> bool:
-        return self.alive and not self.dead and not self.removed
+        return self.active and self.alive and not self.dead and not self.removed
 
     @property
     def corpse_visible(self) -> bool:
@@ -286,6 +291,8 @@ class WorldEnemy:
         audio,
     ) -> None:
         if self.removed:
+            return
+        if not self.active:
             return
 
         self.animation_timer += delta_time
@@ -620,6 +627,9 @@ def build_enemy_runtime(spawn: EnemySpawn) -> WorldEnemy:
         y=spawn.y,
         room_index=spawn.room_index,
         difficulty_tier=spawn.difficulty_tier,
+        wake_trigger_id=spawn.wake_trigger_id,
+        ambush=spawn.ambush,
+        active=spawn.wake_trigger_id is None,
         radius=definition.collision_radius,
         hp=definition.max_hp,
         max_hp=definition.max_hp,
