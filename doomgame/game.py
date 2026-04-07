@@ -11,7 +11,7 @@ from doomgame.debug_log import append_debug_log, clear_debug_log
 from doomgame.doors import KEY_DEFINITIONS, KEY_TYPES
 from doomgame.loot import get_pickup_definition
 from doomgame.mapgen import MapGenerator
-from doomgame.music import DoomMusicPlayer
+from doomgame.music import DoomMusicPlayer, MusicSnapshot
 from doomgame.player import Player
 from doomgame.progression import (
     CampaignSequenceDirector,
@@ -116,6 +116,9 @@ class DoomGame:
         self.face_idle_sequence = ("center", "left", "center", "right")
         self.face_hit_timer = 0.0
         self.face_hit_state = "hit_light"
+        self.music_recent_shots = 0.0
+        self.music_recent_damage = 0.0
+        self.music_recent_kills = 0.0
 
         self.world: World | None = None
         self.player: Player | None = None
@@ -211,6 +214,9 @@ class DoomGame:
         self.player_death_timer = 0.0
         self.face_hit_timer = 0.0
         self.face_hit_state = "hit_light"
+        self.music_recent_shots = 0.0
+        self.music_recent_damage = 0.0
+        self.music_recent_kills = 0.0
         self._reset_weapon_state()
         self.level_start_snapshot = {
             "health": self.health,
@@ -383,20 +389,25 @@ class DoomGame:
                 self._try_fire()
 
     def _update(self, delta_time: float) -> None:
+        self._decay_music_impulses(delta_time)
         if self.awaiting_difficulty_selection or self.world is None or self.player is None:
+            self.music.update(MusicSnapshot(), delta_time)
             return
         if self.campaign_complete:
+            self.music.update(MusicSnapshot(), delta_time)
             return
         if self.intermission_timer > 0.0:
             self.intermission_timer = max(0.0, self.intermission_timer - delta_time)
         if self.player_death_timer > 0.0:
             self.player_death_timer = max(0.0, self.player_death_timer - delta_time)
             self.damage_flash_timer = max(0.0, self.damage_flash_timer - delta_time * 2.6)
+            self.music.update(self._build_music_snapshot(), delta_time)
             if self.player_death_timer <= 0.0:
                 self.restart_current_level_after_death()
             return
         if self.level_complete_timer > 0.0:
             self.level_complete_timer = max(0.0, self.level_complete_timer - delta_time)
+            self.music.update(self._build_music_snapshot(), delta_time)
             if self.level_complete_timer <= 0.0:
                 self.advance_to_next_level()
             return
@@ -427,6 +438,7 @@ class DoomGame:
         if self.move_amount > 0.0:
             self.walk_time += delta_time * (4.5 + self.move_amount * 5.0)
             self.ammo = max(0, self.ammo - 0)
+        self.music.update(self._build_music_snapshot(), delta_time)
 
     def _render(self) -> None:
         if self.awaiting_difficulty_selection or self.world is None or self.player is None:
@@ -562,6 +574,7 @@ class DoomGame:
         self.shot_anim_index = 0
         self.muzzle_flash = 1.0
         self.weapon_recoil = 0.8
+        self._bump_music_impulse("music_recent_shots", 0.42)
         self.audio.play_shotgun_fire()
         self.world.emit_noise(
             self.player.x,
@@ -596,6 +609,7 @@ class DoomGame:
         if impact.enemy.enemy_type == "warden" and impact.enemy_killed:
             self._show_message("WARDEN DOWN - FINAL DOOR UNLOCKED", (255, 182, 104))
         if impact.enemy_killed:
+            self._bump_music_impulse("music_recent_kills", 0.34)
             self.audio.play_enemy_death(impact.enemy.enemy_type)
             self._trigger_damage_flash((255, 126, 96), settings.ENEMY_HIT_FLASH_TIME)
         elif impact.enemy_pain:
@@ -683,7 +697,7 @@ class DoomGame:
             f"owned={sorted(self.keys_owned)}"
         )
         if opened:
-            self.audio.play_door_open()
+            self.audio.play_door_open(door.door_type)
             return
         if message:
             self._show_message(message, door.definition.visual.accent_color)
@@ -695,6 +709,7 @@ class DoomGame:
         if not self.world.is_player_in_exit(self.player.x, self.player.y):
             return
         self.level_complete_timer = 0.7
+        self.audio.play_level_exit()
         if self.run_state is not None and self.run_state.current_level_index >= self.run_state.total_level_count:
             self._show_message("FINAL GATE CLEARED", (120, 255, 168))
         else:
@@ -760,6 +775,7 @@ class DoomGame:
     def _apply_player_damage(self, amount: int, source: str) -> None:
         if amount <= 0 or self.player_death_timer > 0.0:
             return
+        self._bump_music_impulse("music_recent_damage", min(1.0, amount / 30.0))
         absorbed = min(self.armor, int(math.ceil(amount * settings.PLAYER_ARMOR_ABSORB)))
         self.armor = max(0, self.armor - absorbed)
         damage_taken = max(0, amount - absorbed)
@@ -780,6 +796,42 @@ class DoomGame:
         self.player_death_timer = settings.PLAYER_DEATH_RESET_TIME
         self.audio.play_player_death()
         self._show_message("YOU DIED", (255, 96, 72))
+
+    def _bump_music_impulse(self, attr: str, amount: float) -> None:
+        current = getattr(self, attr, 0.0)
+        setattr(self, attr, min(1.0, current + amount))
+
+    def _decay_music_impulses(self, delta_time: float) -> None:
+        self.music_recent_shots = max(0.0, self.music_recent_shots - delta_time * 0.55)
+        self.music_recent_damage = max(0.0, self.music_recent_damage - delta_time * 0.42)
+        self.music_recent_kills = max(0.0, self.music_recent_kills - delta_time * 0.26)
+
+    def _build_music_snapshot(self) -> MusicSnapshot:
+        if self.world is None or self.player is None:
+            return MusicSnapshot()
+        live_enemies = self.world.active_enemies(include_corpses=False)
+        nearby_enemies = 0
+        attacking_enemies = 0
+        for enemy in live_enemies:
+            distance = math.hypot(enemy.x - self.player.x, enemy.y - self.player.y)
+            if distance <= 6.5:
+                nearby_enemies += 1
+            if enemy.ai_state == "attack":
+                attacking_enemies += 1
+            elif enemy.ai_state == "chase" and distance <= 8.0:
+                attacking_enemies += 1
+            elif enemy.ai_state == "alert" and distance <= 5.0:
+                attacking_enemies += 1
+        return MusicSnapshot(
+            active_enemies=len(live_enemies),
+            nearby_enemies=nearby_enemies,
+            attacking_enemies=attacking_enemies,
+            projectile_count=len(self.world.active_enemy_projectiles()),
+            movement=self.move_amount,
+            recent_shots=self.music_recent_shots,
+            recent_damage=self.music_recent_damage,
+            recent_kills=self.music_recent_kills,
+        )
 
     def _draw_pickup_message(self) -> None:
         if not self.pickup_message:

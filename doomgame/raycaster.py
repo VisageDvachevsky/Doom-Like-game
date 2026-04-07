@@ -41,22 +41,24 @@ class Raycaster:
         self.floor_height_bytes = b""
         self.stair_bytes = b""
         self.room_kind_bytes = b""
+        self.sector_type_bytes = b""
         self.native_door_buffer = bytearray()
         self.depth_buffer = [settings.MAX_RAY_DISTANCE for _ in range(self.width)]
         self.sprite_depth_buffer = [settings.MAX_RAY_DISTANCE for _ in range(self.width)]
         self.texture_size = settings.TEXTURE_SIZE
         self.wall_textures = self._build_wall_textures()
-        self.native_wall_texture_bytes = self._build_native_wall_texture_bytes()
         self.floor_textures = self._build_floor_textures()
-        self.native_floor_texture_bytes = self._build_native_floor_texture_bytes()
         self.ceiling_textures = self._build_ceiling_textures()
+        self.floor_texture = self._build_floor_texture()
+        self.acid_floor_texture = self._build_acid_floor_texture()
+        self.stair_texture = self._build_stair_texture()
+        self.ceiling_texture = self._build_ceiling_texture()
+        self.native_wall_texture_bytes = self._build_native_wall_texture_bytes()
+        self.native_floor_texture_bytes = self._build_native_floor_texture_bytes()
         self.native_ceiling_texture_bytes = self._build_native_ceiling_texture_bytes()
         self.background = self._build_background()
         self.sky_strip = self._build_sky_strip()
         self.vignette = self._build_vignette()
-        self.floor_texture = self._build_floor_texture()
-        self.stair_texture = self._build_stair_texture()
-        self.ceiling_texture = self._build_ceiling_texture()
         self.horizon_glow = pygame.Surface((self.width, 48), pygame.SRCALPHA)
         self.horizon_glow.fill((118, 214, 140, 255))
         self.weapon_frames = self._load_weapon_frames()
@@ -65,7 +67,8 @@ class Raycaster:
         self.scaled_weapon_idle_frame = self._prepare_single_weapon_frame(self.weapon_idle_frame)
         self.pickup_sprites = self._build_pickup_sprites()
         self.door_textures = self._build_door_textures()
-        self.exit_sprite = self._make_exit_sprite()
+        self.native_door_texture_bytes = self._build_native_door_texture_bytes()
+        self.exit_sprite = self._load_sprite_asset("exit_marker.png") or self._make_exit_sprite()
         self.enemy_sprites = self._build_enemy_sprites()
         self.scaled_sprite_cache: dict[tuple[int, int, int], pygame.Surface] = {}
         self.outline_cache: dict[tuple[int, int, int, int], pygame.Surface] = {}
@@ -92,6 +95,7 @@ class Raycaster:
         flat_heights = bytearray(self.map_width * self.map_height)
         flat_stairs = bytearray(self.map_width * self.map_height)
         flat_kinds = bytearray(self.map_width * self.map_height)
+        flat_sector_types = bytearray(self.map_width * self.map_height)
         idx = 0
         for y, row in enumerate(world.tiles):
             for x, tile in enumerate(row):
@@ -99,11 +103,13 @@ class Raycaster:
                 flat_heights[idx] = world.floor_heights[y][x]
                 flat_stairs[idx] = world.stair_mask[y][x]
                 flat_kinds[idx] = max(0, world.room_kinds[y][x])
+                flat_sector_types[idx] = max(0, world.sector_types[y][x])
                 idx += 1
         self.map_bytes = bytes(flat_tiles)
         self.floor_height_bytes = bytes(flat_heights)
         self.stair_bytes = bytes(flat_stairs)
         self.room_kind_bytes = bytes(flat_kinds)
+        self.sector_type_bytes = bytes(flat_sector_types)
 
     def render(
         self,
@@ -132,6 +138,7 @@ class Raycaster:
                 self.floor_height_bytes,
                 self.stair_bytes,
                 self.room_kind_bytes,
+                self.sector_type_bytes,
                 self.native_door_buffer,
                 len(self.native_door_buffer) // 5,
                 self.map_width,
@@ -140,6 +147,7 @@ class Raycaster:
                 self.native_wall_texture_bytes,
                 self.native_floor_texture_bytes,
                 self.native_ceiling_texture_bytes,
+                self.native_door_texture_bytes,
             )
             self.depth_buffer = self.native_depth_buffer
             self.sprite_depth_buffer = array("f", self.depth_buffer)
@@ -719,16 +727,18 @@ class Raycaster:
             if sprite is None:
                 continue
             visual = enemy.definition.visual
+            projected_transform_y = max(transform_y, 0.42)
             floor_z = world.get_floor_height(enemy.x, enemy.y)
             if enemy.dead:
                 floor_z += 0.06
             else:
                 floor_z += 0.02 + math.sin(time_seconds * 3.2 + enemy.room_index * 0.7) * 0.012
-            screen_x = int((self.width / 2) * (1 + transform_x / transform_y))
-            sprite_height = max(24, int(self.height / transform_y * (visual.height_scale * visual.sprite_scale)))
+            screen_x = int((self.width / 2) * (1 + transform_x / projected_transform_y))
+            projected_scale = visual.height_scale * visual.sprite_scale * settings.ENEMY_VISUAL_SCALE
+            sprite_height = max(24, int(self.height / projected_transform_y * projected_scale))
             sprite_width = max(16, int(sprite_height * sprite.get_width() / max(1, sprite.get_height())))
             scaled = pygame.transform.smoothscale(sprite, (sprite_width, sprite_height))
-            bottom_y = self._project_z(eye_z, floor_z, transform_y)
+            bottom_y = self._project_z(eye_z, floor_z, projected_transform_y)
             sprite_rect = scaled.get_rect(midbottom=(screen_x, bottom_y))
             if sprite_rect.right < 0 or sprite_rect.left > self.width:
                 continue
@@ -1026,7 +1036,7 @@ class Raycaster:
                 continue
             visual = enemy.definition.visual
             z_offset = 0.06 if enemy.dead else 0.02 + math.sin(time_seconds * 3.2 + enemy.room_index * 0.7) * 0.012
-            projected_scale = visual.height_scale * visual.sprite_scale
+            projected_scale = visual.height_scale * visual.sprite_scale * settings.ENEMY_VISUAL_SCALE
             instances.extend(
                 struct.pack(
                     "<ffffHHI",
@@ -1171,6 +1181,17 @@ class Raycaster:
         return pygame.transform.smoothscale(frame, (sprite_width, sprite_height)).convert_alpha()
 
     def _build_pickup_sprites(self) -> dict[str, pygame.Surface]:
+        external_names = {
+            "shells": "shells.png",
+            "shell_box": "shell_box.png",
+            "stimpack": "stimpack.png",
+            "medkit": "medkit.png",
+            "armor_bonus": "armor_bonus.png",
+            "green_armor": "green_armor.png",
+            "switch_off": "switch_off.png",
+            "switch_on": "switch_on.png",
+            "secret": "secret_marker.png",
+        }
         sprites = {
             "shells": self._make_shell_sprite((188, 54, 46), 22, 28),
             "shell_box": self._make_shell_box_sprite(),
@@ -1182,7 +1203,15 @@ class Raycaster:
             "switch_on": self._make_switch_sprite(active=True),
             "secret": self._make_secret_sprite(),
         }
+        for sprite_kind, asset_name in external_names.items():
+            external = self._load_sprite_asset(asset_name)
+            if external is not None:
+                sprites[sprite_kind] = external
         for key_type, definition in KEY_DEFINITIONS.items():
+            external = self._load_sprite_asset(f"{key_type}_key.png")
+            if external is not None:
+                sprites[f"{key_type}_key"] = external
+                continue
             sprites[f"{key_type}_key"] = self._make_key_sprite(
                 definition.visual.sprite_primary,
                 definition.visual.sprite_secondary,
@@ -1248,7 +1277,7 @@ class Raycaster:
                 "alert": [idle],
                 "walk": [walk_close, walk_far],
                 "attack": [attack],
-                "pain": [idle],
+                "pain": [self._make_pain_variant(idle)],
                 "dead": [dead],
                 "projectile": [],
             }
@@ -1269,7 +1298,7 @@ class Raycaster:
                 "alert": [idle],
                 "walk": [walk_01, walk_02],
                 "attack": [attack],
-                "pain": [idle],
+                "pain": [self._make_pain_variant(idle)],
                 "dead": [dead],
                 "projectile": [projectile] if projectile is not None else [],
             }
@@ -1290,7 +1319,7 @@ class Raycaster:
                 "alert": [idle],
                 "walk": [walk_01, walk_02],
                 "attack": [attack],
-                "pain": [idle],
+                "pain": [self._make_pain_variant(idle)],
                 "dead": [dead],
                 "projectile": [projectile] if projectile is not None else [],
             }
@@ -1311,7 +1340,7 @@ class Raycaster:
                 "alert": [idle],
                 "walk": [walk_01, walk_02],
                 "attack": [attack],
-                "pain": [idle],
+                "pain": [self._make_pain_variant(idle)],
                 "dead": [dead],
                 "projectile": [projectile] if projectile is not None else [],
             }
@@ -1324,9 +1353,23 @@ class Raycaster:
             return None
         return pygame.image.load(str(path)).convert_alpha()
 
+    def _make_pain_variant(self, sprite: pygame.Surface) -> pygame.Surface:
+        tinted = sprite.copy()
+        red_overlay = pygame.Surface(tinted.get_size(), pygame.SRCALPHA)
+        red_overlay.fill((255, 72, 48, 120))
+        tinted.blit(red_overlay, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+        shadow_overlay = pygame.Surface(tinted.get_size(), pygame.SRCALPHA)
+        shadow_overlay.fill((48, 0, 0, 44))
+        tinted.blit(shadow_overlay, (0, 0))
+        return tinted
+
     def _build_door_textures(self) -> dict[str, pygame.Surface]:
         textures: dict[str, pygame.Surface] = {}
         for door_type, definition in DOOR_DEFINITIONS.items():
+            external = self._load_texture_asset(f"door_{door_type}.png")
+            if external is not None:
+                textures[door_type] = external
+                continue
             textures[door_type] = self._make_door_texture(
                 definition.visual.base_color,
                 definition.visual.accent_color,
@@ -1452,9 +1495,6 @@ class Raycaster:
         if state == "attack":
             bob = -1 if frame == 0 else 1
             arm_swing = 2 + frame * 3
-        if state == "pain":
-            bob = 2 + frame
-            arm_swing = -5
         if state == "alert":
             bob = -1 if frame == 0 else 0
 
@@ -1501,7 +1541,7 @@ class Raycaster:
             pygame.draw.circle(sprite, accent_light, (body_rect.right + 4, body_rect.y + 11), 3)
         elif state == "pain":
             flash = pygame.Surface(sprite.get_size(), pygame.SRCALPHA)
-            flash.fill((255, 212, 188, 48))
+            flash.fill((255, 72, 48, 92))
             sprite.blit(flash, (0, 0))
         if enemy_type == "warden":
             pygame.draw.rect(sprite, accent_color, (width // 2 - 12, body_rect.y + 2, 24, 4), border_radius=2)
@@ -1594,13 +1634,19 @@ class Raycaster:
         if grid_x < 0 or grid_y < 0 or grid_x >= world.width or grid_y >= world.height:
             return self.floor_texture.get_at((tex_x, tex_y)), self.ceiling_texture.get_at((tex_x, tex_y))
 
-        floor_surface = self.stair_texture if world.is_stair_at(grid_x, grid_y) else self.floor_texture
+        sector_type = world.get_sector_type_at(grid_x, grid_y)
+        using_acid_texture = sector_type == 1 and self.acid_floor_texture is not None
+        if world.is_stair_at(grid_x, grid_y):
+            floor_surface = self.stair_texture
+        elif using_acid_texture:
+            floor_surface = self.acid_floor_texture
+        else:
+            floor_surface = self.floor_texture
         floor_color = floor_surface.get_at((tex_x, tex_y))
         ceiling_color = self.ceiling_texture.get_at((tex_x, tex_y))
         room_kind = max(0, world.room_kinds[grid_y][grid_x])
         level = world.floor_heights[grid_y][grid_x]
         ceiling_height = world.get_ceiling_height_at(grid_x, grid_y)
-        sector_type = world.get_sector_type_at(grid_x, grid_y)
         edge_tile = False
         for nx, ny in ((grid_x + 1, grid_y), (grid_x - 1, grid_y), (grid_x, grid_y + 1), (grid_x, grid_y - 1)):
             if 0 <= nx < world.width and 0 <= ny < world.height and not world.is_wall(nx, ny):
@@ -1633,7 +1679,7 @@ class Raycaster:
             min(255, ceiling_color.g + level * 5 + ceiling_bias[1] + max(0, ceiling_height - 1) * 10),
             min(255, ceiling_color.b + level * 10 + ceiling_bias[2] + max(0, ceiling_height - 1) * 16),
         )
-        if sector_type == 1:
+        if sector_type == 1 and not using_acid_texture:
             floor_tint = (
                 max(18, floor_tint[0] // 2),
                 min(255, floor_tint[1] + 56),
@@ -1739,11 +1785,12 @@ class Raycaster:
 
     def _build_wall_textures(self) -> list[pygame.Surface]:
         external_names = [
-            "wall_01_hell_brick.png",
-            "wall_02_corrupted_metal.png",
-            "wall_03_occult_stone.png",
-            "wall_04_bone_fortress.png",
-            "wall_05_tech_hell_panel.png",
+            "wall_brick.png",
+            "wall_steel.png",
+            "wall_toxic.png",
+            "wall_stone.png",
+            "wall_computer.png",
+            "wall_industrial.png",
         ]
         external_textures: list[pygame.Surface] = []
         for name in external_names:
@@ -1752,6 +1799,21 @@ class Raycaster:
                 external_textures.append(texture)
         if len(external_textures) == len(external_names):
             return external_textures
+        legacy_names = [
+            "wall_01_hell_brick.png",
+            "wall_02_corrupted_metal.png",
+            "wall_03_occult_stone.png",
+            "wall_04_bone_fortress.png",
+            "wall_05_tech_hell_panel.png",
+        ]
+        legacy_textures: list[pygame.Surface] = []
+        for name in legacy_names:
+            texture = self._load_texture_asset(name)
+            if texture is not None:
+                legacy_textures.append(texture)
+        if len(legacy_textures) == len(legacy_names):
+            # Older asset set lacks the sixth industrial slot; keep procedural fallback for parity.
+            return legacy_textures
 
         size = self.texture_size
         textures = []
@@ -1853,38 +1915,59 @@ class Raycaster:
             textures.append(textures[-1])
         return b"".join(pygame.image.tostring(texture, "RGB") for texture in textures)
 
+    def _build_native_door_texture_bytes(self) -> bytes:
+        textures: list[pygame.Surface] = []
+        for door_type, _index in sorted(NATIVE_DOOR_TYPE_INDEX.items(), key=lambda item: item[1]):
+            texture = self.door_textures.get(door_type)
+            if texture is not None:
+                textures.append(texture)
+        if not textures:
+            return b""
+        while len(textures) < len(NATIVE_DOOR_TYPE_INDEX):
+            textures.append(textures[-1])
+        return b"".join(pygame.image.tostring(texture, "RGB") for texture in textures)
+
     def _build_floor_textures(self) -> list[pygame.Surface]:
-        external_names = [
+        texture = self._load_texture_asset("floor_base.png")
+        if texture is not None:
+            return [texture]
+        legacy_names = [
             "floor_01_blood_stone.png",
             "floor_02_hell_metal_grate.png",
             "floor_03_occult_tiles.png",
             "floor_04_corrupted_flesh_metal.png",
         ]
         textures: list[pygame.Surface] = []
-        for name in external_names:
-            texture = self._load_texture_asset(name)
-            if texture is not None:
-                textures.append(texture)
+        for name in legacy_names:
+            loaded = self._load_texture_asset(name)
+            if loaded is not None:
+                textures.append(loaded)
         return textures
 
     def _build_native_floor_texture_bytes(self) -> bytes:
-        textures = list(self.floor_textures[:4])
-        if not textures:
+        regular = list(self.floor_textures[:4])
+        if not regular:
             return b""
-        while len(textures) < 4:
-            textures.append(textures[-1])
+        while len(regular) < 4:
+            regular.append(regular[-1])
+        acid = self.acid_floor_texture if self.acid_floor_texture is not None else regular[0]
+        stair = self.stair_texture
+        textures = [*regular, acid, stair]
         return b"".join(pygame.image.tostring(texture, "RGB") for texture in textures)
 
     def _build_ceiling_textures(self) -> list[pygame.Surface]:
-        external_names = [
+        texture = self._load_texture_asset("ceiling_base.png")
+        if texture is not None:
+            return [texture]
+        legacy_names = [
             "ceiling_01_dark_tech.png",
             "ceiling_02_hell_vault.png",
         ]
         textures: list[pygame.Surface] = []
-        for name in external_names:
-            texture = self._load_texture_asset(name)
-            if texture is not None:
-                textures.append(texture)
+        for name in legacy_names:
+            loaded = self._load_texture_asset(name)
+            if loaded is not None:
+                textures.append(loaded)
         return textures
 
     def _build_native_ceiling_texture_bytes(self) -> bytes:
@@ -1896,6 +1979,9 @@ class Raycaster:
         return b"".join(pygame.image.tostring(texture, "RGB") for texture in textures)
 
     def _build_floor_texture(self) -> pygame.Surface:
+        external = self._load_texture_asset("floor_base.png")
+        if external is not None:
+            return external
         size = self.texture_size
         floor = pygame.Surface((size, size))
         floor.fill((58, 32, 18))
@@ -1914,7 +2000,13 @@ class Raycaster:
             pygame.draw.rect(floor, (34, 18, 12), (x, 0, 3, size))
         return floor
 
+    def _build_acid_floor_texture(self) -> pygame.Surface | None:
+        return self._load_texture_asset("floor_acid.png")
+
     def _build_stair_texture(self) -> pygame.Surface:
+        external = self._load_texture_asset("floor_stair.png")
+        if external is not None:
+            return external
         size = self.texture_size
         stair = pygame.Surface((size, size))
         stair.fill((72, 46, 22))
@@ -1930,6 +2022,9 @@ class Raycaster:
         return stair
 
     def _build_ceiling_texture(self) -> pygame.Surface:
+        external = self._load_texture_asset("ceiling_base.png")
+        if external is not None:
+            return external
         size = self.texture_size
         ceiling = pygame.Surface((size, size))
         ceiling.fill((26, 30, 40))

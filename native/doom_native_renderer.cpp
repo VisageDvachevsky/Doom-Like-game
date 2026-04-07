@@ -13,7 +13,9 @@ constexpr double kTau = 6.28318530717958647692;
 constexpr double kFov = 70.0 * kPi / 180.0;
 constexpr double kCameraPlaneScale = 0.7002075382097097;  // tan(70deg / 2)
 constexpr double kMaxRayDistance = 32.0;
-constexpr int kTextureSize = 64;
+constexpr double kMinProjectionDistance = 0.24;
+constexpr double kMinBillboardProjectionDistance = 0.42;
+constexpr int kTextureSize = 128;
 
 struct Color {
     uint8_t r;
@@ -71,6 +73,48 @@ inline Color darken(const Color& c, int amount) {
     };
 }
 
+inline Color sample_texture_rgb(
+    const uint8_t* texture_data,
+    int texture_index,
+    int texture_count,
+    int tx,
+    int ty
+) {
+    constexpr Py_ssize_t kTextureBytes = static_cast<Py_ssize_t>(kTextureSize) * kTextureSize * 3;
+    const int normalized_index = ((texture_index % texture_count) + texture_count) % texture_count;
+    tx &= (kTextureSize - 1);
+    ty &= (kTextureSize - 1);
+    const Py_ssize_t base = static_cast<Py_ssize_t>(normalized_index) * kTextureBytes;
+    const Py_ssize_t pixel = static_cast<Py_ssize_t>((ty * kTextureSize + tx) * 3);
+    const uint8_t* src = texture_data + base + pixel;
+    return {src[0], src[1], src[2]};
+}
+
+inline Color bilinear_sample_texture_rgb(
+    const uint8_t* texture_data,
+    int texture_index,
+    int texture_count,
+    double tx,
+    double ty
+) {
+    const double wrapped_x = std::fmod(tx + kTextureSize * 8.0, static_cast<double>(kTextureSize));
+    const double wrapped_y = std::fmod(ty + kTextureSize * 8.0, static_cast<double>(kTextureSize));
+    const int x0 = static_cast<int>(std::floor(wrapped_x)) & (kTextureSize - 1);
+    const int y0 = static_cast<int>(std::floor(wrapped_y)) & (kTextureSize - 1);
+    const int x1 = (x0 + 1) & (kTextureSize - 1);
+    const int y1 = (y0 + 1) & (kTextureSize - 1);
+    const double fx = wrapped_x - std::floor(wrapped_x);
+    const double fy = wrapped_y - std::floor(wrapped_y);
+
+    const Color c00 = sample_texture_rgb(texture_data, texture_index, texture_count, x0, y0);
+    const Color c10 = sample_texture_rgb(texture_data, texture_index, texture_count, x1, y0);
+    const Color c01 = sample_texture_rgb(texture_data, texture_index, texture_count, x0, y1);
+    const Color c11 = sample_texture_rgb(texture_data, texture_index, texture_count, x1, y1);
+    const Color top = lerp_color(c00, c10, fx);
+    const Color bottom = lerp_color(c01, c11, fx);
+    return lerp_color(top, bottom, fy);
+}
+
 inline void put_pixel(uint8_t* frame, int width, int x, int y, const Color& c) {
     const int idx = (y * width + x) * 3;
     frame[idx] = c.r;
@@ -121,6 +165,13 @@ inline int room_kind_at(const uint8_t* room_kinds, int map_width, int map_height
         return 0;
     }
     return room_kinds[y * map_width + x];
+}
+
+inline int sector_type_at(const uint8_t* sector_types, int map_width, int map_height, int x, int y) {
+    if (sector_types == nullptr || x < 0 || y < 0 || x >= map_width || y >= map_height) {
+        return 0;
+    }
+    return sector_types[y * map_width + x];
 }
 
 Color door_texel(int door_type, int tx, int ty) {
@@ -296,49 +347,53 @@ Color wall_texel(int texture_index, int tx, int ty) {
     }
 }
 
-Color wall_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len, int texture_index, int tx, int ty) {
+Color wall_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len, int texture_index, double tx, double ty) {
     constexpr Py_ssize_t kTextureBytes = static_cast<Py_ssize_t>(kTextureSize) * kTextureSize * 3;
     constexpr int kTextureCount = 6;
-    const int normalized_index = ((texture_index % kTextureCount) + kTextureCount) % kTextureCount;
-    tx &= (kTextureSize - 1);
-    ty &= (kTextureSize - 1);
     if (texture_data == nullptr || texture_len < kTextureBytes * kTextureCount) {
-        return wall_texel(normalized_index, tx, ty);
+        const int ix = static_cast<int>(std::floor(tx)) & (kTextureSize - 1);
+        const int iy = static_cast<int>(std::floor(ty)) & (kTextureSize - 1);
+        return wall_texel(texture_index, ix, iy);
     }
-    const Py_ssize_t base = static_cast<Py_ssize_t>(normalized_index) * kTextureBytes;
-    const Py_ssize_t pixel = static_cast<Py_ssize_t>((ty * kTextureSize + tx) * 3);
-    const uint8_t* src = texture_data + base + pixel;
-    return {src[0], src[1], src[2]};
+    return bilinear_sample_texture_rgb(texture_data, texture_index, kTextureCount, tx, ty);
 }
 
-Color floor_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len, int room_kind, int tx, int ty) {
+Color door_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len, int door_type, double tx, double ty) {
     constexpr Py_ssize_t kTextureBytes = static_cast<Py_ssize_t>(kTextureSize) * kTextureSize * 3;
     constexpr int kTextureCount = 4;
-    const int normalized_index = ((room_kind % kTextureCount) + kTextureCount) % kTextureCount;
-    tx &= (kTextureSize - 1);
-    ty &= (kTextureSize - 1);
+    if (texture_data == nullptr || texture_len < kTextureBytes * kTextureCount) {
+        const int ix = static_cast<int>(std::floor(tx)) & (kTextureSize - 1);
+        const int iy = static_cast<int>(std::floor(ty)) & (kTextureSize - 1);
+        return door_texel(door_type, ix, iy);
+    }
+    return bilinear_sample_texture_rgb(texture_data, door_type, kTextureCount, tx, ty);
+}
+
+Color floor_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len, int room_kind, int sector_type, bool stair_tile, double tx, double ty) {
+    constexpr Py_ssize_t kTextureBytes = static_cast<Py_ssize_t>(kTextureSize) * kTextureSize * 3;
+    constexpr int kTextureCount = 6;
+    int normalized_index = 0;
+    if (stair_tile) {
+        normalized_index = 5;
+    } else if (sector_type == 1) {
+        normalized_index = 4;
+    } else {
+        normalized_index = ((room_kind % 4) + 4) % 4;
+    }
     if (texture_data == nullptr || texture_len < kTextureBytes * kTextureCount) {
         return {0, 0, 0};
     }
-    const Py_ssize_t base = static_cast<Py_ssize_t>(normalized_index) * kTextureBytes;
-    const Py_ssize_t pixel = static_cast<Py_ssize_t>((ty * kTextureSize + tx) * 3);
-    const uint8_t* src = texture_data + base + pixel;
-    return {src[0], src[1], src[2]};
+    return bilinear_sample_texture_rgb(texture_data, normalized_index, kTextureCount, tx, ty);
 }
 
-Color ceiling_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len, int room_kind, int tx, int ty) {
+Color ceiling_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len, int room_kind, double tx, double ty) {
     constexpr Py_ssize_t kTextureBytes = static_cast<Py_ssize_t>(kTextureSize) * kTextureSize * 3;
     constexpr int kTextureCount = 2;
     const int normalized_index = (room_kind >= 4) ? 1 : 0;
-    tx &= (kTextureSize - 1);
-    ty &= (kTextureSize - 1);
     if (texture_data == nullptr || texture_len < kTextureBytes * kTextureCount) {
         return {0, 0, 0};
     }
-    const Py_ssize_t base = static_cast<Py_ssize_t>(normalized_index) * kTextureBytes;
-    const Py_ssize_t pixel = static_cast<Py_ssize_t>((ty * kTextureSize + tx) * 3);
-    const uint8_t* src = texture_data + base + pixel;
-    return {src[0], src[1], src[2]};
+    return bilinear_sample_texture_rgb(texture_data, normalized_index, kTextureCount, tx, ty);
 }
 
 Color floor_texel(int tx, int ty, int level, int room_kind, bool stair_tile, bool edge_tile) {
@@ -468,6 +523,7 @@ void draw_floor_and_ceiling(
     const uint8_t* floor_heights,
     const uint8_t* stair_mask,
     const uint8_t* room_kinds,
+    const uint8_t* sector_types,
     const uint8_t* floor_texture_data,
     Py_ssize_t floor_texture_len,
     const uint8_t* ceiling_texture_data,
@@ -499,19 +555,34 @@ void draw_floor_and_ceiling(
         const int ceiling_y = horizon - row;
 
         for (int x = 0; x < width; ++x) {
-            const int tx = static_cast<int>(kTextureSize * (floor_x - std::floor(floor_x))) & (kTextureSize - 1);
-            const int ty = static_cast<int>(kTextureSize * (floor_y - std::floor(floor_y))) & (kTextureSize - 1);
+            const double tex_x = kTextureSize * (floor_x - std::floor(floor_x));
+            const double tex_y = kTextureSize * (floor_y - std::floor(floor_y));
+            const int tx = static_cast<int>(tex_x) & (kTextureSize - 1);
+            const int ty = static_cast<int>(tex_y) & (kTextureSize - 1);
             const int grid_x = static_cast<int>(floor_x);
             const int grid_y = static_cast<int>(floor_y);
             const int level = floor_height_at(floor_heights, map_width, map_height, grid_x, grid_y);
             const int room_kind = room_kind_at(room_kinds, map_width, map_height, grid_x, grid_y);
+            const int sector_type = sector_type_at(sector_types, map_width, map_height, grid_x, grid_y);
             const bool stair_tile = is_stair(stair_mask, map_width, map_height, grid_x, grid_y);
             const bool edge_tile = is_edge_tile(tiles, floor_heights, map_width, map_height, grid_x, grid_y);
             Color floor_color = floor_texel(tx, ty, level, room_kind, stair_tile, edge_tile);
-            if (!stair_tile) {
-                const Color external_floor = floor_texel_from_buffer(floor_texture_data, floor_texture_len, room_kind, tx, ty);
-                if (external_floor.r != 0 || external_floor.g != 0 || external_floor.b != 0) {
-                    floor_color = external_floor;
+            const Color external_floor = floor_texel_from_buffer(
+                floor_texture_data,
+                floor_texture_len,
+                room_kind,
+                sector_type,
+                stair_tile,
+                tex_x,
+                tex_y
+            );
+            if (external_floor.r != 0 || external_floor.g != 0 || external_floor.b != 0) {
+                floor_color = external_floor;
+                if (sector_type == 1) {
+                    floor_color.r = static_cast<uint8_t>(clamp_value(static_cast<int>(floor_color.r), 18, 255));
+                    floor_color.g = static_cast<uint8_t>(clamp_value(static_cast<int>(floor_color.g) + level * 6 + 18 + (edge_tile ? 8 : 0), 0, 255));
+                    floor_color.b = static_cast<uint8_t>(clamp_value(static_cast<int>(floor_color.b) + level * 4, 0, 255));
+                } else {
                     floor_color.r = static_cast<uint8_t>(clamp_value(static_cast<int>(floor_color.r) + level * 10 + (edge_tile ? 12 : 0), 0, 255));
                     floor_color.g = static_cast<uint8_t>(clamp_value(static_cast<int>(floor_color.g) + level * 8 + (edge_tile ? 10 : 0), 0, 255));
                     floor_color.b = static_cast<uint8_t>(clamp_value(static_cast<int>(floor_color.b) + level * 6 + (edge_tile ? 6 : 0), 0, 255));
@@ -521,7 +592,7 @@ void draw_floor_and_ceiling(
             put_pixel(frame, width, x, y, scale_color(floor_color, shade));
             if (ceiling_y >= 0 && ceiling_y < height) {
                 Color ceiling_color = ceiling_texel(tx, ty, level, room_kind);
-                const Color external_ceiling = ceiling_texel_from_buffer(ceiling_texture_data, ceiling_texture_len, room_kind, tx, ty);
+                const Color external_ceiling = ceiling_texel_from_buffer(ceiling_texture_data, ceiling_texture_len, room_kind, tex_x, tex_y);
                 if (external_ceiling.r != 0 || external_ceiling.g != 0 || external_ceiling.b != 0) {
                     ceiling_color = external_ceiling;
                     static constexpr int ceiling_bias[6][3] = {
@@ -656,16 +727,17 @@ void draw_walls(
         }
 
         distance = std::max(distance, 0.0001);
+        const double projection_distance = std::max(distance, kMinProjectionDistance);
         depth_buffer[column] = static_cast<float>(distance);
-        const int wall_top = std::max(0, project_z(height, eye_z, hit_floor + hit_height, distance));
-        const int wall_bottom = std::min(height, project_z(height, eye_z, hit_floor, distance));
+        const int wall_top = std::max(0, project_z(height, eye_z, hit_floor + hit_height, projection_distance));
+        const int wall_bottom = std::min(height, project_z(height, eye_z, hit_floor, projection_distance));
         if (wall_bottom <= wall_top) {
             continue;
         }
 
         double wall_x = (side == 0) ? (py + distance * ray_dir_y) : (px + distance * ray_dir_x);
         wall_x -= std::floor(wall_x);
-        int tex_x = static_cast<int>(wall_x * kTextureSize);
+        double tex_x = wall_x * kTextureSize;
         if (side == 0 && ray_dir_x > 0.0) {
             tex_x = kTextureSize - tex_x - 1;
         }
@@ -677,7 +749,7 @@ void draw_walls(
 
         for (int y = wall_top; y < wall_bottom; ++y) {
             const double relative = static_cast<double>(y - wall_top) / std::max(1, wall_bottom - wall_top);
-            const int tex_y = static_cast<int>(relative * hit_height * kTextureSize) & (kTextureSize - 1);
+            const double tex_y = std::fmod(relative * hit_height * kTextureSize + kTextureSize * 8.0, static_cast<double>(kTextureSize));
             Color c = scale_color(wall_texel_from_buffer(wall_texture_data, wall_texture_len, texture_index, tex_x, tex_y), shade);
             const int darkness = std::min(170, static_cast<int>(distance * 10.0));
             c = darken(c, darkness);
@@ -702,6 +774,8 @@ void draw_doors(
     double player_z,
     const uint8_t* floor_heights,
     const uint8_t* door_data,
+    const uint8_t* door_texture_data,
+    Py_ssize_t door_texture_len,
     int door_count,
     int map_width,
     int map_height
@@ -816,19 +890,20 @@ void draw_doors(
                 tex_u = hit_x - grid_x;
             }
 
-            const int wall_top = std::max(0, project_z(height, eye_z, top_z, distance));
-            const int wall_bottom = std::min(height, project_z(height, eye_z, bottom_z, distance));
+            const double projection_distance = std::max(distance, kMinProjectionDistance);
+            const int wall_top = std::max(0, project_z(height, eye_z, top_z, projection_distance));
+            const int wall_bottom = std::min(height, project_z(height, eye_z, bottom_z, projection_distance));
             if (wall_bottom <= wall_top) {
                 continue;
             }
 
-            const int tex_x = clamp_value(static_cast<int>(tex_u * kTextureSize), 0, kTextureSize - 1);
+            const double tex_x = tex_u * kTextureSize;
             const int draw_height = std::max(1, wall_bottom - wall_top);
             const int shade = std::max(42, 255 - std::min(188, static_cast<int>(distance * 14.0) + shade_bias));
             for (int y = wall_top; y < wall_bottom; ++y) {
                 const double relative = static_cast<double>(y - wall_top) / draw_height;
-                const int tex_y = clamp_value(static_cast<int>((lift + relative * visible_height) * kTextureSize), 0, kTextureSize - 1);
-                const Color texel = door_texel(door_type, tex_x, tex_y);
+                const double tex_y = clamp_value((lift + relative * visible_height) * kTextureSize, 0.0, static_cast<double>(kTextureSize - 1));
+                const Color texel = door_texel_from_buffer(door_texture_data, door_texture_len, door_type, tex_x, tex_y);
                 const Color lit{
                     static_cast<uint8_t>(texel.r * shade / 255),
                     static_cast<uint8_t>(texel.g * shade / 255),
@@ -913,10 +988,11 @@ void draw_billboards(
         const int grid_x = static_cast<int>(prepared.instance.x);
         const int grid_y = static_cast<int>(prepared.instance.y);
         const double floor_z = floor_height_at(floor_heights, map_width, map_height, grid_x, grid_y) + prepared.instance.z_offset;
-        const int screen_x = static_cast<int>((width / 2.0) * (1.0 + prepared.transform_x / prepared.transform_y));
+        const double projection_distance = std::max(prepared.transform_y, kMinBillboardProjectionDistance);
+        const int screen_x = static_cast<int>((width / 2.0) * (1.0 + prepared.transform_x / projection_distance));
         const int sprite_height = std::max(
             static_cast<int>(prepared.instance.min_height),
-            static_cast<int>(height / prepared.transform_y * prepared.instance.projected_scale)
+            static_cast<int>(height / projection_distance * prepared.instance.projected_scale)
         );
         const double aspect = static_cast<double>(meta.width) / std::max(1, static_cast<int>(meta.height));
         const int sprite_width = std::max(
@@ -927,7 +1003,7 @@ void draw_billboards(
             continue;
         }
 
-        const int bottom_y = project_z(height, eye_z, floor_z, prepared.transform_y);
+        const int bottom_y = project_z(height, eye_z, floor_z, projection_distance);
         const int top_y = bottom_y - sprite_height;
         const int left_x = screen_x - sprite_width / 2;
         const int right_x = left_x + sprite_width;
@@ -1112,10 +1188,12 @@ PyObject* render_into(PyObject*, PyObject* args) {
     PyObject* floor_height_obj = nullptr;
     PyObject* stair_obj = nullptr;
     PyObject* room_kind_obj = nullptr;
+    PyObject* sector_type_obj = nullptr;
     PyObject* door_obj = nullptr;
     PyObject* wall_texture_obj = Py_None;
     PyObject* floor_texture_obj = Py_None;
     PyObject* ceiling_texture_obj = Py_None;
+    PyObject* door_texture_obj = Py_None;
     int width = 0;
     int height = 0;
     int door_count = 0;
@@ -1129,7 +1207,7 @@ PyObject* render_into(PyObject*, PyObject* args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "OOiiddddOOOOOiiid|OOO",
+            "OOiiddddOOOOOOiiid|OOOO",
             &frame_obj,
             &depth_obj,
             &width,
@@ -1142,6 +1220,7 @@ PyObject* render_into(PyObject*, PyObject* args) {
             &floor_height_obj,
             &stair_obj,
             &room_kind_obj,
+            &sector_type_obj,
             &door_obj,
             &door_count,
             &map_width,
@@ -1149,7 +1228,8 @@ PyObject* render_into(PyObject*, PyObject* args) {
             &time_seconds,
             &wall_texture_obj,
             &floor_texture_obj,
-            &ceiling_texture_obj)) {
+            &ceiling_texture_obj,
+            &door_texture_obj)) {
         return nullptr;
     }
 
@@ -1159,13 +1239,16 @@ PyObject* render_into(PyObject*, PyObject* args) {
     Py_buffer floor_height_view{};
     Py_buffer stair_view{};
     Py_buffer room_kind_view{};
+    Py_buffer sector_type_view{};
     Py_buffer door_view{};
     Py_buffer wall_texture_view{};
     Py_buffer floor_texture_view{};
     Py_buffer ceiling_texture_view{};
+    Py_buffer door_texture_view{};
     bool has_wall_texture_buffer = false;
     bool has_floor_texture_buffer = false;
     bool has_ceiling_texture_buffer = false;
+    bool has_door_texture_buffer = false;
 
     if (PyObject_GetBuffer(frame_obj, &frame_view, PyBUF_WRITABLE) < 0) {
         return nullptr;
@@ -1200,6 +1283,15 @@ PyObject* render_into(PyObject*, PyObject* args) {
         PyBuffer_Release(&stair_view);
         return nullptr;
     }
+    if (PyObject_GetBuffer(sector_type_obj, &sector_type_view, PyBUF_SIMPLE) < 0) {
+        PyBuffer_Release(&frame_view);
+        PyBuffer_Release(&depth_view);
+        PyBuffer_Release(&map_view);
+        PyBuffer_Release(&floor_height_view);
+        PyBuffer_Release(&stair_view);
+        PyBuffer_Release(&room_kind_view);
+        return nullptr;
+    }
     if (PyObject_GetBuffer(door_obj, &door_view, PyBUF_SIMPLE) < 0) {
         PyBuffer_Release(&frame_view);
         PyBuffer_Release(&depth_view);
@@ -1207,6 +1299,7 @@ PyObject* render_into(PyObject*, PyObject* args) {
         PyBuffer_Release(&floor_height_view);
         PyBuffer_Release(&stair_view);
         PyBuffer_Release(&room_kind_view);
+        PyBuffer_Release(&sector_type_view);
         return nullptr;
     }
     if (wall_texture_obj != Py_None) {
@@ -1217,6 +1310,7 @@ PyObject* render_into(PyObject*, PyObject* args) {
             PyBuffer_Release(&floor_height_view);
             PyBuffer_Release(&stair_view);
             PyBuffer_Release(&room_kind_view);
+            PyBuffer_Release(&sector_type_view);
             PyBuffer_Release(&door_view);
             return nullptr;
         }
@@ -1230,6 +1324,7 @@ PyObject* render_into(PyObject*, PyObject* args) {
             PyBuffer_Release(&floor_height_view);
             PyBuffer_Release(&stair_view);
             PyBuffer_Release(&room_kind_view);
+            PyBuffer_Release(&sector_type_view);
             PyBuffer_Release(&door_view);
             if (has_wall_texture_buffer) {
                 PyBuffer_Release(&wall_texture_view);
@@ -1246,6 +1341,7 @@ PyObject* render_into(PyObject*, PyObject* args) {
             PyBuffer_Release(&floor_height_view);
             PyBuffer_Release(&stair_view);
             PyBuffer_Release(&room_kind_view);
+            PyBuffer_Release(&sector_type_view);
             PyBuffer_Release(&door_view);
             if (has_wall_texture_buffer) {
                 PyBuffer_Release(&wall_texture_view);
@@ -1257,19 +1353,43 @@ PyObject* render_into(PyObject*, PyObject* args) {
         }
         has_ceiling_texture_buffer = true;
     }
+    if (door_texture_obj != Py_None) {
+        if (PyObject_GetBuffer(door_texture_obj, &door_texture_view, PyBUF_SIMPLE) < 0) {
+            PyBuffer_Release(&frame_view);
+            PyBuffer_Release(&depth_view);
+            PyBuffer_Release(&map_view);
+            PyBuffer_Release(&floor_height_view);
+            PyBuffer_Release(&stair_view);
+            PyBuffer_Release(&room_kind_view);
+            PyBuffer_Release(&sector_type_view);
+            PyBuffer_Release(&door_view);
+            if (has_wall_texture_buffer) {
+                PyBuffer_Release(&wall_texture_view);
+            }
+            if (has_floor_texture_buffer) {
+                PyBuffer_Release(&floor_texture_view);
+            }
+            if (has_ceiling_texture_buffer) {
+                PyBuffer_Release(&ceiling_texture_view);
+            }
+            return nullptr;
+        }
+        has_door_texture_buffer = true;
+    }
 
     const Py_ssize_t frame_needed = static_cast<Py_ssize_t>(width) * height * 3;
     const Py_ssize_t depth_needed = static_cast<Py_ssize_t>(width) * sizeof(float);
     const Py_ssize_t map_needed = static_cast<Py_ssize_t>(map_width) * map_height;
     const Py_ssize_t door_needed = static_cast<Py_ssize_t>(door_count) * 5;
     if (frame_view.len < frame_needed || depth_view.len < depth_needed || map_view.len < map_needed || floor_height_view.len < map_needed ||
-        stair_view.len < map_needed || room_kind_view.len < map_needed || door_view.len < door_needed) {
+        stair_view.len < map_needed || room_kind_view.len < map_needed || sector_type_view.len < map_needed || door_view.len < door_needed) {
         PyBuffer_Release(&frame_view);
         PyBuffer_Release(&depth_view);
         PyBuffer_Release(&map_view);
         PyBuffer_Release(&floor_height_view);
         PyBuffer_Release(&stair_view);
         PyBuffer_Release(&room_kind_view);
+        PyBuffer_Release(&sector_type_view);
         PyBuffer_Release(&door_view);
         PyErr_SetString(PyExc_ValueError, "buffer smaller than expected");
         return nullptr;
@@ -1281,20 +1401,39 @@ PyObject* render_into(PyObject*, PyObject* args) {
     auto* floor_heights = static_cast<const uint8_t*>(floor_height_view.buf);
     auto* stair_mask = static_cast<const uint8_t*>(stair_view.buf);
     auto* room_kinds = static_cast<const uint8_t*>(room_kind_view.buf);
+    auto* sector_types = static_cast<const uint8_t*>(sector_type_view.buf);
     auto* doors = static_cast<const uint8_t*>(door_view.buf);
 
     const uint8_t* floor_texture_data = has_floor_texture_buffer ? static_cast<const uint8_t*>(floor_texture_view.buf) : nullptr;
     const Py_ssize_t floor_texture_len = has_floor_texture_buffer ? floor_texture_view.len : 0;
     const uint8_t* ceiling_texture_data = has_ceiling_texture_buffer ? static_cast<const uint8_t*>(ceiling_texture_view.buf) : nullptr;
     const Py_ssize_t ceiling_texture_len = has_ceiling_texture_buffer ? ceiling_texture_view.len : 0;
+    const uint8_t* door_texture_data = has_door_texture_buffer ? static_cast<const uint8_t*>(door_texture_view.buf) : nullptr;
+    const Py_ssize_t door_texture_len = has_door_texture_buffer ? door_texture_view.len : 0;
 
     draw_background(frame, width, height, angle, time_seconds);
-    draw_floor_and_ceiling(frame, width, height, px, py, angle, player_z, tiles, floor_heights, stair_mask, room_kinds, floor_texture_data, floor_texture_len, ceiling_texture_data, ceiling_texture_len, map_width, map_height);
+    draw_floor_and_ceiling(frame, width, height, px, py, angle, player_z, tiles, floor_heights, stair_mask, room_kinds, sector_types, floor_texture_data, floor_texture_len, ceiling_texture_data, ceiling_texture_len, map_width, map_height);
     const uint8_t* wall_texture_data = has_wall_texture_buffer ? static_cast<const uint8_t*>(wall_texture_view.buf) : nullptr;
     const Py_ssize_t wall_texture_len = has_wall_texture_buffer ? wall_texture_view.len : 0;
 
     draw_walls(frame, depth_buffer, width, height, px, py, angle, player_z, tiles, floor_heights, stair_mask, room_kinds, wall_texture_data, wall_texture_len, map_width, map_height);
-    draw_doors(frame, depth_buffer, width, height, px, py, angle, player_z, floor_heights, doors, door_count, map_width, map_height);
+    draw_doors(
+        frame,
+        depth_buffer,
+        width,
+        height,
+        px,
+        py,
+        angle,
+        player_z,
+        floor_heights,
+        doors,
+        door_texture_data,
+        door_texture_len,
+        door_count,
+        map_width,
+        map_height
+    );
 
     PyBuffer_Release(&frame_view);
     PyBuffer_Release(&depth_view);
@@ -1302,6 +1441,7 @@ PyObject* render_into(PyObject*, PyObject* args) {
     PyBuffer_Release(&floor_height_view);
     PyBuffer_Release(&stair_view);
     PyBuffer_Release(&room_kind_view);
+    PyBuffer_Release(&sector_type_view);
     PyBuffer_Release(&door_view);
     if (has_wall_texture_buffer) {
         PyBuffer_Release(&wall_texture_view);
@@ -1311,6 +1451,9 @@ PyObject* render_into(PyObject*, PyObject* args) {
     }
     if (has_ceiling_texture_buffer) {
         PyBuffer_Release(&ceiling_texture_view);
+    }
+    if (has_door_texture_buffer) {
+        PyBuffer_Release(&door_texture_view);
     }
     Py_RETURN_NONE;
 }

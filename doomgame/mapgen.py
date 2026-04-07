@@ -3082,13 +3082,11 @@ class MapGenerator:
         if self.difficulty_id == "easy":
             upgrades = {
                 "stimpack": "medkit",
-                "shells": "shell_box",
             }
             return upgrades.get(loot_kind, loot_kind)
         if self.difficulty_id == "hard":
             downgrades = {
                 "medkit": "stimpack",
-                "shell_box": "shells",
                 "green_armor": "armor_bonus",
             }
             return downgrades.get(loot_kind, loot_kind)
@@ -3901,6 +3899,105 @@ class MapGenerator:
             start_index += 1
         return event_spawns, start_index
 
+    def _gate_ambush_room_indices(
+        self,
+        route_plan: MacroRoutePlan,
+        key_room_index: int,
+        return_room_index: int,
+    ) -> list[int]:
+        adjacency: dict[int, set[int]] = {}
+        for edge in route_plan.edges:
+            adjacency.setdefault(edge.room_a_index, set()).add(edge.room_b_index)
+            adjacency.setdefault(edge.room_b_index, set()).add(edge.room_a_index)
+
+        role_by_room = {node.room_index: node.role_hint for node in route_plan.nodes}
+        preferred_roles = {
+            ROOM_ROLE_AMBUSH_ROOM: 0,
+            ROOM_ROLE_PRESSURE_CORRIDOR: 1,
+            ROOM_ROLE_RETURN_ROUTE: 2,
+            ROOM_ROLE_SWITCH_ROOM: 3,
+            ROOM_ROLE_VISTA: 4,
+            ROOM_ROLE_SHORTCUT_HALL: 5,
+            ROOM_ROLE_FINAL_ROOM: 6,
+            ROOM_ROLE_START: 7,
+            ROOM_ROLE_KEY_ROOM: 8,
+        }
+
+        visited = {key_room_index}
+        frontier = [(key_room_index, 0)]
+        candidates: list[tuple[int, int, int]] = []
+        while frontier:
+            room_index, distance = frontier.pop(0)
+            if distance >= 2:
+                continue
+            for neighbor in sorted(adjacency.get(room_index, ())):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                next_distance = distance + 1
+                role = role_by_room.get(neighbor, ROOM_ROLE_PRESSURE_CORRIDOR)
+                if neighbor != key_room_index:
+                    candidates.append((neighbor, next_distance, preferred_roles.get(role, 9)))
+                frontier.append((neighbor, next_distance))
+
+        ordered = [room for room, _, _ in sorted(candidates, key=lambda item: (item[2], item[1], item[0]))]
+        if return_room_index in ordered:
+            ordered.remove(return_room_index)
+        ordered.insert(0, return_room_index)
+        deduped: list[int] = []
+        for room_index in ordered:
+            if room_index == key_room_index or room_index in deduped:
+                continue
+            deduped.append(room_index)
+        return deduped
+
+    def _spawn_event_enemies_across_rooms(
+        self,
+        rooms: list[Room],
+        room_indices: list[int],
+        total_count: int,
+        wake_trigger_id: str,
+        tiles: list[list[int]],
+        stair_mask: list[list[int]],
+        sector_types: list[list[int]],
+        spawn: tuple[float, float],
+        occupied_positions: list[tuple[float, float]],
+        start_index: int,
+    ) -> tuple[list[EnemySpawn], int]:
+        if total_count <= 0 or not room_indices:
+            return [], start_index
+
+        event_spawns: list[EnemySpawn] = []
+        remaining = total_count
+        max_passes = max(2, len(room_indices) * 2)
+        current_pass = 0
+        while remaining > 0 and current_pass < max_passes:
+            spawned_this_pass = 0
+            for room_index in room_indices:
+                if remaining <= 0:
+                    break
+                new_spawns, start_index = self._spawn_event_enemies(
+                    rooms,
+                    room_index,
+                    1,
+                    wake_trigger_id,
+                    tiles,
+                    stair_mask,
+                    sector_types,
+                    spawn,
+                    occupied_positions,
+                    start_index,
+                )
+                if not new_spawns:
+                    continue
+                event_spawns.extend(new_spawns)
+                remaining -= len(new_spawns)
+                spawned_this_pass += len(new_spawns)
+            if spawned_this_pass == 0:
+                break
+            current_pass += 1
+        return event_spawns, start_index
+
     def _build_dynamic_layer(
         self,
         rooms: list[Room],
@@ -4022,12 +4119,18 @@ class MapGenerator:
                         note=f"{gate.key_type.upper()} SHORTCUT OPENED",
                     )
                 )
+            return_room_index = connections[gate.connection_index].room_a_index
+            ambush_room_indices = self._gate_ambush_room_indices(
+                route_plan,
+                key_room_index,
+                return_room_index,
+            )
             ambush_count = 1 if self.difficulty_id == "easy" else 2
             if self.difficulty_id == "hard" and self.rng.random() < self.difficulty.ambush_probability:
                 ambush_count += 1
-            extra_spawns, next_enemy_index = self._spawn_event_enemies(
+            extra_spawns, next_enemy_index = self._spawn_event_enemies_across_rooms(
                 rooms,
-                key_room_index,
+                ambush_room_indices,
                 ambush_count,
                 event_id,
                 tiles,
@@ -4038,23 +4141,6 @@ class MapGenerator:
                 next_enemy_index,
             )
             enemy_spawns.extend(extra_spawns)
-            return_room_index = connections[gate.connection_index].room_a_index
-            return_count = 0 if self.difficulty_id == "easy" else 1
-            if self.difficulty_id == "hard":
-                return_count = 2
-            return_spawns, next_enemy_index = self._spawn_event_enemies(
-                rooms,
-                return_room_index,
-                return_count,
-                event_id,
-                tiles,
-                stair_mask,
-                sector_types,
-                spawn,
-                occupied_positions,
-                next_enemy_index,
-            )
-            enemy_spawns.extend(return_spawns)
             trigger = WorldTriggerSpawn(
                 trigger_id=pickup_source,
                 trigger_type="pickup",
@@ -4074,9 +4160,9 @@ class MapGenerator:
                     beat_type="key_room",
                     trigger_type="pickup",
                     trigger_ref=pickup_source,
-                    target_enemy_ids=tuple(enemy.enemy_id for enemy in [*extra_spawns, *return_spawns]),
+                    target_enemy_ids=tuple(enemy.enemy_id for enemy in extra_spawns),
                     actions=tuple(actions),
-                    pressure_value=1.0 + len(extra_spawns) * 0.45 + len(return_spawns) * 0.32,
+                    pressure_value=1.0 + len(extra_spawns) * 0.42,
                 )
             )
             beats.append(

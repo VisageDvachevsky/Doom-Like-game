@@ -29,6 +29,11 @@ NOTE_INDEX = {
     "B": 11,
 }
 
+MOOD_CALM = "calm"
+MOOD_COMBAT = "combat"
+MOOD_FRENZY = "frenzy"
+MOOD_ORDER = (MOOD_CALM, MOOD_COMBAT, MOOD_FRENZY)
+
 
 @dataclass(frozen=True)
 class NoteEvent:
@@ -39,6 +44,117 @@ class NoteEvent:
     pan: float = 0.0
 
 
+@dataclass(frozen=True)
+class MusicSnapshot:
+    active_enemies: int = 0
+    nearby_enemies: int = 0
+    attacking_enemies: int = 0
+    projectile_count: int = 0
+    movement: float = 0.0
+    recent_shots: float = 0.0
+    recent_damage: float = 0.0
+    recent_kills: float = 0.0
+
+
+@dataclass(frozen=True)
+class MusicTrack:
+    path: Path
+    mood: str
+    sound: pygame.mixer.Sound | None = None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+class AdaptiveMusicLogic:
+    def __init__(self) -> None:
+        self.intensity = 0.0
+        self.current_mood = MOOD_CALM
+        self._hold_timer = 0.0
+
+    @staticmethod
+    def classify_track(path: Path) -> str:
+        name = path.stem.casefold()
+        if "rip" in name or "tear" in name:
+            return MOOD_FRENZY
+        if "at dooms gate" in name or "doom's gate" in name or "dooms gate" in name:
+            return MOOD_FRENZY
+        if "main theme" in name:
+            return MOOD_COMBAT
+        if "imp" in name:
+            return MOOD_CALM
+        return MOOD_COMBAT
+
+    @staticmethod
+    def compute_target_intensity(snapshot: MusicSnapshot) -> float:
+        active_pressure = _clamp(snapshot.active_enemies / 8.0, 0.0, 1.0)
+        nearby_pressure = _clamp(snapshot.nearby_enemies / 4.0, 0.0, 1.0)
+        attack_pressure = _clamp(snapshot.attacking_enemies / 3.0, 0.0, 1.0)
+        projectile_pressure = _clamp(snapshot.projectile_count / 4.0, 0.0, 1.0)
+        motion_pressure = _clamp(snapshot.movement, 0.0, 1.0)
+        shots_pressure = _clamp(snapshot.recent_shots, 0.0, 1.0)
+        damage_pressure = _clamp(snapshot.recent_damage, 0.0, 1.0)
+        kill_pressure = _clamp(snapshot.recent_kills, 0.0, 1.0)
+        intensity = (
+            active_pressure * 0.15
+            + nearby_pressure * 0.20
+            + attack_pressure * 0.21
+            + projectile_pressure * 0.12
+            + motion_pressure * 0.08
+            + shots_pressure * 0.12
+            + damage_pressure * 0.08
+            + kill_pressure * 0.04
+        )
+        return _clamp(intensity, 0.0, 1.0)
+
+    def update(self, snapshot: MusicSnapshot, delta_time: float, available_moods: set[str]) -> str:
+        target = self.compute_target_intensity(snapshot)
+        blend = 1.0 - math.exp(-max(0.0, delta_time) * 1.65)
+        self.intensity += (target - self.intensity) * blend
+        self._hold_timer = max(0.0, self._hold_timer - delta_time)
+
+        desired_mood = self._mood_from_intensity(self.intensity)
+        desired_mood = self._closest_available_mood(desired_mood, available_moods)
+        if desired_mood != self.current_mood and (
+            self._is_escalation(desired_mood, self.current_mood) or self._hold_timer <= 0.0
+        ):
+            self.current_mood = desired_mood
+            self._hold_timer = 7.5
+        return self.current_mood
+
+    def _mood_from_intensity(self, intensity: float) -> str:
+        if self.current_mood == MOOD_FRENZY:
+            if intensity >= 0.62:
+                return MOOD_FRENZY
+        elif intensity >= 0.74:
+            return MOOD_FRENZY
+
+        if self.current_mood == MOOD_COMBAT:
+            if intensity >= 0.22:
+                return MOOD_COMBAT
+        elif intensity >= 0.34:
+            return MOOD_COMBAT
+
+        return MOOD_CALM
+
+    def _closest_available_mood(self, desired_mood: str, available_moods: set[str]) -> str:
+        if desired_mood in available_moods:
+            return desired_mood
+        desired_index = MOOD_ORDER.index(desired_mood)
+        for distance in range(1, len(MOOD_ORDER)):
+            lower = desired_index - distance
+            upper = desired_index + distance
+            if lower >= 0 and MOOD_ORDER[lower] in available_moods:
+                return MOOD_ORDER[lower]
+            if upper < len(MOOD_ORDER) and MOOD_ORDER[upper] in available_moods:
+                return MOOD_ORDER[upper]
+        return MOOD_CALM
+
+    def _is_escalation(self, desired_mood: str, current_mood: str) -> bool:
+        return MOOD_ORDER.index(desired_mood) > MOOD_ORDER.index(current_mood)
+
+
 class DoomMusicPlayer:
     def __init__(self) -> None:
         self.sample_rate = 22050
@@ -47,28 +163,35 @@ class DoomMusicPlayer:
         self.seconds_per_beat = 60.0 / self.bpm
         self._sound: pygame.mixer.Sound | None = None
         self._music_channel: pygame.mixer.Channel | None = None
-        self._music_path = self._find_external_music()
+        self._tracks = self._find_external_tracks()
+        self._logic = AdaptiveMusicLogic()
+        self._current_track: MusicTrack | None = None
+        self._current_music_channel_index = 0
+        self._rng = random.Random(666)
         self.enabled = False
         self.using_file_music = False
+        self._file_music_channels: tuple[pygame.mixer.Channel, pygame.mixer.Channel] | None = None
+        self._background_track: Path | None = self._find_background_track()
+        self._background_enabled = False
 
     def start(self) -> None:
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(frequency=self.sample_rate, size=-16, channels=self.channels, buffer=512)
+            pygame.mixer.set_num_channels(max(8, pygame.mixer.get_num_channels()))
         except pygame.error:
             self.enabled = False
             return
 
-        if self._music_path is not None:
-            try:
-                pygame.mixer.music.load(str(self._music_path))
-                pygame.mixer.music.set_volume(0.42)
-                pygame.mixer.music.play(-1)
+        self._background_enabled = self._start_background_bed()
+        overlay_tracks = [track for track in self._tracks if track.mood != MOOD_CALM]
+        if overlay_tracks:
+            self._prepare_file_music_channels()
+            self._tracks = self._preload_tracks(overlay_tracks)
+            if self._background_enabled or self._tracks:
                 self.enabled = True
                 self.using_file_music = True
                 return
-            except pygame.error:
-                self.using_file_music = False
 
         try:
             self._sound = pygame.mixer.Sound(buffer=self._render_loop())
@@ -84,6 +207,8 @@ class DoomMusicPlayer:
 
     def stop(self) -> None:
         if self.using_file_music:
+            for channel in self._file_music_channels or ():
+                channel.stop()
             pygame.mixer.music.stop()
             self.enabled = False
             return
@@ -91,25 +216,120 @@ class DoomMusicPlayer:
             self._music_channel.stop()
         self.enabled = False
 
-    def _find_external_music(self) -> Path | None:
-        assets_dir = Path(__file__).resolve().parent.parent / "assets"
-        preferred = [
-            "music.mp3",
-            "music.ogg",
-            "music.wav",
-            "doom_music.mp3",
-            "doom_music.ogg",
-            "new_music.mp3",
-        ]
-        for name in preferred:
-            path = assets_dir / name
-            if path.exists():
-                return path
+    def update(self, snapshot: MusicSnapshot, delta_time: float) -> None:
+        if not self.enabled or not self.using_file_music or not self._tracks:
+            return
+        mood = self._logic.update(snapshot, delta_time, self._available_moods())
+        if mood == MOOD_CALM:
+            self._fade_out_overlay(fade_ms=1800)
+            return
+        if self._current_track is not None and self._current_track.mood == mood:
+            return
+        track = self._select_track_for_mood(mood)
+        if track is None or track == self._current_track:
+            return
+        self._play_file_track(track, fade_ms=1800)
 
+    def _find_external_tracks(self) -> list[MusicTrack]:
+        assets_dir = Path(__file__).resolve().parent.parent / "assets"
         candidates: list[Path] = []
-        for ext in ("*.mp3", "*.ogg", "*.wav", "*.flac"):
+        for ext in ("*.mp3", "*.ogg", "*.flac"):
             candidates.extend(sorted(assets_dir.glob(ext)))
-        return candidates[0] if candidates else None
+
+        tracks: list[MusicTrack] = []
+        for path in candidates:
+            if not self._is_music_asset(path):
+                continue
+            tracks.append(MusicTrack(path=path, mood=AdaptiveMusicLogic.classify_track(path)))
+        return tracks
+
+    def _is_music_asset(self, path: Path) -> bool:
+        name = path.stem.casefold()
+        if name.startswith("ds"):
+            return False
+        music_markers = ("doom", "ost", "theme", "song", "gate", "rip", "tear", "music")
+        return any(marker in name for marker in music_markers)
+
+    def _find_background_track(self) -> Path | None:
+        assets_dir = Path(__file__).resolve().parent.parent / "assets"
+        preferred = assets_dir / "d_e2m6.mid"
+        return preferred if preferred.exists() else None
+
+    def _preload_tracks(self, tracks: list[MusicTrack]) -> list[MusicTrack]:
+        loaded_tracks: list[MusicTrack] = []
+        for track in tracks:
+            try:
+                sound = pygame.mixer.Sound(str(track.path))
+            except pygame.error:
+                continue
+            loaded_tracks.append(MusicTrack(path=track.path, mood=track.mood, sound=sound))
+        return loaded_tracks
+
+    def _prepare_file_music_channels(self) -> None:
+        if self._file_music_channels is not None:
+            return
+        primary = pygame.mixer.Channel(0)
+        secondary = pygame.mixer.Channel(5)
+        primary.set_volume(0.0)
+        secondary.set_volume(0.0)
+        self._file_music_channels = (primary, secondary)
+
+    def _start_background_bed(self) -> bool:
+        if self._background_track is None:
+            return False
+        try:
+            pygame.mixer.music.load(str(self._background_track))
+            pygame.mixer.music.set_volume(0.24)
+            pygame.mixer.music.play(-1, fade_ms=1600)
+        except pygame.error:
+            return False
+        return True
+
+    def _available_moods(self) -> set[str]:
+        moods = {track.mood for track in self._tracks}
+        if self._background_enabled:
+            moods.add(MOOD_CALM)
+        return moods
+
+    def _select_track_for_mood(self, mood: str) -> MusicTrack | None:
+        matching = [track for track in self._tracks if track.mood == mood]
+        if not matching:
+            return None
+        if len(matching) == 1:
+            return matching[0]
+        current_path = self._current_track.path if self._current_track is not None else None
+        alternatives = [track for track in matching if track.path != current_path]
+        pool = alternatives or matching
+        return self._rng.choice(pool)
+
+    def _play_file_track(self, track: MusicTrack, fade_ms: int = 0) -> bool:
+        if track.sound is None:
+            return False
+        self._prepare_file_music_channels()
+        if self._file_music_channels is None:
+            return False
+        next_index = self._current_music_channel_index
+        previous_index = 1 - next_index
+        next_channel = self._file_music_channels[next_index]
+        previous_channel = self._file_music_channels[previous_index]
+        try:
+            next_channel.set_volume(0.42)
+            next_channel.play(track.sound, loops=-1, fade_ms=fade_ms)
+            if previous_channel.get_busy():
+                previous_channel.fadeout(max(fade_ms, 250))
+        except pygame.error:
+            return False
+        self._current_music_channel_index = previous_index
+        self._current_track = track
+        return True
+
+    def _fade_out_overlay(self, fade_ms: int) -> None:
+        if self._current_track is None:
+            return
+        for channel in self._file_music_channels or ():
+            if channel.get_busy():
+                channel.fadeout(fade_ms)
+        self._current_track = None
 
     def _render_loop(self) -> bytes:
         total_beats = 32.0

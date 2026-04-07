@@ -12,6 +12,8 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 from doomgame.game import DoomGame
+from doomgame.enemies import ENEMY_DEFINITIONS
+from doomgame.loot import get_pickup_definition
 from doomgame.mapgen import MapGenerator
 from doomgame.progression import CampaignSequenceDirector
 from doomgame.world import World
@@ -99,6 +101,77 @@ class DifficultyGenerationTests(unittest.TestCase):
         easy_value = sum(loot.amount for loot in easy.loot_spawns) + sum(secret.reward_amount for secret in easy.secret_spawns)
         hard_value = sum(loot.amount for loot in hard.loot_spawns) + sum(secret.reward_amount for secret in hard.secret_spawns)
         self.assertGreater(easy_value, hard_value)
+
+    def test_difficulty_ammo_economy_is_more_evenly_tuned(self) -> None:
+        def ammo_profile(difficulty_id: str) -> tuple[float, float]:
+            required_shots: list[float] = []
+            placed_ammo: list[float] = []
+            expected_drop_ammo: list[float] = []
+            for seed in range(200, 206):
+                generated = MapGenerator(seed=seed, difficulty_id=difficulty_id, runtime_pressure_bias=1.0).generate()
+                required_shots.append(
+                    sum((ENEMY_DEFINITIONS[enemy.enemy_type].max_hp + 23) // 24 for enemy in generated.enemy_spawns)
+                )
+                placed = 32
+                expected_drops = 0.0
+                for loot in generated.loot_spawns:
+                    definition = get_pickup_definition(loot.kind)
+                    if definition.effect.stat == "ammo":
+                        placed += loot.amount
+                for enemy in generated.enemy_spawns:
+                    for drop in ENEMY_DEFINITIONS[enemy.enemy_type].drops:
+                        definition = get_pickup_definition(drop.kind)
+                        if definition.effect.stat == "ammo":
+                            expected_drops += drop.amount * drop.chance
+                placed_ammo.append(placed)
+                expected_drop_ammo.append(expected_drops)
+            placed_ratio = sum(placed_ammo) / sum(required_shots)
+            total_ratio = (sum(placed_ammo) + sum(expected_drop_ammo)) / sum(required_shots)
+            return placed_ratio, total_ratio
+
+        easy_placed, easy_total = ammo_profile("easy")
+        medium_placed, medium_total = ammo_profile("medium")
+        hard_placed, hard_total = ammo_profile("hard")
+
+        self.assertLess(easy_total, 2.6)
+        self.assertGreater(hard_placed, 0.5)
+        self.assertGreater(hard_total, 1.65)
+        self.assertGreater(hard_total, 0.85 * medium_total)
+        self.assertGreater(easy_total, medium_total)
+
+    def test_key_ambushes_spawn_in_neighboring_rooms_not_on_top_of_key(self) -> None:
+        generated = MapGenerator(seed=20260411, difficulty_id="hard", runtime_pressure_bias=1.0).generate()
+        enemy_by_id = {enemy.enemy_id: enemy for enemy in generated.enemy_spawns}
+        adjacency: dict[int, set[int]] = {}
+        for edge in generated.route_plan.edges:
+            adjacency.setdefault(edge.room_a_index, set()).add(edge.room_b_index)
+            adjacency.setdefault(edge.room_b_index, set()).add(edge.room_a_index)
+
+        def room_distance(start: int, target: int) -> int | None:
+            queue = deque([(start, 0)])
+            visited = {start}
+            while queue:
+                room_index, depth = queue.popleft()
+                if room_index == target:
+                    return depth
+                for neighbor in adjacency.get(room_index, ()):
+                    if neighbor in visited:
+                        continue
+                    visited.add(neighbor)
+                    queue.append((neighbor, depth + 1))
+            return None
+
+        key_room_by_trigger = {trigger.trigger_id: trigger.room_index for trigger in generated.trigger_spawns if trigger.trigger_type == "pickup"}
+        for event in generated.encounter_events:
+            if event.trigger_type != "pickup":
+                continue
+            key_room_index = key_room_by_trigger[event.trigger_ref]
+            self.assertTrue(event.target_enemy_ids)
+            for enemy_id in event.target_enemy_ids:
+                enemy_room_index = enemy_by_id[enemy_id].room_index
+                self.assertNotEqual(key_room_index, enemy_room_index)
+                distance = room_distance(key_room_index, enemy_room_index)
+                self.assertIn(distance, {1, 2})
 
     def test_dormant_event_enemies_are_hidden_until_triggered(self) -> None:
         generated = MapGenerator(seed=20260407, difficulty_id="medium", runtime_pressure_bias=1.0).generate()

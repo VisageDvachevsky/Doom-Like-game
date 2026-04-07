@@ -526,7 +526,7 @@ class World:
                     f"trigger_unlocked={door.trigger_unlocked}"
                 )
                 if audio is not None:
-                    audio.play_door_open()
+                    audio.play_door_open(door.door_type)
                 if action.note:
                     messages.append(action.note)
                 break

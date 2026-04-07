@@ -14,11 +14,13 @@ class DoomAudio:
         self.enabled = False
         self.channels: dict[str, pygame.mixer.Channel] = {}
         self.sounds: dict[str, pygame.mixer.Sound] = {}
+        self._last_played_at: dict[str, float] = {}
 
     def start(self) -> None:
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(frequency=self.sample_rate, size=-16, channels=2, buffer=512)
+            pygame.mixer.set_num_channels(max(8, pygame.mixer.get_num_channels()))
         except pygame.error:
             self.enabled = False
             return
@@ -30,6 +32,10 @@ class DoomAudio:
             "enemy": pygame.mixer.Channel(4),
         }
         shotgun_fire = self._load_asset_sound("dspistol.wav")
+        normal_door_open = self._load_asset_sound("dsbdopn.wav")
+        locked_door_open = self._load_asset_sound("dsdoropn.wav")
+        item_pickup = self._load_asset_sound("dsitemup.wav")
+        level_exit = self._load_asset_sound("dstelept.wav")
         charger_attack = self._load_asset_sound("dsfirsht.wav")
         grunt_attack = self._load_asset_sound("dsshotgn.wav")
         heavy_attack = self._load_asset_sound("dsrlaunc.wav")
@@ -38,15 +44,21 @@ class DoomAudio:
         grunt_death = self._load_asset_sound("dsskedth.wav")
         heavy_death = self._load_asset_sound("dscybdth.wav")
         warden_death = self._load_asset_sound("dsmandth.wav")
+        charger_pain = self._load_asset_sound("dspopain.wav")
+        grunt_pain = self._load_asset_sound("dchopain.wav")
+        heavy_pain = self._load_asset_sound("dsdmpain.wav")
+        warden_pain = self._load_asset_sound("dsbospn.wav")
         player_pain = self._load_asset_sound("dsplpain.wav")
         player_oof = self._load_asset_sound("dsoof.wav")
         player_death = self._load_asset_sound("dspldeth.wav")
         self.sounds = {
             "shotgun_fire": shotgun_fire if shotgun_fire is not None else pygame.mixer.Sound(buffer=self._render_shotgun_fire()),
             "empty_click": pygame.mixer.Sound(buffer=self._render_empty_click()),
-            "pickup": pygame.mixer.Sound(buffer=self._render_pickup_ping()),
+            "pickup": item_pickup if item_pickup is not None else pygame.mixer.Sound(buffer=self._render_pickup_ping()),
             "key_pickup": pygame.mixer.Sound(buffer=self._render_key_pickup_ping()),
-            "door_open": pygame.mixer.Sound(buffer=self._render_door_open()),
+            "level_exit": level_exit if level_exit is not None else pygame.mixer.Sound(buffer=self._render_key_pickup_ping()),
+            "door_open": normal_door_open if normal_door_open is not None else pygame.mixer.Sound(buffer=self._render_door_open()),
+            "door_open_locked": locked_door_open if locked_door_open is not None else pygame.mixer.Sound(buffer=self._render_door_open()),
             "door_locked": pygame.mixer.Sound(buffer=self._render_door_locked()),
             "enemy_melee": pygame.mixer.Sound(buffer=self._render_enemy_melee()),
             "enemy_ranged": pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
@@ -59,6 +71,10 @@ class DoomAudio:
             "grunt_death": grunt_death if grunt_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
             "heavy_death": heavy_death if heavy_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
             "warden_death": warden_death if warden_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
+            "charger_pain": charger_pain if charger_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
+            "grunt_pain": grunt_pain if grunt_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
+            "heavy_pain": heavy_pain if heavy_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
+            "warden_pain": warden_pain if warden_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
             "player_pain": player_pain,
             "player_oof": player_oof,
             "player_death": player_death,
@@ -75,28 +91,26 @@ class DoomAudio:
         self.enabled = False
 
     def play_shotgun_fire(self) -> None:
-        if self.enabled:
-            self.channels["weapon"].play(self.sounds["shotgun_fire"])
+        self._play_sound("weapon", "shotgun_fire", cooldown=0.08, interrupt=True)
 
     def play_empty_click(self) -> None:
-        if self.enabled:
-            self.channels["weapon"].play(self.sounds["empty_click"])
+        self._play_sound("weapon", "empty_click", cooldown=0.05, interrupt=True)
 
     def play_pickup(self) -> None:
-        if self.enabled:
-            self.channels["ui"].play(self.sounds["pickup"])
+        self._play_sound("ui", "pickup", cooldown=0.05)
 
     def play_key_pickup(self) -> None:
-        if self.enabled:
-            self.channels["ui"].play(self.sounds["key_pickup"])
+        self._play_sound("ui", "key_pickup", cooldown=0.12)
 
-    def play_door_open(self) -> None:
-        if self.enabled:
-            self.channels["world"].play(self.sounds["door_open"])
+    def play_level_exit(self) -> None:
+        self._play_sound("ui", "level_exit", cooldown=0.4, interrupt=True)
+
+    def play_door_open(self, door_type: str = "normal") -> None:
+        sound_key = "door_open_locked" if door_type in {"blue_locked", "yellow_locked", "red_locked"} else "door_open"
+        self._play_sound("world", sound_key, cooldown=0.22)
 
     def play_door_locked(self) -> None:
-        if self.enabled:
-            self.channels["world"].play(self.sounds["door_locked"])
+        self._play_sound("world", "door_locked", cooldown=0.14)
 
     def play_enemy_alert(self, enemy_type: str) -> None:
         return
@@ -112,23 +126,30 @@ class DoomAudio:
         }.get(enemy_type)
         if sound_key is None:
             sound_key = "enemy_melee" if enemy_type == "charger" else "enemy_ranged"
-        self.channels["enemy"].play(self.sounds[sound_key])
+        self._play_sound("enemy", sound_key, cooldown=0.28)
 
     def play_enemy_attack_hit(self, enemy_type: str) -> None:
         return
 
     def play_enemy_pain(self, enemy_type: str) -> None:
-        return
+        sound_key = {
+            "charger": "charger_pain",
+            "grunt": "grunt_pain",
+            "heavy": "heavy_pain",
+            "warden": "warden_pain",
+        }.get(enemy_type)
+        if sound_key is None:
+            return
+        self._play_sound("enemy", sound_key, cooldown=0.16)
 
     def play_enemy_death(self, enemy_type: str) -> None:
-        if self.enabled:
-            sound_key = {
-                "charger": "charger_death",
-                "grunt": "grunt_death",
-                "heavy": "heavy_death",
-                "warden": "warden_death",
-            }.get(enemy_type, "enemy_death")
-            self.channels["enemy"].play(self.sounds[sound_key])
+        sound_key = {
+            "charger": "charger_death",
+            "grunt": "grunt_death",
+            "heavy": "heavy_death",
+            "warden": "warden_death",
+        }.get(enemy_type, "enemy_death")
+        self._play_sound("enemy", sound_key, cooldown=0.12)
 
     def play_player_hit(self) -> None:
         if not self.enabled:
@@ -140,7 +161,9 @@ class DoomAudio:
             choices.append(self.sounds["player_oof"])
         if not choices:
             return
-        self.channels["ui"].play(random.choice(choices))
+        sound = random.choice(choices)
+        sound_key = "player_pain" if sound is self.sounds.get("player_pain") else "player_oof"
+        self._play_sound("ui", sound_key, cooldown=0.22)
 
     def play_player_death(self) -> None:
         if not self.enabled:
@@ -148,7 +171,31 @@ class DoomAudio:
         sound = self.sounds.get("player_death")
         if sound is None:
             return
-        self.channels["ui"].play(sound)
+        self._play_sound("ui", "player_death", cooldown=0.3, interrupt=True)
+
+    def _play_sound(
+        self,
+        channel_key: str,
+        sound_key: str,
+        cooldown: float = 0.0,
+        interrupt: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+        channel = self.channels.get(channel_key)
+        sound = self.sounds.get(sound_key)
+        if channel is None or sound is None:
+            return
+        now = pygame.time.get_ticks() * 0.001
+        last_played = self._last_played_at.get(sound_key, -10.0)
+        if now - last_played < cooldown:
+            return
+        if channel.get_busy():
+            if not interrupt:
+                return
+            channel.stop()
+        channel.play(sound)
+        self._last_played_at[sound_key] = now
 
     def _load_asset_sound(self, asset_name: str) -> pygame.mixer.Sound | None:
         asset_path = Path(__file__).resolve().parent.parent / "assets" / asset_name
