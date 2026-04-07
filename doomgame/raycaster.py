@@ -1443,6 +1443,8 @@ class Raycaster:
         if sprite_sets is None:
             return None
         state = enemy.sprite_state()
+        if not enemy.dead and getattr(enemy, "recent_hit_flash", 0.0) > 0.0:
+            state = "pain"
         frames = sprite_sets.get(state) or sprite_sets["idle"]
         if enemy.enemy_type == "charger" and not enemy.dead and player_distance is not None:
             if state == "attack":
