@@ -8,6 +8,12 @@ import random
 import pygame
 
 
+WEAPON_CHANNEL_VOLUME = 1.0
+UI_CHANNEL_VOLUME = 1.0
+WORLD_CHANNEL_VOLUME = 1.0
+ENEMY_CHANNEL_VOLUME = 1.0
+
+
 class DoomAudio:
     def __init__(self) -> None:
         self.sample_rate = 22050
@@ -79,10 +85,13 @@ class DoomAudio:
             "player_oof": player_oof,
             "player_death": player_death,
         }
-        self.channels["weapon"].set_volume(0.66)
-        self.channels["ui"].set_volume(0.40)
-        self.channels["world"].set_volume(0.48)
-        self.channels["enemy"].set_volume(0.44)
+        for sound in self.sounds.values():
+            if sound is not None:
+                sound.set_volume(1.0)
+        self.channels["weapon"].set_volume(WEAPON_CHANNEL_VOLUME)
+        self.channels["ui"].set_volume(UI_CHANNEL_VOLUME)
+        self.channels["world"].set_volume(WORLD_CHANNEL_VOLUME)
+        self.channels["enemy"].set_volume(ENEMY_CHANNEL_VOLUME)
         self.enabled = True
 
     def stop(self) -> None:

@@ -80,6 +80,7 @@ class Room:
     shape_family: str = "rectangular"
     spatial_archetype: str = "standard"
     ceiling_height: int = 1
+    geometry_preset_id: str = "standard"
 
     @property
     def center(self) -> tuple[int, int]:
@@ -121,6 +122,11 @@ class GeneratedMap:
     level_index: int
     level_archetype_id: str
     skeleton_profile_id: str
+    macro_variant_id: str
+    spatial_profile_id: str
+    encounter_style_id: str
+    theme_modifier_id: str
+    level_modifier_id: str
     level_title: str
     level_subtitle: str
     macro_layout_type: str
@@ -197,6 +203,182 @@ class LayoutPlan:
     template_variant: str
 
 
+@dataclass(frozen=True)
+class EncounterTemplateDefinition:
+    template_id: str
+    announcement_label: str
+    ambush_bonus: int = 0
+    pressure_multiplier: float = 1.0
+    final_spawn_bonus: int = 0
+    final_pressure_base: float = 1.1
+    final_pressure_per_spawn: float = 0.5
+    switch_pressure: float = 0.35
+
+
+@dataclass(frozen=True)
+class GeometryPresetDefinition:
+    preset_id: str
+    shape_family: str
+    spatial_archetype: str
+    ceiling_height: int
+
+
+def _build_encounter_template_definitions() -> dict[str, EncounterTemplateDefinition]:
+    role_variant_labels = {
+        "standard": "CONTACT STANDARD",
+        "crossfire": "CROSSFIRE LOCKDOWN",
+        "flank": "FLANK PRESSURE",
+        "switch": "SWITCH CONTROL",
+        "chase": "PURSUIT WAVE",
+        "finale": "FINAL DEFENSE",
+    }
+    style_configs = {
+        "standard": {
+            "ambush_bonus": 0,
+            "pressure_multiplier": 1.0,
+            "final_spawn_bonus": 0,
+            "final_pressure_per_spawn": 0.5,
+            "switch_pressure": 0.35,
+        },
+        "holdout": {
+            "ambush_bonus": 1,
+            "pressure_multiplier": 1.18,
+            "final_spawn_bonus": 1,
+            "final_pressure_per_spawn": 0.62,
+            "switch_pressure": 0.55,
+        },
+        "hunter": {
+            "ambush_bonus": 1,
+            "pressure_multiplier": 1.1,
+            "final_spawn_bonus": 0,
+            "final_pressure_per_spawn": 0.54,
+            "switch_pressure": 0.4,
+        },
+        "pincer": {
+            "ambush_bonus": 1,
+            "pressure_multiplier": 1.22,
+            "final_spawn_bonus": 1,
+            "final_pressure_per_spawn": 0.56,
+            "switch_pressure": 0.42,
+        },
+    }
+    template_definitions: dict[str, EncounterTemplateDefinition] = {}
+    for style_id, config in style_configs.items():
+        for variant_id, variant_label in role_variant_labels.items():
+            template_id = f"{style_id}_{variant_id}"
+            template_definitions[template_id] = EncounterTemplateDefinition(
+                template_id=template_id,
+                announcement_label=f"{style_id.upper()} {variant_label}",
+                ambush_bonus=config["ambush_bonus"],
+                pressure_multiplier=config["pressure_multiplier"],
+                final_spawn_bonus=config["final_spawn_bonus"],
+                final_pressure_per_spawn=config["final_pressure_per_spawn"],
+                switch_pressure=config["switch_pressure"],
+            )
+    template_definitions.update(
+        {
+            "key_standard": EncounterTemplateDefinition(
+                template_id="key_standard",
+                announcement_label="STANDARD KEY LOCKDOWN",
+            ),
+            "key_holdout": EncounterTemplateDefinition(
+                template_id="key_holdout",
+                announcement_label="HOLDOUT KEY LOCKDOWN",
+                ambush_bonus=1,
+                pressure_multiplier=1.18,
+            ),
+            "key_hunter": EncounterTemplateDefinition(
+                template_id="key_hunter",
+                announcement_label="HUNTER KEY LOCKDOWN",
+                ambush_bonus=1,
+                pressure_multiplier=1.1,
+            ),
+            "key_pincer": EncounterTemplateDefinition(
+                template_id="key_pincer",
+                announcement_label="PINCER KEY LOCKDOWN",
+                ambush_bonus=1,
+                pressure_multiplier=1.22,
+            ),
+        }
+    )
+    return template_definitions
+
+
+ENCOUNTER_TEMPLATE_DEFINITIONS = _build_encounter_template_definitions()
+
+
+def _build_geometry_preset_definitions() -> dict[str, GeometryPresetDefinition]:
+    preset_rows = (
+        ("entry_hall", "rectangular", ARCHETYPE_HIGH_CEILING_HALL, 2),
+        ("entry_offset", "offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
+        ("entry_grand", "side_bays", ARCHETYPE_GRAND_CHAMBER, 3),
+        ("entry_toxic", "rectangular", ARCHETYPE_TOXIC_CANALS, 2),
+        ("vista_balcony", "cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
+        ("vista_ring", "ring_like", ARCHETYPE_HIGH_CEILING_HALL, 3),
+        ("vista_grand_ring", "ring_like", ARCHETYPE_GRAND_CHAMBER, 4),
+        ("vista_offset", "offset_rect", ARCHETYPE_OVERLOOK_VISTA, 2),
+        ("vista_grand_offset", "offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 3),
+        ("vista_corner", "corner_pillars", ARCHETYPE_GRAND_CHAMBER, 4),
+        ("key_pit_lane", "pit_with_walkway", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+        ("key_toxic_pit_lane", "pit_with_walkway", ARCHETYPE_TOXIC_CANALS, 2),
+        ("key_bridge_control", "pit_with_walkway", ARCHETYPE_BRIDGE_CROSSING, 2),
+        ("key_holdout_island", "raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
+        ("key_crossfire_ring", "cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
+        ("key_toxic_crossfire", "cut_corner", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+        ("key_central_island", "central_island", ARCHETYPE_SPLIT_ARENA, 2),
+        ("key_grand_island", "central_island", ARCHETYPE_SPLIT_ARENA, 3),
+        ("key_grand_holdout", "raised_platform", ARCHETYPE_GRAND_CHAMBER, 3),
+        ("key_bridge_hold", "bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
+        ("key_toxic_bridge_hold", "bridge_room", ARCHETYPE_TOXIC_CANALS, 2),
+        ("return_bridge_lane", "bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
+        ("return_toxic_bridge", "bridge_room", ARCHETYPE_TOXIC_CANALS, 2),
+        ("return_flank_lane", "offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+        ("return_toxic_flank", "offset_rect", ARCHETYPE_TOXIC_CANALS, 1),
+        ("return_crusher_flank", "recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+        ("return_grand_lane", "offset_rect", ARCHETYPE_GRAND_CHAMBER, 2),
+        ("pressure_crossfire", "split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
+        ("pressure_grand_crossfire", "split_by_pillar_line", ARCHETYPE_GRAND_CHAMBER, 3),
+        ("pressure_hazard_island", "central_island", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+        ("pressure_island", "central_island", ARCHETYPE_SPLIT_ARENA, 2),
+        ("pressure_bridge_island", "central_island", ARCHETYPE_BRIDGE_CROSSING, 2),
+        ("pressure_flank_lane", "offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+        ("pressure_grand_lane", "offset_rect", ARCHETYPE_GRAND_CHAMBER, 2),
+        ("pressure_toxic_crossfire", "split_by_pillar_line", ARCHETYPE_TOXIC_CANALS, 2),
+        ("pressure_toxic_lane", "offset_rect", ARCHETYPE_TOXIC_CANALS, 1),
+        ("pressure_crusher_flank", "recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+        ("final_crossfire", "split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 3),
+        ("final_grand_crossfire", "split_by_pillar_line", ARCHETYPE_GRAND_CHAMBER, 4),
+        ("final_holdout", "raised_platform", ARCHETYPE_RAISED_PLATFORM, 3),
+        ("final_grand_holdout", "raised_platform", ARCHETYPE_GRAND_CHAMBER, 4),
+        ("final_bridge_lane", "bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
+        ("final_toxic_bridge", "bridge_room", ARCHETYPE_TOXIC_PIT_ROOM, 3),
+        ("final_corner_crossfire", "corner_pillars", ARCHETYPE_GRAND_CHAMBER, 4),
+        ("final_ring_crossfire", "ring_like", ARCHETYPE_ACID_RING, 3),
+        ("shrine_ceremonial", "cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
+        ("shrine_grand_ceremonial", "cut_corner", ARCHETYPE_GRAND_CHAMBER, 3),
+        ("shrine_ring", "ring_like", ARCHETYPE_HIGH_CEILING_HALL, 2),
+        ("arena_island", "central_island", ARCHETYPE_SPLIT_ARENA, 2),
+        ("arena_grand_island", "central_island", ARCHETYPE_GRAND_CHAMBER, 3),
+        ("arena_crossfire", "split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
+        ("arena_toxic_crossfire", "split_by_pillar_line", ARCHETYPE_TOXIC_PIT_ROOM, 2),
+        ("arena_corner_crossfire", "corner_pillars", ARCHETYPE_GRAND_CHAMBER, 3),
+        ("arena_toxic_side_bays", "side_bays", ARCHETYPE_TOXIC_CANALS, 2),
+        ("general_standard", "rectangular", "standard", 1),
+        ("general_toxic_standard", "rectangular", ARCHETYPE_TOXIC_CANALS, 1),
+        ("general_grand_standard", "rectangular", ARCHETYPE_GRAND_CHAMBER, 2),
+        ("general_flank_lane", "offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
+        ("general_recessed_flank", "recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
+        ("general_side_bays", "side_bays", ARCHETYPE_GRAND_CHAMBER, 2),
+    )
+    return {
+        preset_id: GeometryPresetDefinition(preset_id, shape_family, spatial_archetype, ceiling_height)
+        for preset_id, shape_family, spatial_archetype, ceiling_height in preset_rows
+    }
+
+
+GEOMETRY_PRESET_DEFINITIONS = _build_geometry_preset_definitions()
+
+
 class MapGenerator:
     def __init__(
         self,
@@ -228,17 +410,28 @@ class MapGenerator:
     def generate(self) -> GeneratedMap:
         best_map: GeneratedMap | None = None
         best_score = float("-inf")
-        for attempt in range(settings.MAPGEN_MAX_ATTEMPTS):
+        best_valid_map: GeneratedMap | None = None
+        best_valid_score = float("-inf")
+        validation_probe = bool(self.generation_request and self.generation_request.validation_probe)
+        attempt_limit = min(settings.MAPGEN_MAX_ATTEMPTS, 3 if validation_probe else settings.MAPGEN_MAX_ATTEMPTS)
+        for attempt in range(attempt_limit):
             self.rng = random.Random(f"topology:{self.seed}:{attempt}")
             generated = self._generate_once()
             if generated is None:
                 continue
+            if validation_probe and generated.validation_report.valid:
+                return generated
             score = generated.quality_report.doom_likeness_score
             if score > best_score:
                 best_map = generated
                 best_score = score
+            if generated.validation_report.valid and score > best_valid_score:
+                best_valid_map = generated
+                best_valid_score = score
             if self._meets_quality_target(generated.quality_report, generated.validation_report):
                 return generated
+        if best_valid_map is not None:
+            return best_valid_map
         if best_map is not None:
             return best_map
         fallback = self._generate_structured_fallback()
@@ -253,6 +446,50 @@ class MapGenerator:
 
     def _campaign_archetype_id(self) -> str:
         return self._campaign_field("level_archetype_id", "single_level")
+
+    def _macro_variant_id(self) -> str:
+        return self._campaign_field("macro_variant_id", "default")
+
+    def _spatial_profile_id(self) -> str:
+        return self._campaign_field("spatial_profile_id", "balanced")
+
+    def _encounter_style_id(self) -> str:
+        return self._campaign_field("encounter_style_id", "standard")
+
+    def _theme_modifier_id(self) -> str:
+        return self._campaign_field("theme_modifier_id", "default")
+
+    def _level_modifier_id(self) -> str:
+        return self._campaign_field("level_modifier_id", "standard")
+
+    def _resolve_template_variant(self, skeleton_profile_id: str) -> str:
+        skeleton_profile = get_skeleton_profile(skeleton_profile_id)
+        variants = skeleton_profile.template_variants or (skeleton_profile.template_variant,)
+        preferred_variant = skeleton_profile.template_variant
+        macro_variant_id = self._macro_variant_id()
+        spatial_profile_id = self._spatial_profile_id()
+        level_modifier_id = self._level_modifier_id()
+        for candidate in variants:
+            macro_footprint, footprint_variant, _, _ = candidate.split(":", 3)
+            if macro_variant_id == "collapse" and "perimeter" in macro_footprint:
+                return candidate
+            if macro_variant_id == "branchy" and footprint_variant in {"tight", "balanced"}:
+                preferred_variant = candidate
+            if spatial_profile_id == "expansive" and footprint_variant == "wide":
+                return candidate
+            if spatial_profile_id == "tight" and footprint_variant == "tight":
+                return candidate
+            if level_modifier_id == "vista_dominant" and macro_footprint in {"pockets", "perimeter", "twinhub"}:
+                preferred_variant = candidate
+        return preferred_variant
+
+    def _template_variant_candidates(self, skeleton_profile_id: str) -> tuple[str, ...]:
+        skeleton_profile = get_skeleton_profile(skeleton_profile_id)
+        variants = skeleton_profile.template_variants or (skeleton_profile.template_variant,)
+        preferred_variant = self._resolve_template_variant(skeleton_profile_id)
+        ordered_variants = [preferred_variant]
+        ordered_variants.extend(candidate for candidate in variants if candidate != preferred_variant)
+        return tuple(ordered_variants)
 
     def _build_generated_map(
         self,
@@ -306,6 +543,11 @@ class MapGenerator:
             level_index=self._campaign_field("level_index", 1),
             level_archetype_id=self._campaign_field("level_archetype_id", "single_level"),
             skeleton_profile_id=self._campaign_field("skeleton_profile_id", macro_layout_type),
+            macro_variant_id=self._macro_variant_id(),
+            spatial_profile_id=self._spatial_profile_id(),
+            encounter_style_id=self._encounter_style_id(),
+            theme_modifier_id=self._theme_modifier_id(),
+            level_modifier_id=self._level_modifier_id(),
             level_title=self._campaign_field("level_title", f"Level {self._campaign_field('level_index', 1)}"),
             level_subtitle=self._campaign_field("level_subtitle", macro_layout_type.replace("_", " ").title()),
             macro_layout_type=macro_layout_type,
@@ -322,6 +564,18 @@ class MapGenerator:
         )
 
     def _generate_once(self) -> GeneratedMap | None:
+        template_variants = (
+            self._template_variant_candidates(self.generation_request.skeleton_profile_id)
+            if self.generation_request is not None
+            else (None,)
+        )
+        for template_variant in template_variants:
+            generated = self._generate_once_for_template_variant(template_variant)
+            if generated is not None:
+                return generated
+        return None
+
+    def _generate_once_for_template_variant(self, template_variant: str | None) -> GeneratedMap | None:
         tiles = [[1 for _ in range(self.width)] for _ in range(self.height)]
         floor_heights = [[0 for _ in range(self.width)] for _ in range(self.height)]
         ceiling_heights = [[1 for _ in range(self.width)] for _ in range(self.height)]
@@ -335,6 +589,7 @@ class MapGenerator:
             stair_mask,
             room_kinds,
             sector_types,
+            template_variant=template_variant,
         )
         if layout is None:
             return None
@@ -346,6 +601,7 @@ class MapGenerator:
             stair_mask,
             room_kinds,
             sector_types,
+            rooms,
             layout.route_plan,
             layout.template_variant,
         )
@@ -439,7 +695,7 @@ class MapGenerator:
             spawn,
             reserved_positions,
         )
-        enemy_reserved_positions = [*reserved_positions, *( (loot.x, loot.y) for loot in loot_spawns )]
+        enemy_reserved_positions = [*reserved_positions, *((loot.x, loot.y) for loot in loot_spawns)]
         if exit_spawn is not None:
             enemy_reserved_positions.append((exit_spawn.x, exit_spawn.y))
         enemy_spawns, guard_enemy_id = self._generate_enemy_spawns(
@@ -547,12 +803,18 @@ class MapGenerator:
         room_kinds = [[-1 for _ in range(self.width)] for _ in range(self.height)]
         sector_types = [[SECTOR_SAFE for _ in range(self.width)] for _ in range(self.height)]
         route_plan = self._build_macro_route_plan()
-        template_variant = (
-            get_skeleton_profile(self.generation_request.skeleton_profile_id).template_variant
+        template_variants = (
+            self._template_variant_candidates(self.generation_request.skeleton_profile_id)
             if self.generation_request is not None
-            else "spine:balanced:direct:base"
+            else ("spine:balanced:direct:base",)
         )
-        rooms = self._build_template_rooms(route_plan, template_variant)
+        template_variant = template_variants[0]
+        rooms: list[Room] | None = None
+        for candidate_variant in template_variants:
+            rooms = self._build_template_rooms(route_plan, candidate_variant)
+            if rooms is not None:
+                template_variant = candidate_variant
+                break
         if rooms is None:
             return None
         for room in rooms:
@@ -569,6 +831,7 @@ class MapGenerator:
             stair_mask,
             room_kinds,
             sector_types,
+            rooms,
             route_plan,
             template_variant,
         )
@@ -768,17 +1031,26 @@ class MapGenerator:
         stair_mask: list[list[int]],
         room_kinds: list[list[int]],
         sector_types: list[list[int]],
+        template_variant: str | None = None,
     ) -> LayoutPlan | None:
         route_plan = self._build_macro_route_plan()
-        if self.generation_request is not None:
-            template_variant = get_skeleton_profile(self.generation_request.skeleton_profile_id).template_variant
+        if template_variant is not None:
+            template_variants = (template_variant,)
+        elif self.generation_request is not None:
+            template_variants = self._template_variant_candidates(self.generation_request.skeleton_profile_id)
         else:
             macro_footprint = self.rng.choice(("spine", "staggered", "pockets"))
             footprint_variant = self.rng.choice(("tight", "balanced", "wide"))
             corridor_variant = self.rng.choice(("direct", "dogleg"))
             mirror_variant = self.rng.choice(("base", "mirror_x", "mirror_y", "mirror_xy"))
-            template_variant = f"{macro_footprint}:{footprint_variant}:{corridor_variant}:{mirror_variant}"
-        rooms = self._build_template_rooms(route_plan, template_variant)
+            template_variants = (f"{macro_footprint}:{footprint_variant}:{corridor_variant}:{mirror_variant}",)
+        template_variant = template_variants[0]
+        rooms: list[Room] | None = None
+        for candidate_variant in template_variants:
+            rooms = self._build_template_rooms(route_plan, candidate_variant)
+            if rooms is not None:
+                template_variant = candidate_variant
+                break
         if rooms is None:
             return None
         for room in rooms:
@@ -811,105 +1083,354 @@ class MapGenerator:
                 )
             )
             layout_type = get_skeleton_profile(skeleton_profile_id).macro_layout_type
-
-        route_variants: dict[str, tuple[str, dict[int, tuple[str, str]], tuple[int, ...], tuple[int, ...], tuple[tuple[int, int], ...], tuple[tuple[int, int, str], ...]]] = {
-            "intro_hub_spokes": (
-                "hub_spoke",
-                {
-                    1: (ROOM_ROLE_VISTA, "shrine"),
-                    3: (ROOM_ROLE_RETURN_ROUTE, "tech"),
-                    4: (ROOM_ROLE_SWITCH_ROOM, "tech"),
-                    6: (ROOM_ROLE_SHORTCUT_HALL, "storage"),
-                    7: (ROOM_ROLE_VISTA, "shrine"),
-                    8: (ROOM_ROLE_PRESSURE_CORRIDOR, "tech"),
+        route_variants: dict[str, dict[str, dict[str, object]]] = {
+            "intro_hub_spokes": {
+                "default": {
+                    "layout_type": "hub_spoke",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
+                        (3, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (4, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_SHORTCUT_HALL, "storage", 3, False),
+                        (7, 2, ROOM_ROLE_VISTA, "shrine", 0, True),
+                        (8, 2, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1, 7),
+                    "return_rooms": (3, 8),
+                    "layout_loops": ((0, 2), (7, 9)),
+                    "shortcut_specs": ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
                 },
-                (1, 7),
-                (3, 8),
-                ((0, 2), (7, 9)),
-                ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
-            ),
-            "double_ring_circulation": (
-                "double_loop",
-                {
-                    1: (ROOM_ROLE_VISTA, "shrine"),
-                    3: (ROOM_ROLE_RETURN_ROUTE, "tech"),
-                    4: (ROOM_ROLE_PRESSURE_CORRIDOR, "tech"),
-                    6: (ROOM_ROLE_AMBUSH_ROOM, "cross"),
-                    7: (ROOM_ROLE_RETURN_ROUTE, "tech"),
-                    8: (ROOM_ROLE_VISTA, "shrine"),
+                "branchy": {
+                    "layout_type": "hub_spoke",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+                        (2, 0, ROOM_ROLE_VISTA, "shrine", 2, True),
+                        (3, 1, ROOM_ROLE_KEY_ROOM, "storage", 0, False),
+                        (4, 1, ROOM_ROLE_AMBUSH_ROOM, "cross", 1, False),
+                        (5, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 2, False),
+                        (6, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 3, False),
+                        (7, 2, ROOM_ROLE_KEY_ROOM, "arena", 0, False),
+                        (8, 2, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (2, 8),
+                    "return_rooms": (6, 8),
+                    "layout_loops": ((0, 2), (3, 6), (7, 9)),
+                    "shortcut_specs": ((6, 9, "pickup:yellow"),),
+                    "key_room_indices": (2, 7, 9),
                 },
-                (1, 8),
-                (3, 7),
-                ((0, 2), (7, 9)),
-                ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
-            ),
-            "split_fork_reconverge": (
-                "fork_return",
-                {
-                    1: (ROOM_ROLE_VISTA, "shrine"),
-                    3: (ROOM_ROLE_RETURN_ROUTE, "storage"),
-                    4: (ROOM_ROLE_SWITCH_ROOM, "tech"),
-                    6: (ROOM_ROLE_SHORTCUT_HALL, "tech"),
-                    7: (ROOM_ROLE_RETURN_ROUTE, "tech"),
-                    8: (ROOM_ROLE_VISTA, "cross"),
+                "cross_link": {
+                    "layout_type": "hub_spoke",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
+                        (3, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (4, 1, ROOM_ROLE_PRESSURE_CORRIDOR, "cross", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_AMBUSH_ROOM, "tech", 3, False),
+                        (7, 2, ROOM_ROLE_SHORTCUT_HALL, "cross", 0, False),
+                        (8, 2, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1, 8),
+                    "return_rooms": (3, 7),
+                    "layout_loops": ((0, 2), (3, 6), (6, 9)),
+                    "shortcut_specs": ((2, 6, "pickup:blue"), (5, 8, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
                 },
-                (1, 8),
-                (3, 7),
-                ((0, 2), (7, 9)),
-                ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
-            ),
-            "perimeter_inward_push": (
-                "loop_spoke",
-                {
-                    1: (ROOM_ROLE_PRESSURE_CORRIDOR, "tech"),
-                    2: (ROOM_ROLE_KEY_ROOM, "storage"),
-                    3: (ROOM_ROLE_VISTA, "shrine"),
-                    4: (ROOM_ROLE_PRESSURE_CORRIDOR, "cross"),
-                    6: (ROOM_ROLE_AMBUSH_ROOM, "arena"),
-                    7: (ROOM_ROLE_RETURN_ROUTE, "tech"),
-                    8: (ROOM_ROLE_VISTA, "shrine"),
+            },
+            "double_ring_circulation": {
+                "default": {
+                    "layout_type": "double_loop",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
+                        (3, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (4, 1, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_AMBUSH_ROOM, "cross", 3, False),
+                        (7, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (8, 2, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1, 8),
+                    "return_rooms": (3, 7),
+                    "layout_loops": ((0, 2), (7, 9)),
+                    "shortcut_specs": ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
                 },
-                (3, 8),
-                (4, 7),
-                ((0, 2), (2, 5), (5, 8), (7, 9)),
-                ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
-            ),
-            "two_hub_finale": (
-                "two_hub",
-                {
-                    1: (ROOM_ROLE_VISTA, "shrine"),
-                    3: (ROOM_ROLE_SWITCH_ROOM, "tech"),
-                    4: (ROOM_ROLE_RETURN_ROUTE, "tech"),
-                    6: (ROOM_ROLE_AMBUSH_ROOM, "arena"),
-                    7: (ROOM_ROLE_SHORTCUT_HALL, "cross"),
-                    8: (ROOM_ROLE_RETURN_ROUTE, "tech"),
+                "cross_link": {
+                    "layout_type": "double_loop",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "storage", 2, False),
+                        (3, 1, ROOM_ROLE_VISTA, "shrine", 0, True),
+                        (4, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 3, False),
+                        (7, 2, ROOM_ROLE_AMBUSH_ROOM, "cross", 0, False),
+                        (8, 2, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (3, 8),
+                    "return_rooms": (4, 7),
+                    "layout_loops": ((0, 3), (2, 6), (5, 8)),
+                    "shortcut_specs": ((2, 6, "pickup:blue"), (5, 9, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
                 },
-                (1, 8),
-                (4, 8),
-                ((0, 2), (2, 4), (5, 7), (7, 9)),
-                ((2, 5, "pickup:blue"), (4, 8, "switch:stage1"), (6, 9, "pickup:yellow")),
-            ),
+                "collapse": {
+                    "layout_type": "double_loop",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
+                        (3, 1, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 0, False),
+                        (4, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_AMBUSH_ROOM, "arena", 3, False),
+                        (7, 2, ROOM_ROLE_SWITCH_ROOM, "tech", 0, False),
+                        (8, 2, ROOM_ROLE_PRESSURE_CORRIDOR, "cross", 1, False),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1,),
+                    "return_rooms": (4, 8),
+                    "layout_loops": ((0, 2), (4, 7), (7, 9)),
+                    "shortcut_specs": ((2, 5, "pickup:blue"), (7, 9, "switch:stage1")),
+                    "key_room_indices": (2, 5, 9),
+                },
+            },
+            "split_fork_reconverge": {
+                "default": {
+                    "layout_type": "fork_return",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
+                        (3, 1, ROOM_ROLE_RETURN_ROUTE, "storage", 0, False),
+                        (4, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_SHORTCUT_HALL, "tech", 3, False),
+                        (7, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (8, 2, ROOM_ROLE_VISTA, "cross", 1, True),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1, 8),
+                    "return_rooms": (3, 7),
+                    "layout_loops": ((0, 2), (7, 9)),
+                    "shortcut_specs": ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
+                },
+                "branchy": {
+                    "layout_type": "fork_return",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+                        (2, 0, ROOM_ROLE_VISTA, "shrine", 2, True),
+                        (3, 1, ROOM_ROLE_KEY_ROOM, "storage", 0, False),
+                        (4, 1, ROOM_ROLE_RETURN_ROUTE, "cross", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_AMBUSH_ROOM, "tech", 3, False),
+                        (7, 2, ROOM_ROLE_SWITCH_ROOM, "tech", 0, False),
+                        (8, 2, ROOM_ROLE_VISTA, "cross", 1, True),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (2, 8),
+                    "return_rooms": (4, 7),
+                    "layout_loops": ((0, 3), (4, 6), (7, 9)),
+                    "shortcut_specs": ((3, 6, "pickup:blue"), (5, 8, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
+                },
+                "pincer": {
+                    "layout_type": "fork_return",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "storage", 2, False),
+                        (3, 1, ROOM_ROLE_AMBUSH_ROOM, "cross", 0, False),
+                        (4, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 3, False),
+                        (7, 2, ROOM_ROLE_SHORTCUT_HALL, "cross", 0, False),
+                        (8, 2, ROOM_ROLE_KEY_ROOM, "arena", 1, False),
+                        (9, 2, ROOM_ROLE_VISTA, "shrine", 2, True),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1, 9),
+                    "return_rooms": (6, 7),
+                    "layout_loops": ((0, 2), (3, 5), (6, 8)),
+                    "shortcut_specs": ((2, 4, "pickup:blue"), (5, 8, "switch:stage1"), (7, 10, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 8),
+                },
+            },
+            "perimeter_inward_push": {
+                "default": {
+                    "layout_type": "loop_spoke",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "storage", 2, False),
+                        (3, 1, ROOM_ROLE_VISTA, "shrine", 0, True),
+                        (4, 1, ROOM_ROLE_PRESSURE_CORRIDOR, "cross", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_AMBUSH_ROOM, "arena", 3, False),
+                        (7, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (8, 2, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (3, 8),
+                    "return_rooms": (4, 7),
+                    "layout_loops": ((0, 2), (2, 5), (5, 8), (7, 9)),
+                    "shortcut_specs": ((2, 5, "pickup:blue"), (6, 9, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
+                },
+                "collapse": {
+                    "layout_type": "loop_spoke",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "storage", 2, False),
+                        (3, 1, ROOM_ROLE_PRESSURE_CORRIDOR, "cross", 0, False),
+                        (4, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 3, False),
+                        (7, 2, ROOM_ROLE_AMBUSH_ROOM, "arena", 0, False),
+                        (8, 2, ROOM_ROLE_PRESSURE_CORRIDOR, "cross", 1, False),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1,),
+                    "return_rooms": (4, 8),
+                    "layout_loops": ((0, 2), (3, 5), (5, 7), (8, 10)),
+                    "shortcut_specs": ((2, 6, "pickup:blue"), (6, 9, "switch:stage1")),
+                    "key_room_indices": (2, 5, 9),
+                },
+                "cross_link": {
+                    "layout_type": "loop_spoke",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
+                        (2, 0, ROOM_ROLE_VISTA, "shrine", 2, True),
+                        (3, 1, ROOM_ROLE_KEY_ROOM, "storage", 0, False),
+                        (4, 1, ROOM_ROLE_AMBUSH_ROOM, "cross", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_SHORTCUT_HALL, "cross", 3, False),
+                        (7, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (8, 2, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (2, 8),
+                    "return_rooms": (6, 7),
+                    "layout_loops": ((0, 3), (2, 5), (4, 8), (7, 9)),
+                    "shortcut_specs": ((3, 6, "pickup:blue"), (5, 8, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
+                },
+            },
+            "two_hub_finale": {
+                "default": {
+                    "layout_type": "two_hub",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
+                        (3, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 0, False),
+                        (4, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_AMBUSH_ROOM, "arena", 3, False),
+                        (7, 2, ROOM_ROLE_SHORTCUT_HALL, "cross", 0, False),
+                        (8, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 1, False),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1, 8),
+                    "return_rooms": (4, 8),
+                    "layout_loops": ((0, 2), (3, 6), (7, 9)),
+                    "shortcut_specs": ((2, 5, "pickup:blue"), (4, 8, "pickup:yellow"), (6, 9, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
+                },
+                "pincer": {
+                    "layout_type": "two_hub",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_PRESSURE_CORRIDOR, "cross", 1, False),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
+                        (3, 1, ROOM_ROLE_VISTA, "shrine", 0, True),
+                        (4, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_AMBUSH_ROOM, "arena", 3, False),
+                        (7, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (8, 2, ROOM_ROLE_KEY_ROOM, "arena", 1, False),
+                        (9, 2, ROOM_ROLE_VISTA, "shrine", 2, True),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (3, 9),
+                    "return_rooms": (7,),
+                    "layout_loops": ((0, 2), (3, 6), (7, 9)),
+                    "shortcut_specs": ((2, 5, "pickup:blue"), (4, 8, "pickup:yellow"), (6, 9, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 8),
+                },
+                "collapse": {
+                    "layout_type": "two_hub",
+                    "node_specs": (
+                        (0, 0, ROOM_ROLE_START, "start", 0, False),
+                        (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
+                        (2, 0, ROOM_ROLE_KEY_ROOM, "storage", 2, False),
+                        (3, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
+                        (4, 1, ROOM_ROLE_PRESSURE_CORRIDOR, "cross", 1, False),
+                        (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (6, 1, ROOM_ROLE_SWITCH_ROOM, "tech", 3, False),
+                        (7, 2, ROOM_ROLE_AMBUSH_ROOM, "arena", 0, False),
+                        (8, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 1, False),
+                        (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
+                        (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
+                    ),
+                    "vista_rooms": (1,),
+                    "return_rooms": (3, 8),
+                    "layout_loops": ((0, 2), (3, 6), (7, 9)),
+                    "shortcut_specs": ((2, 5, "pickup:blue"), (4, 8, "pickup:yellow"), (6, 9, "pickup:yellow")),
+                    "key_room_indices": (2, 5, 9),
+                },
+            },
         }
-        layout_type, role_overrides, vista_rooms, return_rooms, layout_loops, shortcut_specs = route_variants[skeleton_profile_id]
-        base_nodes = (
-            (0, 0, ROOM_ROLE_START, "start", 0, False),
-            (1, 0, ROOM_ROLE_VISTA, "shrine", 1, True),
-            (2, 0, ROOM_ROLE_KEY_ROOM, "shrine", 2, False),
-            (3, 1, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
-            (4, 1, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
-            (5, 1, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
-            (6, 1, ROOM_ROLE_AMBUSH_ROOM, "tech", 3, False),
-            (7, 2, ROOM_ROLE_RETURN_ROUTE, "tech", 0, False),
-            (8, 2, ROOM_ROLE_PRESSURE_CORRIDOR, "tech", 1, False),
-            (9, 2, ROOM_ROLE_KEY_ROOM, "arena", 2, False),
-            (10, 3, ROOM_ROLE_FINAL_ROOM, "tech", 0, False),
-        )
+        skeleton_variants = route_variants[skeleton_profile_id]
+        requested_variant_id = self._macro_variant_id()
+        if requested_variant_id in skeleton_variants:
+            variant_definition = skeleton_variants[requested_variant_id]
+        else:
+            fallback_variant_id = next(iter(skeleton_variants))
+            variant_definition = skeleton_variants[fallback_variant_id]
+
+        layout_type = variant_definition["layout_type"]
+        base_nodes = variant_definition["node_specs"]
+        vista_rooms = tuple(variant_definition["vista_rooms"])
+        return_rooms = tuple(variant_definition["return_rooms"])
+        layout_loops = tuple(variant_definition["layout_loops"])
+        shortcut_specs = tuple(variant_definition["shortcut_specs"])
+        key_room_indices = tuple(variant_definition["key_room_indices"])
         nodes = tuple(
             MacroRouteNode(
                 room_index,
                 stage_index,
-                role_overrides.get(room_index, (role_hint, kind_hint))[0],
-                role_overrides.get(room_index, (role_hint, kind_hint))[1],
+                role_hint,
+                kind_hint,
                 branch_slot=branch_slot,
                 requires_vista=requires_vista or room_index in vista_rooms,
             )
@@ -954,7 +1475,7 @@ class MapGenerator:
             layout_type=layout_type,
             nodes=nodes,
             edges=tuple(edges),
-            key_room_indices=(2, 5, 9),
+            key_room_indices=key_room_indices,
             return_room_indices=return_rooms,
             final_room_index=10,
             vista_room_indices=vista_rooms,
@@ -1102,317 +1623,260 @@ class MapGenerator:
         mirror_y = "mirror_y" in mirror_variant
 
         rooms: list[Room] = []
-        preserve_base_dimensions = self.generation_request is not None
         for node in route_plan.nodes:
-            room_x, room_y, room_w, room_h = base_rooms[node.room_index]
-            shape_family, spatial_archetype, ceiling_height = self._choose_room_profile(node)
-            if not preserve_base_dimensions:
-                room_w, room_h = self._adjust_room_footprint(node, room_w, room_h, footprint_variant)
-                room_w, room_h = self._shape_size_adjustment(shape_family, room_w, room_h)
-            if mirror_x:
-                room_x = self.width - room_x - room_w
-            if mirror_y:
-                room_y = self.height - room_y - room_h
-            room_x = max(1, min(room_x, self.width - room_w - 1))
-            room_y = max(1, min(room_y, self.height - room_h - 1))
-            room = Room(
-                room_x,
-                room_y,
-                room_w,
-                room_h,
-                node.kind_hint,
-                0,
-                shape_family,
-                spatial_archetype,
-                ceiling_height,
-            )
-            if any(room.intersects(other, padding=0) for other in rooms):
-                return None
-            rooms.append(room)
+            base_x, base_y, room_w, room_h = base_rooms[node.room_index]
+            shape_family, spatial_archetype, ceiling_height, geometry_preset_id = self._choose_room_profile(node)
+            room_w, room_h = self._adjust_room_footprint(node, room_w, room_h, footprint_variant)
+            room_w, room_h = self._shape_size_adjustment(shape_family, room_w, room_h)
+            room_w, room_h = self._apply_request_footprint_profile(node, room_w, room_h)
+            placed_room: Room | None = None
+            for shrink in range(0, 3):
+                candidate_w = max(5, room_w - shrink)
+                candidate_h = max(5, room_h - shrink)
+                jitter_positions = (
+                    (base_x, base_y),
+                    (base_x + 1, base_y),
+                    (base_x - 1, base_y),
+                    (base_x, base_y + 1),
+                    (base_x, base_y - 1),
+                    (base_x + 1, base_y + 1),
+                    (base_x - 1, base_y - 1),
+                )
+                for raw_x, raw_y in jitter_positions:
+                    room_x = raw_x
+                    room_y = raw_y
+                    if mirror_x:
+                        room_x = self.width - room_x - candidate_w
+                    if mirror_y:
+                        room_y = self.height - room_y - candidate_h
+                    room_x = max(1, min(room_x, self.width - candidate_w - 1))
+                    room_y = max(1, min(room_y, self.height - candidate_h - 1))
+                    candidate_room = Room(
+                        room_x,
+                        room_y,
+                        candidate_w,
+                        candidate_h,
+                        node.kind_hint,
+                        0,
+                        shape_family,
+                        spatial_archetype,
+                        ceiling_height,
+                        geometry_preset_id,
+                    )
+                    if any(candidate_room.intersects(other, padding=0) for other in rooms):
+                        continue
+                    placed_room = candidate_room
+                    break
+                if placed_room is not None:
+                    break
+            if placed_room is None:
+                anchor_room = self._planned_profiled_room(
+                    node,
+                    rooms,
+                    candidate_w,
+                    candidate_h,
+                    shape_family,
+                    spatial_archetype,
+                    ceiling_height,
+                    geometry_preset_id,
+                )
+                if anchor_room is None:
+                    return None
+                placed_room = anchor_room
+            rooms.append(placed_room)
         return rooms
 
-    def _choose_room_profile(self, node: MacroRouteNode) -> tuple[str, str, int]:
-        if self.generation_request is not None:
-            archetype_id = self._campaign_archetype_id()
-            if node.role_hint == ROOM_ROLE_START:
-                if archetype_id == "tech_base":
-                    pool = (
-                        ("rectangular", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                    )
-                elif archetype_id == "relay_station":
-                    pool = (
-                        ("rectangular", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                        ("offset_rect", ARCHETYPE_GRAND_CHAMBER, 2),
-                    )
-                elif archetype_id == "waste_plant":
-                    pool = (
-                        ("rectangular", ARCHETYPE_TOXIC_CANALS, 2),
-                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                    )
-                elif archetype_id == "outer_ring":
-                    pool = (
-                        ("rectangular", ARCHETYPE_GRAND_CHAMBER, 3),
-                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                    )
-                else:
-                    pool = (
-                        ("rectangular", ARCHETYPE_GRAND_CHAMBER, 3),
-                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                    )
-            elif node.role_hint == ROOM_ROLE_VISTA:
-                if archetype_id == "waste_plant":
-                    pool = (
-                        ("cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
-                        ("ring_like", ARCHETYPE_TOXIC_CANALS, 3),
-                        ("offset_rect", ARCHETYPE_OVERLOOK_VISTA, 2),
-                    )
-                elif archetype_id in {"outer_ring", "shrine_fortress"}:
-                    pool = (
-                        ("cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
-                        ("ring_like", ARCHETYPE_GRAND_CHAMBER, 4),
-                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 3),
-                    )
-                else:
-                    pool = (
-                        ("cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
-                        ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 3),
-                        ("offset_rect", ARCHETYPE_OVERLOOK_VISTA, 2),
-                    )
-            elif node.role_hint == ROOM_ROLE_KEY_ROOM:
-                if node.stage_index == 0:
-                    if archetype_id == "waste_plant":
-                        pool = (
-                            ("pit_with_walkway", ARCHETYPE_TOXIC_CANALS, 2),
-                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
-                            ("cut_corner", ARCHETYPE_TOXIC_PIT_ROOM, 2),
-                        )
-                    elif archetype_id == "relay_station":
-                        pool = (
-                            ("pit_with_walkway", ARCHETYPE_BRIDGE_CROSSING, 2),
-                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
-                            ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                        )
-                    else:
-                        pool = (
-                            ("pit_with_walkway", ARCHETYPE_TOXIC_PIT_ROOM, 2),
-                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
-                            ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                        )
-                else:
-                    if archetype_id == "waste_plant":
-                        pool = (
-                            ("central_island", ARCHETYPE_TOXIC_CANALS, 2),
-                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
-                            ("bridge_room", ARCHETYPE_TOXIC_CANALS, 2),
-                        )
-                    elif archetype_id in {"outer_ring", "shrine_fortress"}:
-                        pool = (
-                            ("central_island", ARCHETYPE_SPLIT_ARENA, 3),
-                            ("raised_platform", ARCHETYPE_GRAND_CHAMBER, 3),
-                            ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
-                        )
-                    else:
-                        pool = (
-                            ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
-                            ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
-                            ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
-                        )
-            elif node.role_hint == ROOM_ROLE_RETURN_ROUTE:
-                if archetype_id == "waste_plant":
-                    pool = (
-                        ("bridge_room", ARCHETYPE_TOXIC_CANALS, 2),
-                        ("offset_rect", ARCHETYPE_TOXIC_CANALS, 1),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                    )
-                elif archetype_id in {"outer_ring", "shrine_fortress"}:
-                    pool = (
-                        ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
-                        ("offset_rect", ARCHETYPE_GRAND_CHAMBER, 2),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                    )
-                else:
-                    pool = (
-                        ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
-                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                    )
-            elif node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_PRESSURE_CORRIDOR}:
-                if archetype_id == "tech_base":
-                    pool = (
-                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
-                        ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
-                    )
-                elif archetype_id == "relay_station":
-                    pool = (
-                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
-                        ("central_island", ARCHETYPE_BRIDGE_CROSSING, 2),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                        ("offset_rect", ARCHETYPE_GRAND_CHAMBER, 2),
-                    )
-                elif archetype_id == "waste_plant":
-                    pool = (
-                        ("split_by_pillar_line", ARCHETYPE_TOXIC_CANALS, 2),
-                        ("central_island", ARCHETYPE_TOXIC_PIT_ROOM, 2),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                        ("offset_rect", ARCHETYPE_TOXIC_CANALS, 1),
-                    )
-                elif archetype_id == "outer_ring":
-                    pool = (
-                        ("split_by_pillar_line", ARCHETYPE_GRAND_CHAMBER, 3),
-                        ("central_island", ARCHETYPE_SPLIT_ARENA, 3),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                        ("offset_rect", ARCHETYPE_BRIDGE_CROSSING, 2),
-                    )
-                else:
-                    pool = (
-                        ("split_by_pillar_line", ARCHETYPE_GRAND_CHAMBER, 3),
-                        ("central_island", ARCHETYPE_SPLIT_ARENA, 3),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                        ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                    )
-            elif node.role_hint == ROOM_ROLE_FINAL_ROOM:
-                if archetype_id == "waste_plant":
-                    pool = (
-                        ("split_by_pillar_line", ARCHETYPE_TOXIC_CANALS, 3),
-                        ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 3),
-                        ("bridge_room", ARCHETYPE_TOXIC_PIT_ROOM, 3),
-                    )
-                elif archetype_id in {"outer_ring", "shrine_fortress"}:
-                    pool = (
-                        ("split_by_pillar_line", ARCHETYPE_GRAND_CHAMBER, 4),
-                        ("raised_platform", ARCHETYPE_GRAND_CHAMBER, 4),
-                        ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
-                    )
-                else:
-                    pool = (
-                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 3),
-                        ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 3),
-                        ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
-                    )
-            elif node.kind_hint == "shrine":
-                if archetype_id == "shrine_fortress":
-                    pool = (
-                        ("cut_corner", ARCHETYPE_GRAND_CHAMBER, 3),
-                        ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 3),
-                    )
-                else:
-                    pool = (
-                        ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                        ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                    )
-            elif node.kind_hint == "arena":
-                if archetype_id == "waste_plant":
-                    pool = (
-                        ("central_island", ARCHETYPE_TOXIC_CANALS, 2),
-                        ("split_by_pillar_line", ARCHETYPE_TOXIC_PIT_ROOM, 2),
-                    )
-                elif archetype_id in {"outer_ring", "shrine_fortress"}:
-                    pool = (
-                        ("central_island", ARCHETYPE_GRAND_CHAMBER, 3),
-                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 3),
-                    )
-                else:
-                    pool = (
-                        ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
-                        ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
-                    )
-            else:
-                if archetype_id == "waste_plant":
-                    pool = (
-                        ("rectangular", ARCHETYPE_TOXIC_CANALS, 1),
-                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                    )
-                elif archetype_id in {"outer_ring", "shrine_fortress"}:
-                    pool = (
-                        ("rectangular", ARCHETYPE_GRAND_CHAMBER, 2),
-                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                    )
-                else:
-                    pool = (
-                        ("rectangular", "standard", 1),
-                        ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
-                        ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                    )
-            return pool[(node.room_index + self.rng.randrange(len(pool))) % len(pool)]
+    def _choose_room_profile(self, node: MacroRouteNode) -> tuple[str, str, int, str]:
+        archetype_id = self._campaign_archetype_id() if self.generation_request is not None else None
+        preset_pool = self._geometry_preset_pool(node, archetype_id)
+        preset_id = preset_pool[(node.room_index + self.rng.randrange(len(preset_pool))) % len(preset_pool)]
+        preset_definition = GEOMETRY_PRESET_DEFINITIONS[preset_id]
+        return self._finalize_room_profile(node, preset_definition)
 
+    def _geometry_preset_pool(
+        self,
+        node: MacroRouteNode,
+        archetype_id: str | None,
+    ) -> tuple[str, ...]:
         if node.role_hint == ROOM_ROLE_START:
-            pool = (
-                ("rectangular", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                ("offset_rect", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                ("side_bays", ARCHETYPE_GRAND_CHAMBER, 3),
-            )
-        elif node.role_hint == ROOM_ROLE_VISTA:
-            pool = (
-                ("cut_corner", ARCHETYPE_OVERLOOK_VISTA, 3),
-                ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 3),
-                ("offset_rect", ARCHETYPE_OVERLOOK_VISTA, 2),
-                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 4),
-            )
-        elif node.role_hint == ROOM_ROLE_KEY_ROOM:
+            if archetype_id == "waste_plant":
+                return ("entry_toxic", "entry_offset")
+            if archetype_id in {"outer_ring", "shrine_fortress", "relay_station"}:
+                return ("entry_hall", "entry_offset", "entry_grand")
+            return ("entry_hall", "entry_offset")
+        if node.role_hint == ROOM_ROLE_VISTA:
+            if archetype_id == "waste_plant":
+                return ("vista_balcony", "vista_ring", "vista_offset")
+            if archetype_id in {"outer_ring", "shrine_fortress"}:
+                return ("vista_balcony", "vista_grand_ring", "vista_grand_offset", "vista_corner")
+            return ("vista_balcony", "vista_ring", "vista_offset", "vista_corner")
+        if node.role_hint == ROOM_ROLE_KEY_ROOM:
             if node.stage_index == 0:
-                pool = (
-                    ("pit_with_walkway", ARCHETYPE_TOXIC_PIT_ROOM, 2),
-                    ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
-                    ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                    ("ring_like", ARCHETYPE_ACID_RING, 2),
-                )
-            else:
-                pool = (
-                    ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
-                    ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 2),
-                    ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
-                    ("side_bays", ARCHETYPE_TOXIC_CANALS, 3),
-                )
-        elif node.role_hint == ROOM_ROLE_RETURN_ROUTE:
-            pool = (
-                ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 2),
-                ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
-                ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                ("side_bays", ARCHETYPE_TOXIC_CANALS, 2),
-            )
-        elif node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_PRESSURE_CORRIDOR}:
-            pool = (
-                ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
-                ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
-                ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
-                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 3),
-                ("ring_like", ARCHETYPE_ACID_RING, 2),
-            )
-        elif node.role_hint == ROOM_ROLE_FINAL_ROOM:
-            pool = (
-                ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 3),
-                ("raised_platform", ARCHETYPE_RAISED_PLATFORM, 3),
-                ("bridge_room", ARCHETYPE_BRIDGE_CROSSING, 3),
-                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 4),
-                ("ring_like", ARCHETYPE_ACID_RING, 3),
-            )
-        elif node.kind_hint == "shrine":
-            pool = (
-                ("cut_corner", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                ("ring_like", ARCHETYPE_HIGH_CEILING_HALL, 2),
-                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 3),
-            )
-        elif node.kind_hint == "arena":
-            pool = (
-                ("central_island", ARCHETYPE_SPLIT_ARENA, 2),
-                ("split_by_pillar_line", ARCHETYPE_SPLIT_ARENA, 2),
-                ("corner_pillars", ARCHETYPE_GRAND_CHAMBER, 3),
-                ("side_bays", ARCHETYPE_TOXIC_CANALS, 2),
-            )
+                if archetype_id == "waste_plant":
+                    return ("key_toxic_pit_lane", "key_holdout_island", "key_toxic_crossfire")
+                if archetype_id == "relay_station":
+                    return ("key_bridge_control", "key_holdout_island", "key_crossfire_ring")
+                return ("key_pit_lane", "key_holdout_island", "key_crossfire_ring")
+            if archetype_id == "waste_plant":
+                return ("key_central_island", "key_holdout_island", "key_toxic_bridge_hold")
+            if archetype_id in {"outer_ring", "shrine_fortress"}:
+                return ("key_grand_island", "key_grand_holdout", "key_bridge_hold")
+            return ("key_central_island", "key_holdout_island", "key_bridge_hold")
+        if node.role_hint == ROOM_ROLE_RETURN_ROUTE:
+            if archetype_id == "waste_plant":
+                return ("return_toxic_bridge", "return_toxic_flank", "return_crusher_flank")
+            if archetype_id in {"outer_ring", "shrine_fortress"}:
+                return ("return_bridge_lane", "return_grand_lane", "return_crusher_flank")
+            return ("return_bridge_lane", "return_flank_lane", "return_crusher_flank")
+        if node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_PRESSURE_CORRIDOR}:
+            if archetype_id == "tech_base":
+                return ("pressure_crossfire", "pressure_island", "pressure_crusher_flank", "pressure_flank_lane")
+            if archetype_id == "relay_station":
+                return ("pressure_crossfire", "pressure_bridge_island", "pressure_crusher_flank", "pressure_grand_lane")
+            if archetype_id == "waste_plant":
+                return ("pressure_toxic_crossfire", "pressure_hazard_island", "pressure_crusher_flank", "pressure_toxic_lane")
+            if archetype_id in {"outer_ring", "shrine_fortress"}:
+                return ("pressure_grand_crossfire", "pressure_island", "pressure_crusher_flank", "pressure_grand_lane")
+            return ("pressure_grand_crossfire", "pressure_island", "pressure_crusher_flank", "pressure_flank_lane")
+        if node.role_hint == ROOM_ROLE_FINAL_ROOM:
+            if archetype_id == "waste_plant":
+                return ("final_crossfire", "final_holdout", "final_toxic_bridge")
+            if archetype_id in {"outer_ring", "shrine_fortress"}:
+                return ("final_grand_crossfire", "final_grand_holdout", "final_bridge_lane", "final_corner_crossfire")
+            return ("final_crossfire", "final_holdout", "final_bridge_lane", "final_corner_crossfire", "final_ring_crossfire")
+        if node.kind_hint == "shrine":
+            if archetype_id == "shrine_fortress":
+                return ("shrine_grand_ceremonial", "shrine_ring")
+            return ("shrine_ceremonial", "shrine_ring", "vista_corner")
+        if node.kind_hint == "arena":
+            if archetype_id == "waste_plant":
+                return ("arena_island", "arena_toxic_crossfire", "arena_toxic_side_bays")
+            if archetype_id in {"outer_ring", "shrine_fortress"}:
+                return ("arena_grand_island", "arena_crossfire", "arena_corner_crossfire")
+            return ("arena_island", "arena_crossfire", "arena_corner_crossfire", "arena_toxic_side_bays")
+        if archetype_id == "waste_plant":
+            return ("general_toxic_standard", "general_flank_lane", "general_recessed_flank")
+        if archetype_id in {"outer_ring", "shrine_fortress"}:
+            return ("general_grand_standard", "general_flank_lane", "general_recessed_flank")
+        return ("general_standard", "general_flank_lane", "general_recessed_flank", "general_side_bays")
+
+    def _finalize_room_profile(
+        self,
+        node: MacroRouteNode,
+        preset_definition: GeometryPresetDefinition,
+    ) -> tuple[str, str, int, str]:
+        shape_family = preset_definition.shape_family
+        spatial_archetype = preset_definition.spatial_archetype
+        ceiling_height = preset_definition.ceiling_height
+        geometry_preset_id = preset_definition.preset_id
+        spatial_profile_id = self._spatial_profile_id()
+        encounter_style_id = self._encounter_style_id()
+        level_modifier_id = self._level_modifier_id()
+        macro_variant_id = self._macro_variant_id()
+        theme_modifier_id = self._theme_modifier_id()
+
+        if spatial_profile_id == "vertical" and node.role_hint in {ROOM_ROLE_VISTA, ROOM_ROLE_FINAL_ROOM, ROOM_ROLE_KEY_ROOM}:
+            ceiling_height = max(ceiling_height, 3 if node.role_hint != ROOM_ROLE_FINAL_ROOM else 4)
+            if spatial_archetype == "standard":
+                spatial_archetype = ARCHETYPE_OVERLOOK_VISTA
+        elif spatial_profile_id == "expansive" and node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_FINAL_ROOM, ROOM_ROLE_KEY_ROOM}:
+            if shape_family in {"offset_rect", "recessed_endcap"}:
+                shape_family = "central_island"
+            if spatial_archetype == ARCHETYPE_OFFSET_CORRIDOR:
+                spatial_archetype = ARCHETYPE_GRAND_CHAMBER
+        elif spatial_profile_id == "tight" and node.role_hint in {ROOM_ROLE_PRESSURE_CORRIDOR, ROOM_ROLE_RETURN_ROUTE, ROOM_ROLE_SHORTCUT_HALL}:
+            if shape_family not in {"offset_rect", "recessed_endcap"}:
+                shape_family = "offset_rect"
+            if spatial_archetype in {ARCHETYPE_GRAND_CHAMBER, ARCHETYPE_HIGH_CEILING_HALL}:
+                spatial_archetype = ARCHETYPE_OFFSET_CORRIDOR
+
+        if level_modifier_id == "lockdown" and node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_PRESSURE_CORRIDOR, ROOM_ROLE_FINAL_ROOM}:
+            shape_family = "split_by_pillar_line"
+            if spatial_archetype == "standard":
+                spatial_archetype = ARCHETYPE_CRUSHER_PASSAGE
+        elif level_modifier_id == "vista_dominant" and node.role_hint in {ROOM_ROLE_VISTA, ROOM_ROLE_RETURN_ROUTE, ROOM_ROLE_START}:
+            ceiling_height = max(ceiling_height, 3)
+            if spatial_archetype == "standard":
+                spatial_archetype = ARCHETYPE_OVERLOOK_VISTA
+        elif level_modifier_id == "shortcut_surge" and node.role_hint in {ROOM_ROLE_SHORTCUT_HALL, ROOM_ROLE_RETURN_ROUTE}:
+            if spatial_archetype == "standard":
+                spatial_archetype = ARCHETYPE_BRIDGE_CROSSING
+
+        if encounter_style_id == "holdout" and node.role_hint in {ROOM_ROLE_KEY_ROOM, ROOM_ROLE_FINAL_ROOM, ROOM_ROLE_SWITCH_ROOM}:
+            shape_family = "raised_platform" if node.role_hint != ROOM_ROLE_SWITCH_ROOM else "central_island"
+            if spatial_archetype == "standard":
+                spatial_archetype = ARCHETYPE_RAISED_PLATFORM
+        elif encounter_style_id == "hunter" and node.role_hint in {ROOM_ROLE_PRESSURE_CORRIDOR, ROOM_ROLE_RETURN_ROUTE, ROOM_ROLE_SHORTCUT_HALL}:
+            if shape_family not in {"offset_rect", "recessed_endcap"}:
+                shape_family = "offset_rect"
+            if spatial_archetype == "standard":
+                spatial_archetype = ARCHETYPE_OFFSET_CORRIDOR
+        elif encounter_style_id == "pincer" and node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_FINAL_ROOM, ROOM_ROLE_PRESSURE_CORRIDOR}:
+            if shape_family not in {"split_by_pillar_line", "ring_like"}:
+                shape_family = "split_by_pillar_line"
+            if spatial_archetype == "standard":
+                spatial_archetype = ARCHETYPE_SPLIT_ARENA
+
+        if macro_variant_id in {"collapse", "pincer"} and node.role_hint in {ROOM_ROLE_FINAL_ROOM, ROOM_ROLE_KEY_ROOM, ROOM_ROLE_AMBUSH_ROOM}:
+            ceiling_height = max(ceiling_height, 3)
+
+        if theme_modifier_id == "corrosion" and node.role_hint in {ROOM_ROLE_KEY_ROOM, ROOM_ROLE_RETURN_ROUTE, ROOM_ROLE_PRESSURE_CORRIDOR}:
+            if spatial_archetype in {"standard", ARCHETYPE_HIGH_CEILING_HALL, ARCHETYPE_OFFSET_CORRIDOR}:
+                spatial_archetype = ARCHETYPE_TOXIC_CANALS
+        elif theme_modifier_id == "ritual" and node.kind_hint in {"shrine", "arena"}:
+            if spatial_archetype in {"standard", ARCHETYPE_HIGH_CEILING_HALL}:
+                spatial_archetype = ARCHETYPE_GRAND_CHAMBER
+            ceiling_height = max(ceiling_height, 3)
+        elif theme_modifier_id == "siege" and node.role_hint in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_FINAL_ROOM, ROOM_ROLE_SWITCH_ROOM}:
+            if spatial_archetype in {"standard", ARCHETYPE_HIGH_CEILING_HALL}:
+                spatial_archetype = ARCHETYPE_SPLIT_ARENA
+        elif theme_modifier_id == "power_failure" and node.kind_hint == "tech":
+            if spatial_archetype == "standard":
+                spatial_archetype = ARCHETYPE_OFFSET_CORRIDOR
+
+        geometry_preset_id = self._resolve_geometry_preset_id(
+            node,
+            shape_family,
+            spatial_archetype,
+            base_preset_id=geometry_preset_id,
+        )
+        return (shape_family, spatial_archetype, ceiling_height, geometry_preset_id)
+
+    def _resolve_geometry_preset_id(
+        self,
+        node: MacroRouteNode,
+        shape_family: str,
+        spatial_archetype: str,
+        base_preset_id: str | None = None,
+    ) -> str:
+        if base_preset_id is not None:
+            role_prefix, _, existing_suffix = base_preset_id.partition("_")
         else:
-            pool = (
-                ("rectangular", "standard", 1),
-                ("offset_rect", ARCHETYPE_OFFSET_CORRIDOR, 1),
-                ("recessed_endcap", ARCHETYPE_CRUSHER_PASSAGE, 1),
-                ("side_bays", ARCHETYPE_GRAND_CHAMBER, 2),
-            )
-        return pool[(node.room_index + self.rng.randrange(len(pool))) % len(pool)]
+            role_prefix = {
+                ROOM_ROLE_START: "entry",
+                ROOM_ROLE_VISTA: "vista",
+                ROOM_ROLE_KEY_ROOM: "key",
+                ROOM_ROLE_RETURN_ROUTE: "return",
+                ROOM_ROLE_SHORTCUT_HALL: "shortcut",
+                ROOM_ROLE_SWITCH_ROOM: "switch",
+                ROOM_ROLE_AMBUSH_ROOM: "ambush",
+                ROOM_ROLE_PRESSURE_CORRIDOR: "pressure",
+                ROOM_ROLE_FINAL_ROOM: "finale",
+            }.get(node.role_hint, "general")
+            existing_suffix = ""
+        if spatial_archetype in {ARCHETYPE_TOXIC_PIT_ROOM, ARCHETYPE_BRIDGE_CROSSING, ARCHETYPE_ACID_RING, ARCHETYPE_TOXIC_CANALS}:
+            suffix = "hazard_lane"
+        elif shape_family in {"raised_platform", "central_island"} or spatial_archetype == ARCHETYPE_RAISED_PLATFORM:
+            suffix = "holdout_island"
+        elif shape_family in {"split_by_pillar_line", "ring_like"}:
+            suffix = "crossfire"
+        elif shape_family in {"offset_rect", "recessed_endcap"}:
+            suffix = "flank"
+        else:
+            suffix = "standard"
+        if existing_suffix in {"balcony", "corner", "ring", "ceremonial"} and suffix == "standard":
+            suffix = existing_suffix
+        return f"{role_prefix}_{suffix}"
 
     def _shape_size_adjustment(self, shape_family: str, width: int, height: int) -> tuple[int, int]:
         if shape_family in {"ring_like", "bridge_room", "pit_with_walkway", "side_bays"}:
@@ -1429,6 +1893,7 @@ class MapGenerator:
         stair_mask: list[list[int]],
         room_kinds: list[list[int]],
         sector_types: list[list[int]],
+        rooms: list[Room],
         route_plan: MacroRoutePlan,
         template_variant: str,
     ) -> list[CorridorConnection] | None:
@@ -1462,19 +1927,40 @@ class MapGenerator:
         connections: list[CorridorConnection] = []
         for edge in route_plan.edges:
             segments = segment_map.get(edge.edge_id)
-            if segments is None:
-                return None
             path: list[tuple[int, int]] = []
-            transformed_segments = [transform_segment(segment) for segment in segments]
-            for axis, start, end, fixed in transformed_segments:
-                if axis == "h":
-                    path.extend(self._carve_h_corridor(tiles, start, end, fixed, widen_chance=0.0))
-                else:
-                    path.extend(self._carve_v_corridor(tiles, start, end, fixed, widen_chance=0.0))
-                self._assign_path_heights(path, floor_heights, ceiling_heights, stair_mask, room_kinds, sector_types)
             door_candidate = explicit_doors.get(edge.edge_id)
-            if door_candidate is not None:
-                door_candidate = transform_door(door_candidate)
+            if segments is None:
+                path = self._connect_rooms(
+                    tiles,
+                    floor_heights,
+                    ceiling_heights,
+                    stair_mask,
+                    room_kinds,
+                    sector_types,
+                    rooms[edge.room_a_index],
+                    rooms[edge.room_b_index],
+                    widen_chance=0.0,
+                )
+                door_candidate = None
+            else:
+                transformed_segments = [transform_segment(segment) for segment in segments]
+                for axis, start, end, fixed in transformed_segments:
+                    if axis == "h":
+                        path.extend(self._carve_h_corridor(tiles, start, end, fixed, widen_chance=0.0))
+                    else:
+                        path.extend(self._carve_v_corridor(tiles, start, end, fixed, widen_chance=0.0))
+                    self._assign_path_heights(path, floor_heights, ceiling_heights, stair_mask, room_kinds, sector_types)
+                if door_candidate is not None:
+                    door_candidate = transform_door(door_candidate)
+                    if not self._is_connection_door_candidate_valid(
+                        tiles,
+                        rooms,
+                        edge.room_a_index,
+                        edge.room_b_index,
+                        path,
+                        door_candidate,
+                    ):
+                        door_candidate = None
             connections.append(
                 CorridorConnection(
                     index=len(connections),
@@ -1630,6 +2116,43 @@ class MapGenerator:
                 width = min(width + 1, 7)
         return (width, height)
 
+    def _apply_request_footprint_profile(
+        self,
+        node: MacroRouteNode,
+        width: int,
+        height: int,
+    ) -> tuple[int, int]:
+        spatial_profile_id = self._spatial_profile_id()
+        level_modifier_id = self._level_modifier_id()
+        role = node.role_hint
+        kind = node.kind_hint
+        if spatial_profile_id == "expansive":
+            if role in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_FINAL_ROOM, ROOM_ROLE_KEY_ROOM, ROOM_ROLE_VISTA} or kind in {"arena", "shrine", "cross"}:
+                width += 1
+                height += 1
+        elif spatial_profile_id == "tight":
+            if role in {ROOM_ROLE_PRESSURE_CORRIDOR, ROOM_ROLE_RETURN_ROUTE, ROOM_ROLE_SHORTCUT_HALL} or kind in {"tech", "storage"}:
+                width -= 1
+                height -= 1 if role != ROOM_ROLE_RETURN_ROUTE else 0
+        elif spatial_profile_id == "vertical":
+            if role in {ROOM_ROLE_VISTA, ROOM_ROLE_FINAL_ROOM}:
+                width = max(width, 7)
+                height += 1
+
+        if level_modifier_id == "lockdown" and role in {ROOM_ROLE_PRESSURE_CORRIDOR, ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_FINAL_ROOM}:
+            width = max(6, width - 1)
+            height = max(6, height - (0 if role == ROOM_ROLE_FINAL_ROOM else 1))
+        elif level_modifier_id == "vista_dominant" and role in {ROOM_ROLE_VISTA, ROOM_ROLE_START, ROOM_ROLE_RETURN_ROUTE}:
+            width += 1
+            height += 1
+        elif level_modifier_id == "shortcut_surge" and role in {ROOM_ROLE_SHORTCUT_HALL, ROOM_ROLE_RETURN_ROUTE}:
+            width = max(6, width - 1)
+            height = max(6, height)
+
+        width = max(5, min(width, self.width - 3))
+        height = max(5, min(height, self.height - 3))
+        return (width, height)
+
     def _planned_room(self, node: MacroRouteNode, rooms: list[Room]) -> Room | None:
         kind = node.kind_hint
         floor_height = 0
@@ -1648,6 +2171,38 @@ class MapGenerator:
                 if any(room.intersects(other) for other in rooms):
                     continue
                 return room
+        return None
+
+    def _planned_profiled_room(
+        self,
+        node: MacroRouteNode,
+        rooms: list[Room],
+        width: int,
+        height: int,
+        shape_family: str,
+        spatial_archetype: str,
+        ceiling_height: int,
+        geometry_preset_id: str,
+    ) -> Room | None:
+        min_x, max_x, min_y, max_y = self._room_bounds_for_stage(node.stage_index, node.branch_slot, width, height)
+        for _ in range(settings.MAX_ROOMS * 10):
+            x = self.rng.randint(min_x, max_x)
+            y = self.rng.randint(min_y, max_y)
+            room = Room(
+                x,
+                y,
+                width,
+                height,
+                node.kind_hint,
+                0,
+                shape_family,
+                spatial_archetype,
+                ceiling_height,
+                geometry_preset_id,
+            )
+            if any(room.intersects(other, padding=0) for other in rooms):
+                continue
+            return room
         return None
 
     def _room_bounds_for_stage(self, stage_index: int, branch_slot: int, width: int, height: int) -> tuple[int, int, int, int]:
@@ -2441,6 +2996,7 @@ class MapGenerator:
                     grid_y=door_y,
                     orientation=orientation,
                     door_type="normal",
+                    required_trigger_id=connection.trigger_source if connection.edge_kind == EDGE_SHORTCUT else None,
                 )
             )
         return normal_doors
@@ -2795,29 +3351,51 @@ class MapGenerator:
     ) -> tuple[int, int, str] | None:
         room_a = rooms[connection.room_a_index]
         room_b = rooms[connection.room_b_index]
-        candidates: list[tuple[int, int, str]] = []
-        seen: set[tuple[int, int]] = set()
+        for room_padding in (1, 0):
+            candidates: list[tuple[int, int, str]] = []
+            seen: set[tuple[int, int]] = set()
 
-        for grid_x, grid_y in connection.path:
-            if (grid_x, grid_y) in seen:
-                continue
-            seen.add((grid_x, grid_y))
-            if tiles[grid_y][grid_x] != 0:
-                continue
-            if stair_mask[grid_y][grid_x] != 0:
-                continue
-            if room_a.contains_tile(grid_x, grid_y, padding=1) or room_b.contains_tile(grid_x, grid_y, padding=1):
-                continue
-            if math.dist((grid_x + 0.5, grid_y + 0.5), spawn) < settings.DOOR_MIN_PLAYER_DISTANCE:
-                continue
-            orientation = self._door_orientation_at(tiles, grid_x, grid_y)
-            if orientation is None:
-                continue
-            candidates.append((grid_x, grid_y, orientation))
+            for grid_x, grid_y in connection.path:
+                if (grid_x, grid_y) in seen:
+                    continue
+                seen.add((grid_x, grid_y))
+                if tiles[grid_y][grid_x] != 0:
+                    continue
+                if stair_mask[grid_y][grid_x] != 0:
+                    continue
+                if room_a.contains_tile(grid_x, grid_y, padding=room_padding) or room_b.contains_tile(grid_x, grid_y, padding=room_padding):
+                    continue
+                if math.dist((grid_x + 0.5, grid_y + 0.5), spawn) < settings.DOOR_MIN_PLAYER_DISTANCE:
+                    continue
+                orientation = self._door_orientation_at(tiles, grid_x, grid_y)
+                if orientation is None:
+                    continue
+                candidates.append((grid_x, grid_y, orientation))
 
-        if not candidates:
-            return None
-        return candidates[len(candidates) // 2]
+            if candidates:
+                return candidates[len(candidates) // 2]
+        return None
+
+    def _is_connection_door_candidate_valid(
+        self,
+        tiles: list[list[int]],
+        rooms: list[Room],
+        room_a_index: int,
+        room_b_index: int,
+        path: list[tuple[int, int]],
+        candidate: tuple[int, int, str],
+    ) -> bool:
+        grid_x, grid_y, orientation = candidate
+        if grid_x < 0 or grid_y < 0 or grid_x >= self.width or grid_y >= self.height:
+            return False
+        if tiles[grid_y][grid_x] != 0:
+            return False
+        room_a = rooms[room_a_index]
+        room_b = rooms[room_b_index]
+        if room_a.contains_tile(grid_x, grid_y, padding=0) or room_b.contains_tile(grid_x, grid_y, padding=0):
+            return False
+        resolved_orientation = self._door_orientation_at(tiles, grid_x, grid_y)
+        return resolved_orientation is not None and resolved_orientation == orientation
 
     def _door_orientation_at(self, tiles: list[list[int]], grid_x: int, grid_y: int) -> str | None:
         open_left = tiles[grid_y][grid_x - 1] == 0
@@ -3513,6 +4091,71 @@ class MapGenerator:
             return "charger"
         return "grunt"
 
+    def _encounter_template_for_room(
+        self,
+        role: str,
+        room: Room,
+    ) -> str:
+        encounter_style_id = self._encounter_style_id()
+        if role == ROOM_ROLE_FINAL_ROOM:
+            return f"{encounter_style_id}_finale"
+        if role == ROOM_ROLE_KEY_ROOM:
+            if encounter_style_id == "holdout":
+                return "key_holdout"
+            if encounter_style_id == "hunter":
+                return "key_hunter"
+            if encounter_style_id == "pincer":
+                return "key_pincer"
+            return "key_standard"
+        if role in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_PRESSURE_CORRIDOR}:
+            if room.geometry_preset_id.endswith("crossfire"):
+                return f"{encounter_style_id}_crossfire"
+            if room.geometry_preset_id.endswith("flank"):
+                return f"{encounter_style_id}_flank"
+        if role == ROOM_ROLE_SWITCH_ROOM:
+            return f"{encounter_style_id}_switch"
+        if role in {ROOM_ROLE_RETURN_ROUTE, ROOM_ROLE_SHORTCUT_HALL}:
+            return f"{encounter_style_id}_chase"
+        return f"{encounter_style_id}_standard"
+
+    def _encounter_template_definition(self, encounter_template_id: str) -> EncounterTemplateDefinition:
+        return ENCOUNTER_TEMPLATE_DEFINITIONS.get(
+            encounter_template_id,
+            ENCOUNTER_TEMPLATE_DEFINITIONS["standard_standard"],
+        )
+
+    def _room_sightline_class(self, room: Room) -> str:
+        if room.ceiling_height >= 4 or room.spatial_archetype in {ARCHETYPE_OVERLOOK_VISTA, ARCHETYPE_GRAND_CHAMBER}:
+            return "long"
+        if room.geometry_preset_id.endswith("flank") or room.spatial_archetype == ARCHETYPE_OFFSET_CORRIDOR:
+            return "broken"
+        if room.spatial_archetype in {ARCHETYPE_TOXIC_PIT_ROOM, ARCHETYPE_BRIDGE_CROSSING, ARCHETYPE_TOXIC_CANALS}:
+            return "channeled"
+        return "medium"
+
+    def _room_mobility_class(self, room: Room) -> str:
+        if room.spatial_archetype in {ARCHETYPE_TOXIC_PIT_ROOM, ARCHETYPE_BRIDGE_CROSSING, ARCHETYPE_ACID_RING, ARCHETYPE_TOXIC_CANALS}:
+            return "hazardous"
+        if room.geometry_preset_id.endswith("holdout_island") or room.spatial_archetype == ARCHETYPE_RAISED_PLATFORM:
+            return "layered"
+        if room.geometry_preset_id.endswith("flank"):
+            return "flanking"
+        return "open"
+
+    def _ambush_count_for_template(self, encounter_template_id: str) -> int:
+        template_definition = self._encounter_template_definition(encounter_template_id)
+        base_count = 1 if self.difficulty_id == "easy" else 2
+        base_count += template_definition.ambush_bonus
+        if encounter_template_id.startswith("hunter_") and self.difficulty_id != "easy":
+            base_count += 1
+        if self.difficulty_id == "hard" and self.rng.random() < self.difficulty.ambush_probability:
+            base_count += 1
+        return base_count
+
+    def _pressure_value_for_template(self, encounter_template_id: str, spawn_count: int) -> float:
+        template_definition = self._encounter_template_definition(encounter_template_id)
+        return (1.0 + spawn_count * 0.42) * template_definition.pressure_multiplier
+
     def _room_floor_candidates(
         self,
         room: Room,
@@ -3807,6 +4450,8 @@ class MapGenerator:
                 encounter_weight += 0.28
             if role in {ROOM_ROLE_AMBUSH_ROOM, ROOM_ROLE_KEY_ROOM, ROOM_ROLE_FINAL_ROOM}:
                 encounter_weight += 0.22
+            encounter_template_id = self._encounter_template_for_room(role, room)
+            combat_profile_id = f"{self._encounter_style_id()}:{role}"
             metadata.append(
                 RoomMetadata(
                     room_index=room_index,
@@ -3846,6 +4491,11 @@ class MapGenerator:
                         }
                         else 0
                     ),
+                    geometry_preset_id=room.geometry_preset_id,
+                    encounter_template_id=encounter_template_id,
+                    combat_profile_id=combat_profile_id,
+                    sightline_class=self._room_sightline_class(room),
+                    mobility_class=self._room_mobility_class(room),
                 )
             )
         return tuple(metadata)
@@ -4065,6 +4715,8 @@ class MapGenerator:
             "medium": 2,
             "hard": 1,
         }.get(self.difficulty_id, 2)
+        if self._level_modifier_id() == "vista_dominant":
+            target_secret_count += 1
         secret_count = max(
             settings.MIN_SECRETS_PER_MAP,
             min(settings.MAX_SECRETS_PER_MAP, target_secret_count),
@@ -4088,6 +4740,7 @@ class MapGenerator:
             secret_room_indices,
             final_room_index,
         )
+        metadata_by_room = {entry.room_index: entry for entry in room_metadata}
 
         occupied_positions = [(enemy.x, enemy.y) for enemy in enemy_spawns]
         next_enemy_index = len(enemy_spawns)
@@ -4099,6 +4752,13 @@ class MapGenerator:
 
         for gate in progression.gate_plans:
             key_room_index = key_room_by_type.get(gate.key_type, 0)
+            key_room_metadata = metadata_by_room.get(key_room_index)
+            encounter_template_id = (
+                key_room_metadata.encounter_template_id
+                if key_room_metadata is not None
+                else f"{self._encounter_style_id()}_standard"
+            )
+            template_definition = self._encounter_template_definition(encounter_template_id)
             pickup_source = f"pickup:{gate.key_type}"
             event_id = f"beat:{gate.key_type}"
             actions: list[ProgressionAction] = [
@@ -4106,14 +4766,17 @@ class MapGenerator:
                     action_type=ACTION_SPAWN_AMBUSH,
                     target_id=event_id,
                     room_index=key_room_index,
-                    note=f"{gate.key_type.upper()} AMBUSH",
+                    note=f"{gate.key_type.upper()} {template_definition.announcement_label}",
                 )
             ]
             shortcut = shortcut_doors.get(pickup_source)
             if shortcut is not None:
+                shortcut_action_type = (
+                    ACTION_OPEN_DOOR if self._level_modifier_id() == "shortcut_surge" else ACTION_UNLOCK_SHORTCUT
+                )
                 actions.append(
                     ProgressionAction(
-                        action_type=ACTION_UNLOCK_SHORTCUT,
+                        action_type=shortcut_action_type,
                         target_id=shortcut.door_id,
                         room_index=key_room_index,
                         note=f"{gate.key_type.upper()} SHORTCUT OPENED",
@@ -4125,9 +4788,7 @@ class MapGenerator:
                 key_room_index,
                 return_room_index,
             )
-            ambush_count = 1 if self.difficulty_id == "easy" else 2
-            if self.difficulty_id == "hard" and self.rng.random() < self.difficulty.ambush_probability:
-                ambush_count += 1
+            ambush_count = self._ambush_count_for_template(encounter_template_id)
             extra_spawns, next_enemy_index = self._spawn_event_enemies_across_rooms(
                 rooms,
                 ambush_room_indices,
@@ -4162,7 +4823,7 @@ class MapGenerator:
                     trigger_ref=pickup_source,
                     target_enemy_ids=tuple(enemy.enemy_id for enemy in extra_spawns),
                     actions=tuple(actions),
-                    pressure_value=1.0 + len(extra_spawns) * 0.42,
+                    pressure_value=self._pressure_value_for_template(encounter_template_id, len(extra_spawns)),
                 )
             )
             beats.append(
@@ -4179,7 +4840,13 @@ class MapGenerator:
 
         for secret_index, room_index in enumerate(sorted(secret_room_indices)):
             room = rooms[room_index]
-            if self.difficulty_id == "easy":
+            if self._theme_modifier_id() == "ritual":
+                secret_type = "stash_room"
+                reward_kind = "armor_bonus"
+            elif self._theme_modifier_id() == "power_failure":
+                secret_type = "optional_shortcut"
+                reward_kind = "shell_box"
+            elif self.difficulty_id == "easy":
                 secret_type = "stash_room"
                 reward_kind = "medkit"
             elif self.difficulty_id == "hard":
@@ -4207,6 +4874,12 @@ class MapGenerator:
 
         if switch_room_index is not None and secrets:
             room = rooms[switch_room_index]
+            switch_metadata = metadata_by_room.get(switch_room_index)
+            switch_template_definition = (
+                self._encounter_template_definition(switch_metadata.encounter_template_id)
+                if switch_metadata is not None
+                else ENCOUNTER_TEMPLATE_DEFINITIONS["standard_switch"]
+            )
             switch_event_id = f"switch:{self.seed}:return"
             switch_actions = [
                 ProgressionAction(
@@ -4234,6 +4907,16 @@ class MapGenerator:
                         note="RETURN ROUTE SHIFTED",
                     )
                 )
+            if self._level_modifier_id() == "backtrack_pressure":
+                for shortcut in shortcut_doors.values():
+                    switch_actions.append(
+                        ProgressionAction(
+                            action_type=ACTION_UNLOCK_SHORTCUT,
+                            target_id=shortcut.door_id,
+                            room_index=switch_room_index,
+                            note="ALL RETURN ROUTES RELEASED",
+                        )
+                    )
             switches.append(
                 WorldSwitchSpawn(
                     switch_id=f"switch-{self.seed}-00",
@@ -4254,7 +4937,7 @@ class MapGenerator:
                     trigger_ref=switches[-1].switch_id,
                     target_enemy_ids=tuple(),
                     actions=switches[-1].actions,
-                    pressure_value=0.35,
+                    pressure_value=switch_template_definition.switch_pressure,
                 )
             )
             beats.append(
@@ -4270,7 +4953,15 @@ class MapGenerator:
 
         if exit_spawn is not None:
             final_event_id = f"final:{self.seed}"
+            final_metadata = metadata_by_room.get(final_room_index)
+            final_template_id = (
+                final_metadata.encounter_template_id
+                if final_metadata is not None
+                else f"{self._encounter_style_id()}_finale"
+            )
+            final_template_definition = self._encounter_template_definition(final_template_id)
             final_count = 1 if self.difficulty_id == "medium" else (2 if self.difficulty_id == "hard" else 0)
+            final_count += final_template_definition.final_spawn_bonus
             final_spawns, next_enemy_index = self._spawn_event_enemies(
                 rooms,
                 final_room_index,
@@ -4290,7 +4981,7 @@ class MapGenerator:
                         action_type=ACTION_WAKE_ROOM,
                         target_id=final_event_id,
                         room_index=final_room_index,
-                        note="FINAL HOLDOUT",
+                        note=final_template_definition.announcement_label,
                     ),
                 )
                 triggers.append(
@@ -4314,7 +5005,8 @@ class MapGenerator:
                         trigger_ref=triggers[-1].trigger_id,
                         target_enemy_ids=tuple(enemy.enemy_id for enemy in final_spawns),
                         actions=actions,
-                        pressure_value=1.1 + len(final_spawns) * 0.5,
+                        pressure_value=final_template_definition.final_pressure_base
+                        + len(final_spawns) * final_template_definition.final_pressure_per_spawn,
                     )
                 )
                 beats.append(
@@ -4323,7 +5015,7 @@ class MapGenerator:
                         stage_index=3,
                         room_index=final_room_index,
                         role="final_room",
-                        label="FINAL HOLDOUT",
+                        label=final_template_definition.announcement_label,
                         trigger_id=triggers[-1].trigger_id,
                     )
                 )
@@ -4529,6 +5221,8 @@ class MapGenerator:
         bridge_crossing_count = sum(1 for room in room_metadata if room.has_bridge)
         vertical_variety_score = round(sum(room.height_variance for room in room_metadata) / max(1, len(room_metadata)), 3)
         unique_shapes = len({room.shape_family for room in room_metadata})
+        unique_geometry_presets = len({room.geometry_preset_id for room in room_metadata})
+        unique_encounter_templates = len({room.encounter_template_id for room in room_metadata})
         silhouette_variety_score = round(unique_shapes / max(1, len(room_metadata)), 3)
         non_linear_path_score = round(
             (
@@ -4543,6 +5237,7 @@ class MapGenerator:
                     }
                 )
                 + meaningful_loop_count
+                + max(0, unique_geometry_presets - 2)
             )
             / max(1, len(KEY_TYPES) + 2),
             3,
@@ -4637,6 +5332,8 @@ class MapGenerator:
                 current_run = 1
                 previous_role = room.role
             same_role_run = max(same_role_run, current_run)
+        unique_geometry_presets = len({room.geometry_preset_id for room in room_metadata})
+        unique_encounter_templates = len({room.encounter_template_id for room in room_metadata})
         encounter_pressure = sum(event.pressure_value for event in encounter_events) / max(1, len(KEY_TYPES) + 1)
         doom_score = (
             validation_report.mandatory_backtrack_count * 0.42
@@ -4651,6 +5348,8 @@ class MapGenerator:
             + validation_report.non_linear_path_score * 1.6
             + validation_report.vista_height_score * 0.45
             + key_occlusion_score * 0.35
+            + unique_geometry_presets * 0.28
+            + unique_encounter_templates * 0.24
             - validation_report.progression_break_count * 6.0
             - validation_report.wide_bypass_count * 0.65
             - max(0, same_role_run - 2) * 0.45

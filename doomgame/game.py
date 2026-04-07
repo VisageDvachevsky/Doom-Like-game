@@ -812,26 +812,47 @@ class DoomGame:
         live_enemies = self.world.active_enemies(include_corpses=False)
         nearby_enemies = 0
         attacking_enemies = 0
+        active_threat = 0.0
+        nearby_threat = 0.0
+        attacking_threat = 0.0
         for enemy in live_enemies:
+            threat = self._enemy_music_threat(enemy.enemy_type)
             distance = math.hypot(enemy.x - self.player.x, enemy.y - self.player.y)
-            if distance <= 6.5:
+            active_threat += threat
+            if distance <= 7.5:
                 nearby_enemies += 1
+                nearby_threat += threat
             if enemy.ai_state == "attack":
                 attacking_enemies += 1
-            elif enemy.ai_state == "chase" and distance <= 8.0:
+                attacking_threat += threat
+            elif enemy.ai_state == "chase" and distance <= 9.5:
                 attacking_enemies += 1
-            elif enemy.ai_state == "alert" and distance <= 5.0:
+                attacking_threat += threat * 0.9
+            elif enemy.ai_state == "alert" and distance <= 6.5:
                 attacking_enemies += 1
+                attacking_threat += threat * 0.65
         return MusicSnapshot(
             active_enemies=len(live_enemies),
             nearby_enemies=nearby_enemies,
             attacking_enemies=attacking_enemies,
+            active_threat=active_threat,
+            nearby_threat=nearby_threat,
+            attacking_threat=attacking_threat,
             projectile_count=len(self.world.active_enemy_projectiles()),
             movement=self.move_amount,
             recent_shots=self.music_recent_shots,
             recent_damage=self.music_recent_damage,
             recent_kills=self.music_recent_kills,
+            player_health_ratio=max(0.0, min(1.0, self.health / max(1, settings.MAX_HEALTH))),
         )
+
+    def _enemy_music_threat(self, enemy_type: str) -> float:
+        return {
+            "charger": 1.15,
+            "grunt": 1.0,
+            "heavy": 2.35,
+            "warden": 3.15,
+        }.get(enemy_type, 1.0)
 
     def _draw_pickup_message(self) -> None:
         if not self.pickup_message:
