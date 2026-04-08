@@ -56,6 +56,14 @@ inline Color lerp_color(const Color& a, const Color& b, double t) {
     };
 }
 
+inline Color average_color(const Color& a, const Color& b) {
+    return {
+        static_cast<uint8_t>((static_cast<int>(a.r) + static_cast<int>(b.r)) / 2),
+        static_cast<uint8_t>((static_cast<int>(a.g) + static_cast<int>(b.g)) / 2),
+        static_cast<uint8_t>((static_cast<int>(a.b) + static_cast<int>(b.b)) / 2),
+    };
+}
+
 inline Color scale_color(const Color& c, double s) {
     s = std::max(0.0, s);
     return {
@@ -356,6 +364,64 @@ Color wall_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len
         return wall_texel(texture_index, ix, iy);
     }
     return bilinear_sample_texture_rgb(texture_data, texture_index, kTextureCount, tx, ty);
+}
+
+double wall_plane_coordinate(int map_x, int map_y, int side, double ray_dir_x, double ray_dir_y) {
+    if (side == 0) {
+        return ray_dir_x > 0.0 ? static_cast<double>(map_x) : static_cast<double>(map_x + 1);
+    }
+    return ray_dir_y > 0.0 ? static_cast<double>(map_y) : static_cast<double>(map_y + 1);
+}
+
+double texel_x_for_camera_sample(
+    double camera_x,
+    double px,
+    double py,
+    double dir_x,
+    double dir_y,
+    double plane_x,
+    double plane_y,
+    int map_x,
+    int map_y,
+    int side
+) {
+    const double ray_dir_x = dir_x + plane_x * camera_x;
+    const double ray_dir_y = dir_y + plane_y * camera_x;
+    double distance = 0.0;
+    if (side == 0) {
+        if (std::abs(ray_dir_x) < 0.00001) {
+            return 0.0;
+        }
+        const double plane = wall_plane_coordinate(map_x, map_y, side, ray_dir_x, ray_dir_y);
+        distance = (plane - px) / ray_dir_x;
+    } else {
+        if (std::abs(ray_dir_y) < 0.00001) {
+            return 0.0;
+        }
+        const double plane = wall_plane_coordinate(map_x, map_y, side, ray_dir_x, ray_dir_y);
+        distance = (plane - py) / ray_dir_y;
+    }
+    distance = std::max(distance, 0.0001);
+    double wall_x = (side == 0) ? (py + distance * ray_dir_y) : (px + distance * ray_dir_x);
+    wall_x -= std::floor(wall_x);
+    double tex_x = wall_x * kTextureSize;
+    if (side == 0 && ray_dir_x > 0.0) {
+        tex_x = kTextureSize - tex_x - 1.0;
+    }
+    if (side == 1 && ray_dir_y < 0.0) {
+        tex_x = kTextureSize - tex_x - 1.0;
+    }
+    return tex_x;
+}
+
+double unwrap_texel_sample(double reference, double sample) {
+    double delta = sample - reference;
+    if (delta > kTextureSize / 2.0) {
+        delta -= kTextureSize;
+    } else if (delta < -kTextureSize / 2.0) {
+        delta += kTextureSize;
+    }
+    return reference + delta;
 }
 
 Color door_texel_from_buffer(const uint8_t* texture_data, Py_ssize_t texture_len, int door_type, double tx, double ty) {
@@ -745,12 +811,64 @@ void draw_walls(
             tex_x = kTextureSize - tex_x - 1;
         }
 
+        const double camera_x_left = 2.0 * static_cast<double>(column) / width - 1.0;
+        const double camera_x_right = 2.0 * static_cast<double>(column + 1) / width - 1.0;
+        const double tex_x_left = texel_x_for_camera_sample(
+            camera_x_left,
+            px,
+            py,
+            dir_x,
+            dir_y,
+            plane_x,
+            plane_y,
+            map_x,
+            map_y,
+            side
+        );
+        const double tex_x_right = unwrap_texel_sample(
+            tex_x_left,
+            texel_x_for_camera_sample(
+                camera_x_right,
+                px,
+                py,
+                dir_x,
+                dir_y,
+                plane_x,
+                plane_y,
+                map_x,
+                map_y,
+                side
+            )
+        );
+        const double texel_span = std::abs(tex_x_right - tex_x_left);
+        const bool use_filtered_column = projection_distance < 1.15 || texel_span > 0.65;
+
         const double shade = std::max(0.20, 1.0 - distance / kMaxRayDistance) * (side ? 0.74 : 1.0);
 
         for (int y = wall_top; y < wall_bottom; ++y) {
             const double relative = static_cast<double>(y - wall_top) / std::max(1, wall_bottom - wall_top);
             const double tex_y = std::fmod(relative * hit_height * kTextureSize + kTextureSize * 8.0, static_cast<double>(kTextureSize));
-            Color c = scale_color(wall_texel_from_buffer(wall_texture_data, wall_texture_len, texture_index, tex_x, tex_y), shade);
+            Color sampled = wall_texel_from_buffer(wall_texture_data, wall_texture_len, texture_index, tex_x, tex_y);
+            if (use_filtered_column) {
+                const double tex_x_mid_left = tex_x_left + (tex_x_right - tex_x_left) * 0.25;
+                const double tex_x_mid_right = tex_x_left + (tex_x_right - tex_x_left) * 0.75;
+                const Color left_sample = wall_texel_from_buffer(
+                    wall_texture_data,
+                    wall_texture_len,
+                    texture_index,
+                    tex_x_mid_left,
+                    tex_y
+                );
+                const Color right_sample = wall_texel_from_buffer(
+                    wall_texture_data,
+                    wall_texture_len,
+                    texture_index,
+                    tex_x_mid_right,
+                    tex_y
+                );
+                sampled = average_color(left_sample, right_sample);
+            }
+            Color c = scale_color(sampled, shade);
             const int darkness = std::min(170, static_cast<int>(distance * 10.0));
             c = darken(c, darkness);
             if (height_face && y - wall_top < 2) {

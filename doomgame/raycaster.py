@@ -44,7 +44,9 @@ class Raycaster:
         self.sector_type_bytes = b""
         self.native_door_buffer = bytearray()
         self.depth_buffer = [settings.MAX_RAY_DISTANCE for _ in range(self.width)]
-        self.sprite_depth_buffer = [settings.MAX_RAY_DISTANCE for _ in range(self.width)]
+        self.world_depth_buffer = array("f", [settings.MAX_RAY_DISTANCE]) * self.width
+        self.combat_depth_buffer = array("f", [settings.MAX_RAY_DISTANCE]) * self.width
+        self.decor_depth_buffer = array("f", [settings.MAX_RAY_DISTANCE]) * self.width
         self.texture_size = settings.TEXTURE_SIZE
         self.wall_textures = self._build_wall_textures()
         self.floor_textures = self._build_floor_textures()
@@ -150,7 +152,9 @@ class Raycaster:
                 self.native_door_texture_bytes,
             )
             self.depth_buffer = self.native_depth_buffer
-            self.sprite_depth_buffer = array("f", self.depth_buffer)
+            self.world_depth_buffer = array("f", self.depth_buffer)
+            self.combat_depth_buffer = array("f", self.depth_buffer)
+            self.decor_depth_buffer = array("f", self.depth_buffer)
             self._draw_exit_marker(self.native_surface, world, player, time_seconds)
             self._draw_pickups(self.native_surface, world, player, time_seconds)
             if (
@@ -162,7 +166,7 @@ class Raycaster:
                 if enemy_count > 0:
                     self.native_renderer.render_billboards_into(
                         self.framebuffer,
-                        self.sprite_depth_buffer,
+                        self.combat_depth_buffer,
                         self.width,
                         self.height,
                         player.x,
@@ -190,7 +194,7 @@ class Raycaster:
                 if projectile_count > 0:
                     self.native_renderer.render_billboards_into(
                         self.framebuffer,
-                        self.sprite_depth_buffer,
+                        self.combat_depth_buffer,
                         self.width,
                         self.height,
                         player.x,
@@ -215,7 +219,9 @@ class Raycaster:
             self._draw_floor_and_ceiling(surface, world, player)
             self._draw_walls(surface, world, player)
             self._draw_doors(surface, world, player)
-            self.sprite_depth_buffer = array("f", self.depth_buffer)
+            self.world_depth_buffer = array("f", self.depth_buffer)
+            self.combat_depth_buffer = array("f", self.depth_buffer)
+            self.decor_depth_buffer = array("f", self.depth_buffer)
             self._draw_exit_marker(surface, world, player, time_seconds)
             self._draw_pickups(surface, world, player, time_seconds)
             self._draw_enemies(surface, world, player, time_seconds)
@@ -669,7 +675,12 @@ class Raycaster:
             if sprite_rect.right < 0 or sprite_rect.left > self.width:
                 continue
 
-            visible_columns = self._visible_sprite_columns(sprite_rect, scaled.get_width(), transform_y)
+            visible_columns = self._visible_sprite_columns(
+                sprite_rect,
+                scaled.get_width(),
+                transform_y,
+                self.decor_depth_buffer,
+            )
             if not visible_columns:
                 continue
 
@@ -693,7 +704,15 @@ class Raycaster:
                 outline_rect = sprite_rect.move(offset_x, offset_y)
                 self._blit_columns(surface, outline, outline_rect, visible_columns, target_dx=offset_x)
 
-            self._blit_columns(surface, scaled, sprite_rect, visible_columns, write_depth=True, depth=transform_y)
+            self._blit_columns(
+                surface,
+                scaled,
+                sprite_rect,
+                visible_columns,
+                write_depth=True,
+                depth=transform_y,
+                write_depth_buffer=self.decor_depth_buffer,
+            )
 
     def _draw_enemies(
         self,
@@ -743,7 +762,12 @@ class Raycaster:
             if sprite_rect.right < 0 or sprite_rect.left > self.width:
                 continue
 
-            visible_columns = self._visible_sprite_columns(sprite_rect, scaled.get_width(), transform_y)
+            visible_columns = self._visible_sprite_columns(
+                sprite_rect,
+                scaled.get_width(),
+                transform_y,
+                self.combat_depth_buffer,
+            )
             if not visible_columns:
                 continue
 
@@ -766,7 +790,15 @@ class Raycaster:
             for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 self._blit_columns(surface, outline, sprite_rect.move(offset_x, offset_y), visible_columns, target_dx=offset_x)
 
-            self._blit_columns(surface, scaled, sprite_rect, visible_columns, write_depth=True, depth=transform_y)
+            self._blit_columns(
+                surface,
+                scaled,
+                sprite_rect,
+                visible_columns,
+                write_depth=True,
+                depth=transform_y,
+                write_depth_buffer=self.combat_depth_buffer,
+            )
 
     def _draw_enemy_projectiles(
         self,
@@ -812,7 +844,12 @@ class Raycaster:
             sprite_rect = scaled.get_rect(center=(screen_x, bottom_y - sprite_height // 2))
             if sprite_rect.right < 0 or sprite_rect.left > self.width:
                 continue
-            visible_columns = self._visible_sprite_columns(sprite_rect, scaled.get_width(), transform_y)
+            visible_columns = self._visible_sprite_columns(
+                sprite_rect,
+                scaled.get_width(),
+                transform_y,
+                self.combat_depth_buffer,
+            )
             if not visible_columns:
                 continue
             trail_rect = sprite_rect.inflate(18, 12)
@@ -826,7 +863,15 @@ class Raycaster:
                 target_dx=trail_rect.left - sprite_rect.left,
                 source_dx=glow_border,
             )
-            self._blit_columns(surface, scaled, sprite_rect, visible_columns, write_depth=True, depth=transform_y)
+            self._blit_columns(
+                surface,
+                scaled,
+                sprite_rect,
+                visible_columns,
+                write_depth=True,
+                depth=transform_y,
+                write_depth_buffer=self.combat_depth_buffer,
+            )
 
     def _draw_exit_marker(
         self,
@@ -862,7 +907,12 @@ class Raycaster:
         sprite_rect = scaled.get_rect(midbottom=(screen_x, bottom_y))
         if sprite_rect.right < 0 or sprite_rect.left > self.width:
             return
-        visible_columns = self._visible_sprite_columns(sprite_rect, scaled.get_width(), transform_y)
+        visible_columns = self._visible_sprite_columns(
+            sprite_rect,
+            scaled.get_width(),
+            transform_y,
+            self.decor_depth_buffer,
+        )
         if not visible_columns:
             return
         glow_color = (120, 255, 168) if world.is_exit_active() else (82, 126, 104)
@@ -877,19 +927,28 @@ class Raycaster:
             target_dx=glow_rect.left - sprite_rect.left,
             source_dx=glow_border,
         )
-        self._blit_columns(surface, scaled, sprite_rect, visible_columns)
+        self._blit_columns(
+            surface,
+            scaled,
+            sprite_rect,
+            visible_columns,
+            write_depth=True,
+            depth=transform_y,
+            write_depth_buffer=self.decor_depth_buffer,
+        )
 
     def _visible_sprite_columns(
         self,
         sprite_rect: pygame.Rect,
         source_width: int,
         depth: float,
+        occlusion_depth_buffer,
     ) -> list[tuple[int, int]]:
         visible_columns: list[tuple[int, int]] = []
         start_x = max(0, sprite_rect.left)
         end_x = min(self.width, sprite_rect.right)
         for screen_col in range(start_x, end_x):
-            if depth >= self.sprite_depth_buffer[screen_col] - 0.015:
+            if depth >= occlusion_depth_buffer[screen_col] - 0.015:
                 continue
             relative = (screen_col - sprite_rect.left) / max(1, sprite_rect.width)
             source_col = min(source_width - 1, max(0, int(relative * source_width)))
@@ -906,6 +965,7 @@ class Raycaster:
         source_dx: int = 0,
         write_depth: bool = False,
         depth: float | None = None,
+        write_depth_buffer=None,
     ) -> None:
         for screen_col, source_col in visible_columns:
             target_x = screen_col + target_dx
@@ -913,8 +973,13 @@ class Raycaster:
                 continue
             source_x = min(sprite.get_width() - 1, max(0, source_col + source_dx))
             surface.blit(sprite, (target_x, target_rect.top), area=(source_x, 0, 1, sprite.get_height()))
-            if write_depth and depth is not None and 0 <= screen_col < len(self.sprite_depth_buffer):
-                self.sprite_depth_buffer[screen_col] = min(self.sprite_depth_buffer[screen_col], depth)
+            if (
+                write_depth
+                and depth is not None
+                and write_depth_buffer is not None
+                and 0 <= screen_col < len(write_depth_buffer)
+            ):
+                write_depth_buffer[screen_col] = min(write_depth_buffer[screen_col], depth)
 
     def _make_pickup_glow(
         self,
