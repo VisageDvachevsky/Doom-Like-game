@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing
 
 from doomgame.game import DoomGame
 
@@ -14,6 +15,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     args = _parse_args()
     if args.dev_mode:
         DoomGame(dev_start_level=5, dev_immortal=True, dev_auto_difficulty="hard").run()

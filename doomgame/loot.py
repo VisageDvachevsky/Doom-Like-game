@@ -119,6 +119,20 @@ PICKUP_DEFINITIONS: dict[str, PickupDefinition] = {
         effect=PickupEffect("armor", "set_floor", 100, "GREEN ARMOR"),
         visual=PickupVisual((28, 30), (64, 164, 120), (118, 230, 160), 0.38, 0.94),
     ),
+    "pistol": PickupDefinition(
+        kind="pistol",
+        display_name="Pistol",
+        default_amount=24,
+        effect=PickupEffect("bullets", "add", settings.MAX_BULLETS, "FOUND THE PISTOL"),
+        visual=PickupVisual((32, 20), (178, 168, 146), (232, 198, 118), 0.39, 0.9),
+    ),
+    "sawedoff": PickupDefinition(
+        kind="sawedoff",
+        display_name="Sawed-Off",
+        default_amount=8,
+        effect=PickupEffect("ammo", "add", settings.MAX_SHELLS, "FOUND THE SAWED-OFF"),
+        visual=PickupVisual((34, 20), (194, 138, 84), (244, 190, 126), 0.4, 0.92),
+    ),
     "chaingun": PickupDefinition(
         kind="chaingun",
         display_name="Chaingun",
@@ -131,6 +145,7 @@ PICKUP_DEFINITIONS: dict[str, PickupDefinition] = {
 
 ROOM_LOOT_TABLES: dict[str, tuple[LootTableEntry, ...]] = {
     "start": (
+        LootTableEntry("bullets", 20, 7),
         LootTableEntry("shells", 4, 8),
         LootTableEntry("stimpack", 10, 5),
         LootTableEntry("armor_bonus", 1, 2),
@@ -144,6 +159,7 @@ ROOM_LOOT_TABLES: dict[str, tuple[LootTableEntry, ...]] = {
     ),
     "arena": (
         LootTableEntry("bullets", 20, 3),
+        LootTableEntry("bullet_box", 60, 1),
         LootTableEntry("shells", 4, 9),
         LootTableEntry("shell_box", 20, 6),
         LootTableEntry("stimpack", 10, 4),
@@ -157,6 +173,7 @@ ROOM_LOOT_TABLES: dict[str, tuple[LootTableEntry, ...]] = {
         LootTableEntry("green_armor", 100, 2),
     ),
     "shrine": (
+        LootTableEntry("bullets", 20, 3),
         LootTableEntry("medkit", 25, 6),
         LootTableEntry("green_armor", 100, 4),
         LootTableEntry("armor_bonus", 1, 5),

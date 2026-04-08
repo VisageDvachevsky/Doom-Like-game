@@ -102,6 +102,9 @@ class MusicSnapshot:
     recent_event: float = 0.0
     boss_nearby_threat: float = 0.0
     player_health_ratio: float = 1.0
+    planned_room_pressure: float = 0.0
+    room_enemy_count: int = 0
+    room_dormant_enemy_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -175,18 +178,24 @@ class AdaptiveMusicLogic:
         event_pressure = _clamp(snapshot.recent_event, 0.0, 1.0)
         boss_pressure = _clamp(snapshot.boss_nearby_threat / 3.2, 0.0, 1.0)
         low_health_pressure = _clamp(1.0 - snapshot.player_health_ratio, 0.0, 1.0)
+        room_pressure = _clamp(snapshot.planned_room_pressure, 0.0, 1.0)
+        room_enemy_pressure = _clamp(snapshot.room_enemy_count / 7.0, 0.0, 1.0)
+        room_dormant_pressure = _clamp(snapshot.room_dormant_enemy_count / 4.0, 0.0, 1.0)
         intensity = (
-            active_pressure * 0.14
-            + nearby_pressure * 0.27
-            + attack_pressure * 0.22
-            + projectile_pressure * 0.14
+            active_pressure * 0.12
+            + nearby_pressure * 0.22
+            + attack_pressure * 0.20
+            + projectile_pressure * 0.12
             + motion_pressure * 0.04
-            + shots_pressure * 0.10
+            + shots_pressure * 0.09
             + damage_pressure * 0.05
             + kill_pressure * 0.06
             + event_pressure * 0.06
             + boss_pressure * 0.08
             + low_health_pressure * 0.08
+            + room_pressure * 0.18
+            + room_enemy_pressure * 0.10
+            + room_dormant_pressure * 0.06
         )
         return _clamp(intensity, 0.0, 1.0)
 
@@ -236,6 +245,9 @@ class AdaptiveMusicLogic:
         event_spike = _clamp(snapshot.recent_event, 0.0, 1.0)
         boss_pressure = _clamp(snapshot.boss_nearby_threat / 3.0, 0.0, 1.0)
         low_health = _clamp(1.0 - snapshot.player_health_ratio, 0.0, 1.0)
+        room_pressure = _clamp(snapshot.planned_room_pressure, 0.0, 1.0)
+        room_enemy_pressure = _clamp(snapshot.room_enemy_count / 7.0, 0.0, 1.0)
+        room_dormant_pressure = _clamp(snapshot.room_dormant_enemy_count / 4.0, 0.0, 1.0)
         tension_target = _clamp(
             awareness * 0.34
             + proximity * 0.38
@@ -265,6 +277,8 @@ class AdaptiveMusicLogic:
             0.0,
             1.0,
         )
+        tension_target = _clamp(tension_target + room_pressure * 0.26 + room_enemy_pressure * 0.12, 0.0, 1.0)
+        pressure_target = _clamp(pressure_target + room_pressure * 0.16 + room_dormant_pressure * 0.08, 0.0, 1.0)
         recovery_target = 1.0 if max(tension_target, pressure_target, momentum_target) < 0.18 else 0.0
         return {
             "tension": tension_target,
@@ -274,6 +288,7 @@ class AdaptiveMusicLogic:
         }
 
     def _phase_from_scores(self, snapshot: MusicSnapshot) -> str:
+        room_pressure = _clamp(snapshot.planned_room_pressure, 0.0, 1.0)
         if (
             self._climax_tail > 0.0
             and max(self.pressure, self.momentum, self.combat_memory) >= 0.42
@@ -282,6 +297,7 @@ class AdaptiveMusicLogic:
             or (self.momentum >= 0.84 and self.tension >= 0.64)
             or (snapshot.nearby_threat >= 5.4 and snapshot.projectile_count >= 2)
             or (snapshot.boss_nearby_threat >= 2.8 and (self.pressure >= 0.58 or self.tension >= 0.52))
+            or (room_pressure >= 0.82 and snapshot.room_enemy_count >= 6)
         ):
             return STATE_CLIMAX
         if (
@@ -289,6 +305,7 @@ class AdaptiveMusicLogic:
             or self.pressure >= 0.30
             or self.momentum >= 0.40
             or self.combat_memory >= 0.62
+            or room_pressure >= 0.42
         ):
             return STATE_COMBAT
         if (
@@ -302,6 +319,7 @@ class AdaptiveMusicLogic:
             self.tension >= 0.14
             or snapshot.active_enemies > 0
             or snapshot.active_threat >= 0.8
+            or room_pressure >= 0.18
         ):
             return STATE_THREAT
         return STATE_EXPLORATION

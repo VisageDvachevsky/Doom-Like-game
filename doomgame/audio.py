@@ -37,14 +37,16 @@ class DoomAudio:
             "world": pygame.mixer.Channel(3),
             "enemy": pygame.mixer.Channel(4),
         }
-        shotgun_fire = self._load_asset_sound("dspistol.wav")
+        pistol_fire = self._load_asset_sound("dspistol (2).wav")
+        shotgun_fire = self._load_asset_sound("dsshotgn (2).wav")
+        sawedoff_fire = self._load_asset_sound("dsdshtgn.wav")
         chaingun_fire = self._load_asset_sound("dspistol (1).wav")
         normal_door_open = self._load_asset_sound("dsbdopn.wav")
         locked_door_open = self._load_asset_sound("dsdoropn.wav")
         item_pickup = self._load_asset_sound("dsitemup.wav")
         level_exit = self._load_asset_sound("dstelept.wav")
         charger_attack = self._load_asset_sound("dsfirsht.wav")
-        grunt_attack = self._load_asset_sound("dsshotgn.wav")
+        grunt_attack = self._load_asset_sound("dsshotgn (3).wav")
         heavy_attack = self._load_asset_sound("dsrlaunc.wav")
         cacodemon_attack = self._load_asset_sound("dsfirshtcaco.wav")
         cyberdemon_attack = self._load_asset_sound("dsrlaunc (1).wav")
@@ -68,7 +70,9 @@ class DoomAudio:
         player_oof = self._load_asset_sound("dsoof.wav")
         player_death = self._load_asset_sound("dspldeth.wav")
         self.sounds = {
+            "pistol_fire": pistol_fire if pistol_fire is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "shotgun_fire": shotgun_fire if shotgun_fire is not None else pygame.mixer.Sound(buffer=self._render_shotgun_fire()),
+            "sawedoff_fire": sawedoff_fire if sawedoff_fire is not None else shotgun_fire if shotgun_fire is not None else pygame.mixer.Sound(buffer=self._render_shotgun_fire()),
             "chaingun_fire": chaingun_fire if chaingun_fire is not None else shotgun_fire if shotgun_fire is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "empty_click": pygame.mixer.Sound(buffer=self._render_empty_click()),
             "pickup": item_pickup if item_pickup is not None else pygame.mixer.Sound(buffer=self._render_pickup_ping()),
@@ -81,7 +85,7 @@ class DoomAudio:
             "enemy_ranged": pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "enemy_death": pygame.mixer.Sound(buffer=self._render_enemy_death()),
             "charger_attack": charger_attack if charger_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_melee()),
-            "grunt_attack": grunt_attack if grunt_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
+            "grunt_attack": grunt_attack if grunt_attack is not None else pygame.mixer.Sound(buffer=self._render_grunt_attack()),
             "heavy_attack": heavy_attack if heavy_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "cacodemon_attack": cacodemon_attack if cacodemon_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "cyberdemon_attack": cyberdemon_attack if cyberdemon_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
@@ -119,8 +123,14 @@ class DoomAudio:
             channel.stop()
         self.enabled = False
 
+    def play_pistol_fire(self) -> None:
+        self._play_sound("weapon", "pistol_fire", cooldown=0.08, interrupt=True)
+
     def play_shotgun_fire(self) -> None:
         self._play_sound("weapon", "shotgun_fire", cooldown=0.08, interrupt=True)
+
+    def play_sawedoff_fire(self) -> None:
+        self._play_sound("weapon", "sawedoff_fire", cooldown=0.08, interrupt=True)
 
     def play_chaingun_fire(self) -> None:
         self._play_sound("weapon", "chaingun_fire", cooldown=0.03, interrupt=True)
@@ -408,6 +418,24 @@ class DoomAudio:
             crack = math.sin(math.tau * 1240.0 * t) * math.exp(-t * 16.0) * 0.18
             boom = math.sin(math.tau * 140.0 * t) * math.exp(-t * 7.0) * 0.18
             sample = math.tanh((charge + crack + boom) * 1.95)
+            pcm.append(int(sample * 32767))
+            pcm.append(int(sample * 32767))
+        return pcm.tobytes()
+
+    def _render_grunt_attack(self) -> bytes:
+        duration = 0.19
+        samples = int(duration * self.sample_rate)
+        pcm = array("h")
+        rng = random.Random(31337)
+        noise_lp = 0.0
+        for idx in range(samples):
+            t = idx / self.sample_rate
+            snap = math.sin(math.tau * 1480.0 * t) * math.exp(-t * 24.0) * 0.18
+            pop = math.sin(math.tau * 760.0 * t) * math.exp(-t * 18.0) * 0.13
+            ring = math.sin(math.tau * 420.0 * t) * math.exp(-t * 11.0) * 0.08
+            noise = (rng.random() * 2.0 - 1.0) * math.exp(-t * 30.0) * 0.10
+            noise_lp = noise_lp * 0.58 + noise * 0.42
+            sample = math.tanh((snap + pop + ring + noise_lp) * 2.1)
             pcm.append(int(sample * 32767))
             pcm.append(int(sample * 32767))
         return pcm.tobytes()

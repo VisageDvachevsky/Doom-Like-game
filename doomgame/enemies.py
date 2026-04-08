@@ -56,6 +56,13 @@ class EnemyDefinition:
     wander_radius: float
     hit_reaction_chance: float
     corpse_time: float
+    preferred_range_min: float
+    preferred_range_max: float
+    strafe_speed_scale: float
+    dodge_chance: float
+    dodge_time: float
+    dodge_cooldown: float
+    search_aggressiveness: float
     drops: tuple[EnemyDrop, ...]
     visual: EnemyVisual
 
@@ -195,6 +202,11 @@ class WorldEnemy:
     recent_hit_flash: float = 0.0
     sprite_phase: float = 0.0
     step_sound_timer: float = 0.0
+    dodge_timer: float = 0.0
+    dodge_cooldown_timer: float = 0.0
+    dodge_dir: int = 0
+    search_timer: float = 0.0
+    search_angle: float = 0.0
 
     def __post_init__(self) -> None:
         self.origin_x = self.x
@@ -330,6 +342,9 @@ class WorldEnemy:
         self.memory_timer = max(0.0, self.memory_timer - delta_time)
         self.wander_timer = max(0.0, self.wander_timer - delta_time)
         self.step_sound_timer = max(0.0, self.step_sound_timer - delta_time)
+        self.dodge_timer = max(0.0, self.dodge_timer - delta_time)
+        self.dodge_cooldown_timer = max(0.0, self.dodge_cooldown_timer - delta_time)
+        self.search_timer = max(0.0, self.search_timer - delta_time)
 
         player_dx = player.x - self.x
         player_dy = player.y - self.y
@@ -343,6 +358,9 @@ class WorldEnemy:
             self.think_timer = settings.ENEMY_THINK_INTERVAL + rng.uniform(0.02, 0.12)
         can_see_player = self.cached_los
         heard_player = world.enemy_can_hear_player(self, player_distance)
+        under_aim_threat = self._is_under_player_aim(player, world, player_distance)
+        shot_threat = world.was_enemy_threatened_by_player_shot(self)
+        local_support = world.get_enemy_local_support(self)
 
         if can_see_player:
             self.last_seen_x = player.x
@@ -353,6 +371,12 @@ class WorldEnemy:
             if not self.has_alerted:
                 self.has_alerted = True
                 audio.play_enemy_alert(self.enemy_type)
+                world.propagate_enemy_alert(
+                    self,
+                    player.x,
+                    player.y,
+                    radius=settings.ENEMY_ALERT_PROPAGATION_RADIUS,
+                )
             if self.ai_state in {"idle", "wander"}:
                 self.ai_state = "alert"
                 self.state_timer = self.definition.reaction_time
@@ -367,6 +391,12 @@ class WorldEnemy:
             if not self.has_alerted:
                 self.has_alerted = True
                 audio.play_enemy_alert(self.enemy_type)
+                world.propagate_enemy_alert(
+                    self,
+                    player.x,
+                    player.y,
+                    radius=settings.ENEMY_ALERT_PROPAGATION_RADIUS * 0.78,
+                )
 
         if self.ai_state == "pain":
             self.pain_timer -= delta_time
@@ -387,22 +417,198 @@ class WorldEnemy:
             self._update_attack(world, player, delta_time, damage_player, audio)
             return
 
+        if self._should_start_dodge(can_see_player, under_aim_threat, shot_threat, rng):
+            self._start_dodge(player, rng)
+
+        if self.dodge_timer > 0.0 and self.memory_timer > 0.0:
+            self.ai_state = "chase"
+            self._perform_dodge(world, player, delta_time, rng, audio)
+            return
+
         if self.attack_cooldown_timer <= 0.0 and self._can_begin_attack(player_distance, can_see_player):
             self._begin_attack(audio)
             return
 
         if self.memory_timer > 0.0:
             self.ai_state = "chase"
-            if self._should_kite_player(player_distance, can_see_player):
-                self._move_away_from(world, player, player.x, player.y, delta_time, rng, audio, speed_scale=0.82)
+            if can_see_player:
+                self._update_combat_movement(world, player, player_distance, local_support, delta_time, rng, audio)
             else:
-                self._move_towards(world, player, self.target_x, self.target_y, delta_time, rng, audio)
+                self._update_search(world, player, delta_time, rng, audio)
             return
 
         if self.ai_state not in {"idle", "wander"}:
             self.ai_state = "wander"
             self.wander_timer = 0.0
         self._update_wander(world, player, delta_time, rng, audio)
+
+    def _is_under_player_aim(self, player: "Player", world: "World", player_distance: float) -> bool:
+        if player_distance > settings.ENEMY_AIM_THREAT_MAX_DISTANCE:
+            return False
+        if not world.has_line_of_sight(player.x, player.y, self.x, self.y):
+            return False
+        dir_x = math.cos(player.angle)
+        dir_y = math.sin(player.angle)
+        to_enemy_x = self.x - player.x
+        to_enemy_y = self.y - player.y
+        norm = max(0.001, player_distance)
+        aim_dot = (to_enemy_x / norm) * dir_x + (to_enemy_y / norm) * dir_y
+        danger_cos = settings.ENEMY_AIM_DANGER_COS if world.noise_timer > 0.0 else settings.ENEMY_AIM_THREAT_COS
+        return aim_dot >= danger_cos
+
+    def _should_start_dodge(
+        self,
+        can_see_player: bool,
+        under_aim_threat: bool,
+        shot_threat: bool,
+        rng: random.Random,
+    ) -> bool:
+        if not can_see_player or not (under_aim_threat or shot_threat):
+            return False
+        if self.dodge_timer > 0.0 or self.dodge_cooldown_timer > 0.0:
+            return False
+        if self.ai_state in {"pain", "attack"}:
+            return False
+        dodge_chance = self.definition.dodge_chance * (1.1 if shot_threat else 1.0)
+        return rng.random() <= min(0.7, dodge_chance)
+
+    def _start_dodge(self, player: "Player", rng: random.Random) -> None:
+        self.dodge_timer = self.definition.dodge_time
+        self.dodge_cooldown_timer = self.definition.dodge_cooldown
+        player_dx = player.x - self.x
+        player_dy = player.y - self.y
+        cross = math.cos(player.angle) * player_dy - math.sin(player.angle) * player_dx
+        if abs(cross) > 0.02:
+            self.dodge_dir = -1 if cross > 0.0 else 1
+        else:
+            self.dodge_dir = rng.choice((-1, 1))
+        self.search_angle = math.atan2(player_dy, player_dx)
+
+    def _perform_dodge(
+        self,
+        world: "World",
+        player: "Player",
+        delta_time: float,
+        rng: random.Random,
+        audio,
+    ) -> None:
+        base_angle = math.atan2(player.y - self.y, player.x - self.x)
+        strafe_angle = base_angle + self.dodge_dir * (math.pi / 2.0)
+        speed_scale = self.definition.strafe_speed_scale * settings.ENEMY_DODGE_SPEED_SCALE
+        if self._move_in_direction(world, player, strafe_angle, delta_time, audio, speed_scale=speed_scale):
+            return
+        self.dodge_dir *= -1
+        strafe_angle = base_angle + self.dodge_dir * (math.pi / 2.0)
+        if self._move_in_direction(world, player, strafe_angle, delta_time, audio, speed_scale=speed_scale):
+            return
+        self._move_in_direction(
+            world,
+            player,
+            base_angle + rng.choice((-0.75, 0.75)),
+            delta_time,
+            audio,
+            speed_scale=self.definition.strafe_speed_scale * 0.88,
+        )
+
+    def _update_combat_movement(
+        self,
+        world: "World",
+        player: "Player",
+        player_distance: float,
+        local_support: int,
+        delta_time: float,
+        rng: random.Random,
+        audio,
+    ) -> None:
+        stance = self._combat_stance(player_distance, local_support)
+        if stance == "rush":
+            self._move_towards(world, player, player.x, player.y, delta_time, rng, audio, speed_scale=1.08)
+            return
+        if stance == "retreat":
+            self._move_away_from(world, player, player.x, player.y, delta_time, rng, audio, speed_scale=0.94)
+            return
+        if stance == "orbit":
+            orbit_dir = self._orbit_direction(player)
+            if not self._orbit_player(world, player, delta_time, audio, orbit_dir, speed_scale=self.definition.strafe_speed_scale):
+                self._move_towards(world, player, player.x, player.y, delta_time, rng, audio, speed_scale=0.72)
+            return
+        if stance == "anchor":
+            if not self._orbit_player(world, player, delta_time, audio, self._orbit_direction(player), speed_scale=self.definition.strafe_speed_scale * 0.92):
+                self._move_towards(world, player, player.x, player.y, delta_time, rng, audio, speed_scale=0.48)
+            return
+        self._move_towards(world, player, player.x, player.y, delta_time, rng, audio)
+
+    def _update_search(
+        self,
+        world: "World",
+        player: "Player",
+        delta_time: float,
+        rng: random.Random,
+        audio,
+    ) -> None:
+        if math.hypot(self.x - self.target_x, self.y - self.target_y) <= settings.ENEMY_SEARCH_REACHED_EPSILON or self.search_timer <= 0.0:
+            self.search_timer = settings.ENEMY_SEARCH_POINT_INTERVAL + rng.uniform(0.0, 0.35)
+            self.search_angle += rng.uniform(0.55, 1.25) * rng.choice((-1, 1))
+            radius = settings.ENEMY_SEARCH_POINT_RADIUS * self.definition.search_aggressiveness
+            self.target_x = self.last_seen_x + math.cos(self.search_angle) * radius
+            self.target_y = self.last_seen_y + math.sin(self.search_angle) * radius
+        self._move_towards(world, player, self.target_x, self.target_y, delta_time, rng, audio, speed_scale=0.78)
+
+    def _combat_stance(self, player_distance: float, local_support: int) -> str:
+        if self.enemy_type == "charger":
+            return "rush"
+        if self.enemy_type == "cyberdemon":
+            return "anchor" if player_distance >= self.definition.preferred_range_min else "retreat"
+        if self.enemy_type == "grunt" and local_support >= 2 and player_distance <= self.definition.preferred_range_max:
+            return "orbit"
+        if self.enemy_type == "heavy" and local_support >= 1 and player_distance >= self.definition.preferred_range_min:
+            return "anchor"
+        if self.enemy_type == "warden" and local_support >= 1:
+            return "orbit"
+        if player_distance < self.definition.preferred_range_min:
+            return "retreat"
+        if self.enemy_type in {"warden", "cacodemon"}:
+            return "orbit"
+        if self.enemy_type == "heavy":
+            return "anchor"
+        if player_distance > self.definition.preferred_range_max:
+            return "advance"
+        return "orbit"
+
+    def _orbit_direction(self, player: "Player") -> int:
+        delta_x = self.x - player.x
+        delta_y = self.y - player.y
+        cross = math.cos(player.angle) * delta_y - math.sin(player.angle) * delta_x
+        return -1 if cross > 0.0 else 1
+
+    def _orbit_player(
+        self,
+        world: "World",
+        player: "Player",
+        delta_time: float,
+        audio,
+        orbit_dir: int,
+        speed_scale: float,
+    ) -> bool:
+        angle = math.atan2(player.y - self.y, player.x - self.x) + orbit_dir * (math.pi / 2.0)
+        return self._move_in_direction(world, player, angle, delta_time, audio, speed_scale=speed_scale)
+
+    def _move_in_direction(
+        self,
+        world: "World",
+        player: "Player",
+        angle: float,
+        delta_time: float,
+        audio,
+        speed_scale: float = 1.0,
+    ) -> bool:
+        speed = self.definition.move_speed * speed_scale * delta_time
+        if speed <= 0.0:
+            return False
+        moved = world.move_enemy(self, math.cos(angle) * speed, math.sin(angle) * speed, player)
+        if moved:
+            self._maybe_play_step(audio)
+        return moved
 
     def _can_begin_attack(self, player_distance: float, can_see_player: bool) -> bool:
         if not can_see_player:
@@ -445,13 +651,27 @@ class WorldEnemy:
                     and world.has_line_of_sight(self.x, self.y, player.x, player.y)
                 )
                 if can_hit:
-                    world.spawn_enemy_projectile(self, player.x, player.y)
+                    target_x, target_y = self._projectile_target_point(player)
+                    world.spawn_enemy_projectile(self, target_x, target_y)
             self.attack_applied = True
 
         if self.attack_timer <= 0.0:
             self.attack_cooldown_timer = self.definition.attack_cooldown
             self.ai_state = "chase" if self.memory_timer > 0.0 else "wander"
             self.animation_timer = 0.0
+
+    def _projectile_target_point(self, player: "Player") -> tuple[float, float]:
+        speed = max(0.001, self.definition.projectile_speed)
+        distance = math.hypot(player.x - self.x, player.y - self.y)
+        lead_time = min(0.55, distance / speed)
+        if self.enemy_type == "heavy":
+            lead_time *= 0.82
+        elif self.enemy_type in {"warden", "cyberdemon"}:
+            lead_time *= 1.08
+        return (
+            player.x + player.vel_x * lead_time,
+            player.y + player.vel_y * lead_time,
+        )
 
     def _update_wander(
         self,
@@ -591,6 +811,13 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         wander_radius=2.2,
         hit_reaction_chance=0.76,
         corpse_time=settings.ENEMY_CORPSE_TIME,
+        preferred_range_min=4.8,
+        preferred_range_max=8.7,
+        strafe_speed_scale=0.96,
+        dodge_chance=0.18,
+        dodge_time=0.18,
+        dodge_cooldown=1.08,
+        search_aggressiveness=1.0,
         drops=(
             EnemyDrop("bullets", 0.42, 20),
             EnemyDrop("shells", 0.22, 4),
@@ -627,6 +854,13 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         wander_radius=2.5,
         hit_reaction_chance=0.52,
         corpse_time=settings.ENEMY_CORPSE_TIME,
+        preferred_range_min=0.0,
+        preferred_range_max=1.2,
+        strafe_speed_scale=1.12,
+        dodge_chance=0.24,
+        dodge_time=0.16,
+        dodge_cooldown=0.96,
+        search_aggressiveness=1.18,
         drops=(EnemyDrop("shells", 0.2, 4), EnemyDrop("armor_bonus", 0.16, 1)),
         visual=EnemyVisual(
             base_color=(158, 66, 58),
@@ -659,6 +893,13 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         wander_radius=1.9,
         hit_reaction_chance=0.34,
         corpse_time=settings.ENEMY_CORPSE_TIME + 1.0,
+        preferred_range_min=6.8,
+        preferred_range_max=11.2,
+        strafe_speed_scale=0.74,
+        dodge_chance=0.1,
+        dodge_time=0.14,
+        dodge_cooldown=1.45,
+        search_aggressiveness=0.82,
         drops=(
             EnemyDrop("bullet_box", 0.46, 60),
             EnemyDrop("shell_box", 0.24, 20),
@@ -695,6 +936,13 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         wander_radius=1.8,
         hit_reaction_chance=0.3,
         corpse_time=settings.ENEMY_CORPSE_TIME + 1.6,
+        preferred_range_min=6.4,
+        preferred_range_max=10.4,
+        strafe_speed_scale=1.02,
+        dodge_chance=0.16,
+        dodge_time=0.2,
+        dodge_cooldown=1.2,
+        search_aggressiveness=1.1,
         drops=(EnemyDrop("shell_box", 0.38, 20), EnemyDrop("medkit", 0.18, 25)),
         visual=EnemyVisual(
             base_color=(170, 52, 44),
@@ -727,6 +975,13 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         wander_radius=1.4,
         hit_reaction_chance=0.18,
         corpse_time=settings.ENEMY_CORPSE_TIME + 2.0,
+        preferred_range_min=7.2,
+        preferred_range_max=11.6,
+        strafe_speed_scale=1.08,
+        dodge_chance=0.2,
+        dodge_time=0.22,
+        dodge_cooldown=1.18,
+        search_aggressiveness=1.18,
         drops=(EnemyDrop("shell_box", 0.72, 20), EnemyDrop("medkit", 0.5, 25), EnemyDrop("green_armor", 0.18, 100)),
         visual=EnemyVisual(
             base_color=(92, 70, 138),
@@ -759,6 +1014,13 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         wander_radius=1.25,
         hit_reaction_chance=0.08,
         corpse_time=settings.ENEMY_CORPSE_TIME + 3.0,
+        preferred_range_min=8.0,
+        preferred_range_max=13.2,
+        strafe_speed_scale=0.62,
+        dodge_chance=0.04,
+        dodge_time=0.14,
+        dodge_cooldown=1.8,
+        search_aggressiveness=0.9,
         drops=(EnemyDrop("shell_box", 1.0, 20), EnemyDrop("medkit", 1.0, 25), EnemyDrop("green_armor", 0.4, 100)),
         visual=EnemyVisual(
             base_color=(116, 82, 72),

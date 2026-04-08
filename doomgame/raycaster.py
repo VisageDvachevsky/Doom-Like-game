@@ -64,7 +64,9 @@ class Raycaster:
         self.horizon_glow = pygame.Surface((self.width, 48), pygame.SRCALPHA)
         self.horizon_glow.fill((118, 214, 140, 255))
         self.weapon_scale_multipliers = {
+            "pistol": 0.3,
             "shotgun": 1.0,
+            "sawedoff": 0.68,
             "chaingun": 0.2,
         }
         self.weapon_frames = self._load_weapon_frames()
@@ -1233,11 +1235,27 @@ class Raycaster:
 
     def _load_weapon_frames(self) -> dict[str, list[pygame.Surface]]:
         return {
+            "pistol": [
+                frame
+                for frame in (
+                    self._load_trimmed_asset(f"weapon_pistol_{index}.png")
+                    for index in range(1, 4)
+                )
+                if frame is not None
+            ],
             "shotgun": [
                 frame
                 for frame in (
                     self._load_trimmed_asset(f"weapon_shotgun_{index}.png")
                     for index in range(1, 6)
+                )
+                if frame is not None
+            ],
+            "sawedoff": [
+                frame
+                for frame in (
+                    self._load_trimmed_asset(f"weapon_sawedoff_{index}.png")
+                    for index in range(1, 4)
                 )
                 if frame is not None
             ],
@@ -1253,7 +1271,9 @@ class Raycaster:
 
     def _load_weapon_idle_frames(self) -> dict[str, pygame.Surface | None]:
         return {
+            "pistol": self._load_trimmed_asset("weapon_pistol_idle.png"),
             "shotgun": self._load_trimmed_asset("weapon_shotgun_idle.png"),
+            "sawedoff": self._load_trimmed_asset("weapon_sawedoff_idle.png"),
             "chaingun": self._load_trimmed_asset("chaingun_idle.png"),
         }
 
@@ -1296,9 +1316,11 @@ class Raycaster:
         external_names = {
             "bullets": "bullets.png",
             "bullet_box": "bullet_box.png",
+            "pistol": "pistol_world.png",
+            "sawedoff": "sawedoff_world.png",
             "chaingun": "chaingun_world.png",
-            "shells": "shells.png",
-            "shell_box": "shell_box.png",
+            "shells": "shells_sawedoff.png",
+            "shell_box": "shell_box_sawedoff.png",
             "stimpack": "stimpack.png",
             "medkit": "medkit.png",
             "armor_bonus": "armor_bonus.png",
@@ -1310,6 +1332,8 @@ class Raycaster:
         sprites = {
             "bullets": self._make_bullet_clip_sprite(),
             "bullet_box": self._make_bullet_box_sprite(),
+            "pistol": self._make_weapon_pickup_sprite(),
+            "sawedoff": self._make_weapon_pickup_sprite(),
             "chaingun": self._make_weapon_pickup_sprite(),
             "shells": self._make_shell_sprite((188, 54, 46), 22, 28),
             "shell_box": self._make_shell_box_sprite(),

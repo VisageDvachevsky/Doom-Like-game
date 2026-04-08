@@ -149,6 +149,18 @@ class AdaptiveMusicLogicTests(unittest.TestCase):
 
         self.assertEqual(STATE_THREAT, mood)
 
+    def test_logic_uses_planned_room_pressure_before_combat_starts(self) -> None:
+        logic = AdaptiveMusicLogic()
+        snapshot = MusicSnapshot(
+            planned_room_pressure=0.72,
+            room_enemy_count=6,
+            room_dormant_enemy_count=3,
+        )
+
+        mood = logic.update(snapshot, 0.8, {STATE_EXPLORATION, STATE_THREAT, STATE_COMBAT, STATE_CLIMAX})
+
+        self.assertEqual(STATE_COMBAT, mood)
+
     def test_logic_enters_aftermath_after_battle_resolves(self) -> None:
         logic = AdaptiveMusicLogic()
         peak = MusicSnapshot(

@@ -4,10 +4,10 @@ from dataclasses import dataclass
 import math
 import random
 
-from doomgame.enemies import EnemySpawn
+from doomgame.enemies import ENEMY_DEFINITIONS, EnemySpawn
 from doomgame import settings
 from doomgame.doors import DoorSpawn, KeySpawn, KEY_TYPES, locked_door_type_for_key
-from doomgame.loot import ROOM_LOOT_COUNTS, ROOM_LOOT_TABLES, resolve_pickup_amount
+from doomgame.loot import ROOM_LOOT_COUNTS, ROOM_LOOT_TABLES, get_pickup_definition, resolve_pickup_amount
 from doomgame.progression import (
     ACTION_ACTIVATE_EXIT_ROUTE,
     ACTION_ACTIVATE_SECRET,
@@ -133,6 +133,7 @@ class GeneratedMap:
     macro_signature: str
     route_plan: MacroRoutePlan
     room_metadata: tuple[RoomMetadata, ...]
+    room_runtime_infos: tuple["GeneratedRoomRuntimeInfo", ...]
     progression_beats: tuple[ProgressionBeat, ...]
     switch_spawns: tuple[WorldSwitchSpawn, ...]
     trigger_spawns: tuple[WorldTriggerSpawn, ...]
@@ -177,6 +178,43 @@ class BossGuardPlan:
     guarded_door_tile: tuple[int, int]
     anchor_position: tuple[float, float]
     candidate_room_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class GeneratedRoomRuntimeInfo:
+    room_index: int
+    x: int
+    y: int
+    width: int
+    height: int
+    room_kind: str
+    role: str
+    encounter_weight: float
+    planned_enemy_count: int
+    dormant_enemy_count: int
+    planned_music_pressure: float
+    is_safe_room: bool = False
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return (self.x + self.width * 0.5, self.y + self.height * 0.5)
+
+    def contains_tile(self, grid_x: int, grid_y: int, padding: int = 0) -> bool:
+        return (
+            self.x - padding <= grid_x < self.x + self.width + padding
+            and self.y - padding <= grid_y < self.y + self.height + padding
+        )
+
+
+EASY_AMMO_SURPLUS = 24.0
+MEDIUM_AMMO_SURPLUS = 10.0
+HARD_AMMO_SURPLUS = 2.5
+STARTING_SHELLS = 32.0
+REFERENCE_SHELL_DAMAGE = 24.0
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
 
 
 @dataclass(frozen=True)
@@ -535,6 +573,7 @@ class MapGenerator:
         macro_layout_type: str,
         route_plan: MacroRoutePlan,
         room_metadata: tuple[RoomMetadata, ...],
+        room_runtime_infos: tuple["GeneratedRoomRuntimeInfo", ...],
         progression_beats: tuple[ProgressionBeat, ...],
         switch_spawns: tuple[WorldSwitchSpawn, ...],
         trigger_spawns: tuple[WorldTriggerSpawn, ...],
@@ -580,6 +619,7 @@ class MapGenerator:
             macro_signature=macro_signature,
             route_plan=route_plan,
             room_metadata=room_metadata,
+            room_runtime_infos=room_runtime_infos,
             progression_beats=progression_beats,
             switch_spawns=switch_spawns,
             trigger_spawns=trigger_spawns,
@@ -600,6 +640,201 @@ class MapGenerator:
             if generated is not None:
                 return generated
         return None
+
+    def _build_room_runtime_infos(
+        self,
+        rooms: list[Room],
+        room_metadata: tuple[RoomMetadata, ...],
+        enemy_spawns: list[EnemySpawn],
+    ) -> tuple[GeneratedRoomRuntimeInfo, ...]:
+        enemy_counts = {room_index: 0 for room_index in range(len(rooms))}
+        dormant_counts = {room_index: 0 for room_index in range(len(rooms))}
+        for enemy in enemy_spawns:
+            enemy_counts[enemy.room_index] = enemy_counts.get(enemy.room_index, 0) + 1
+            if enemy.wake_trigger_id is not None:
+                dormant_counts[enemy.room_index] = dormant_counts.get(enemy.room_index, 0) + 1
+
+        infos: list[GeneratedRoomRuntimeInfo] = []
+        for room, metadata in zip(rooms, room_metadata):
+            area = room.width * room.height
+            enemy_pressure = _clamp(enemy_counts.get(metadata.room_index, 0) / 7.0, 0.0, 1.0)
+            dormant_pressure = _clamp(dormant_counts.get(metadata.room_index, 0) / 4.0, 0.0, 1.0)
+            size_pressure = _clamp((area - 30.0) / 60.0, 0.0, 1.0)
+            weight_pressure = _clamp((metadata.encounter_weight - 0.8) / 1.25, 0.0, 1.0)
+            role_bonus = {
+                ROOM_ROLE_FINAL_ROOM: 0.20,
+                ROOM_ROLE_KEY_ROOM: 0.14,
+                ROOM_ROLE_AMBUSH_ROOM: 0.18,
+                ROOM_ROLE_PRESSURE_CORRIDOR: 0.08,
+                ROOM_ROLE_SWITCH_ROOM: 0.10,
+            }.get(metadata.role, 0.0)
+            kind_bonus = {
+                "arena": 0.16,
+                "cross": 0.10,
+                "tech": 0.05,
+                "storage": -0.06,
+                "shrine": -0.04,
+                "start": -0.22,
+            }.get(room.kind, 0.0)
+            planned_music_pressure = _clamp(
+                weight_pressure * 0.34
+                + enemy_pressure * 0.34
+                + dormant_pressure * 0.14
+                + size_pressure * 0.10
+                + role_bonus
+                + kind_bonus,
+                0.0,
+                1.0,
+            )
+            if metadata.is_safe_room:
+                planned_music_pressure *= 0.35
+            infos.append(
+                GeneratedRoomRuntimeInfo(
+                    room_index=metadata.room_index,
+                    x=room.x,
+                    y=room.y,
+                    width=room.width,
+                    height=room.height,
+                    room_kind=room.kind,
+                    role=metadata.role,
+                    encounter_weight=metadata.encounter_weight,
+                    planned_enemy_count=enemy_counts.get(metadata.room_index, 0),
+                    dormant_enemy_count=dormant_counts.get(metadata.room_index, 0),
+                    planned_music_pressure=planned_music_pressure,
+                    is_safe_room=metadata.is_safe_room,
+                )
+            )
+        return tuple(infos)
+
+    def _target_shell_budget(self, required_shells: float) -> float:
+        if self.difficulty_id == "easy":
+            return max(required_shells * 1.65, required_shells + EASY_AMMO_SURPLUS)
+        if self.difficulty_id == "hard":
+            return required_shells + HARD_AMMO_SURPLUS
+        return max(required_shells * 1.18, required_shells + MEDIUM_AMMO_SURPLUS)
+
+    def _expected_shell_drop_total(self, enemy_spawns: list[EnemySpawn]) -> float:
+        total = 0.0
+        for enemy in enemy_spawns:
+            for drop in ENEMY_DEFINITIONS[enemy.enemy_type].drops:
+                definition = get_pickup_definition(drop.kind)
+                if definition.effect.stat == "ammo":
+                    total += drop.amount * drop.chance
+        return total
+
+    def _required_shells_for_map(self, enemy_spawns: list[EnemySpawn]) -> float:
+        return sum(
+            math.ceil(ENEMY_DEFINITIONS[enemy.enemy_type].max_hp / REFERENCE_SHELL_DAMAGE)
+            for enemy in enemy_spawns
+        )
+
+    def _shell_loot_total(self, loot_spawns: list[LootSpawn]) -> float:
+        return sum(
+            loot.amount
+            for loot in loot_spawns
+            if get_pickup_definition(loot.kind).effect.stat == "ammo"
+        )
+
+    def _fallback_loot_kind_for_room(self, room_kind: str) -> str:
+        return {
+            "arena": "stimpack",
+            "cross": "stimpack",
+            "tech": "armor_bonus",
+            "storage": "armor_bonus",
+            "shrine": "medkit",
+            "start": "stimpack",
+        }.get(room_kind, "stimpack")
+
+    def _rebalance_ammo_loot(
+        self,
+        loot_spawns: list[LootSpawn],
+        rooms: list[Room],
+        enemy_spawns: list[EnemySpawn],
+    ) -> list[LootSpawn]:
+        if not loot_spawns or not enemy_spawns:
+            return loot_spawns
+
+        required_shells = self._required_shells_for_map(enemy_spawns)
+        expected_shell_drops = self._expected_shell_drop_total(enemy_spawns)
+        target_total_shells = self._target_shell_budget(required_shells)
+        target_placed_shells = max(0.0, target_total_shells - STARTING_SHELLS - expected_shell_drops)
+        current_placed_shells = self._shell_loot_total(loot_spawns)
+        delta = target_placed_shells - current_placed_shells
+        if abs(delta) < 0.5:
+            return loot_spawns
+
+        room_by_loot_index: dict[int, int] = {}
+        for index, loot in enumerate(loot_spawns):
+            room_by_loot_index[index] = self._room_index_for_position(rooms, loot.x, loot.y)
+
+        adjusted = list(loot_spawns)
+        shell_indices = [
+            index for index, loot in enumerate(adjusted)
+            if get_pickup_definition(loot.kind).effect.stat == "ammo"
+        ]
+
+        if delta > 0.0:
+            remaining = int(math.ceil(delta))
+            shell_indices.sort(
+                key=lambda index: (
+                    rooms[room_by_loot_index[index]].kind == "arena",
+                    rooms[room_by_loot_index[index]].kind == "cross",
+                    room_by_loot_index[index],
+                ),
+                reverse=True,
+            )
+            if shell_indices:
+                index = shell_indices[0]
+                loot = adjusted[index]
+                adjusted[index] = LootSpawn(loot.pickup_id, loot.x, loot.y, loot.kind, loot.amount + remaining)
+                return adjusted
+
+            candidate_indices = sorted(
+                range(len(adjusted)),
+                key=lambda index: (
+                    rooms[room_by_loot_index[index]].kind == "arena",
+                    rooms[room_by_loot_index[index]].kind == "cross",
+                    rooms[room_by_loot_index[index]].kind == "tech",
+                    room_by_loot_index[index],
+                ),
+                reverse=True,
+            )
+            if not candidate_indices:
+                return adjusted
+            index = candidate_indices[0]
+            loot = adjusted[index]
+            kind = "shell_box" if remaining >= 12 else "shells"
+            adjusted[index] = LootSpawn(loot.pickup_id, loot.x, loot.y, kind, remaining)
+            return adjusted
+
+        remaining = int(math.ceil(-delta))
+        shell_indices.sort(
+            key=lambda index: (
+                rooms[room_by_loot_index[index]].kind in {"start", "storage", "shrine"},
+                -room_by_loot_index[index],
+            ),
+            reverse=True,
+        )
+        for index in shell_indices:
+            loot = adjusted[index]
+            reduced_by = min(loot.amount, remaining)
+            new_amount = loot.amount - reduced_by
+            remaining -= reduced_by
+            if new_amount > 0:
+                adjusted[index] = LootSpawn(loot.pickup_id, loot.x, loot.y, loot.kind, new_amount)
+            else:
+                room_kind = rooms[room_by_loot_index[index]].kind
+                replacement_kind = self._fallback_loot_kind_for_room(room_kind)
+                adjusted[index] = LootSpawn(
+                    loot.pickup_id,
+                    loot.x,
+                    loot.y,
+                    replacement_kind,
+                    resolve_pickup_amount(replacement_kind),
+                )
+            if remaining <= 0:
+                break
+        return adjusted
 
     def _generate_once_for_template_variant(self, template_variant: str | None) -> GeneratedMap | None:
         tiles = [[1 for _ in range(self.width)] for _ in range(self.height)]
@@ -764,6 +999,7 @@ class MapGenerator:
             enemy_spawns,
             exit_spawn,
         )
+        loot_spawns = self._rebalance_ammo_loot(loot_spawns, rooms, enemy_spawns)
         self._enforce_door_choke_tiles(tiles, door_spawns)
         validation_report = self._build_validation_report(
             progression_valid=self._validate_progression_layout(
@@ -796,6 +1032,7 @@ class MapGenerator:
             layout.route_plan,
             self._key_occlusion_score(rooms, tiles, key_spawns),
         )
+        room_runtime_infos = self._build_room_runtime_infos(rooms, room_metadata, enemy_spawns)
 
         return self._build_generated_map(
             tiles=tiles,
@@ -813,6 +1050,7 @@ class MapGenerator:
             macro_layout_type=macro_layout_type,
             route_plan=layout.route_plan,
             room_metadata=room_metadata,
+            room_runtime_infos=room_runtime_infos,
             progression_beats=progression_beats,
             switch_spawns=switch_spawns,
             trigger_spawns=trigger_spawns,
@@ -994,6 +1232,7 @@ class MapGenerator:
             enemy_spawns,
             exit_spawn,
         )
+        loot_spawns = self._rebalance_ammo_loot(loot_spawns, rooms, enemy_spawns)
         validation_report = self._build_validation_report(
             progression_valid=self._validate_progression_layout(
                 tiles,
@@ -1025,6 +1264,7 @@ class MapGenerator:
             route_plan,
             self._key_occlusion_score(rooms, tiles, key_spawns),
         )
+        room_runtime_infos = self._build_room_runtime_infos(rooms, room_metadata, enemy_spawns)
 
         return self._build_generated_map(
             tiles=tiles,
@@ -1042,6 +1282,7 @@ class MapGenerator:
             macro_layout_type=macro_layout_type,
             route_plan=route_plan,
             room_metadata=room_metadata,
+            room_runtime_infos=room_runtime_infos,
             progression_beats=progression_beats,
             switch_spawns=switch_spawns,
             trigger_spawns=trigger_spawns,
@@ -3784,12 +4025,16 @@ class MapGenerator:
         if self.difficulty_id == "easy":
             upgrades = {
                 "stimpack": "medkit",
+                "shells": "shell_box",
+                "bullets": "bullet_box",
             }
             return upgrades.get(loot_kind, loot_kind)
         if self.difficulty_id == "hard":
             downgrades = {
                 "medkit": "stimpack",
                 "green_armor": "armor_bonus",
+                "shell_box": "shells",
+                "bullet_box": "bullets",
             }
             return downgrades.get(loot_kind, loot_kind)
         return loot_kind

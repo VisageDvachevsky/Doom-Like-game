@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import multiprocessing
+import os
+import pickle
 import random
 from pathlib import Path
+import tempfile
+import traceback
 import pygame
 
 from doomgame import settings
@@ -11,7 +16,7 @@ from doomgame.audio import DoomAudio
 from doomgame.debug_log import append_debug_log, clear_debug_log
 from doomgame.doors import KEY_DEFINITIONS, KEY_TYPES
 from doomgame.loot import get_pickup_definition
-from doomgame.mapgen import MapGenerator
+from doomgame.mapgen import GeneratedMap, MapGenerator
 from doomgame.music import DoomMusicPlayer, MusicSnapshot
 from doomgame.player import Player
 from doomgame.progression import (
@@ -55,7 +60,64 @@ class WeaponDefinition:
     spread: float = 0.0
 
 
+@dataclass
+class PendingLevelLoad:
+    request_id: int
+    level_index: int
+    preserve_player_state: bool
+    show_intermission: bool
+    generation_request: LevelGenerationRequest
+    difficulty_id: str
+    runtime_pressure_bias: float
+    loading_label: str
+    started_at: float
+    process: multiprocessing.Process | None = None
+    result_path: str = ""
+
+
+def _generate_map_payload(
+    generation_request: LevelGenerationRequest,
+    difficulty_id: str,
+    runtime_pressure_bias: float,
+) -> GeneratedMap:
+    generator = MapGenerator(
+        difficulty_id=difficulty_id,
+        runtime_pressure_bias=runtime_pressure_bias,
+        generation_request=generation_request,
+    )
+    return generator.generate()
+
+
+def _run_level_generation_process(
+    result_path: str,
+    generation_request: LevelGenerationRequest,
+    difficulty_id: str,
+    runtime_pressure_bias: float,
+) -> None:
+    try:
+        generated = _generate_map_payload(generation_request, difficulty_id, runtime_pressure_bias)
+        with open(result_path, "wb") as result_file:
+            pickle.dump(("ok", generated), result_file, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        with open(result_path, "wb") as result_file:
+            pickle.dump(("error", traceback.format_exc()), result_file, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 WEAPON_DEFINITIONS: dict[str, WeaponDefinition] = {
+    "pistol": WeaponDefinition(
+        weapon_id="pistol",
+        slot=2,
+        ammo_pool="BULL",
+        ammo_per_shot=1,
+        damage=10,
+        cooldown=0.22,
+        anim_frames=[1, 2, 2, 3, 0],
+        recoil=0.42,
+        automatic=False,
+        audio_key="pistol_fire",
+        pickup_name="PISTOL",
+        spread=0.01,
+    ),
     "shotgun": WeaponDefinition(
         weapon_id="shotgun",
         slot=3,
@@ -69,9 +131,23 @@ WEAPON_DEFINITIONS: dict[str, WeaponDefinition] = {
         audio_key="shotgun_fire",
         pickup_name="SHOTGUN",
     ),
+    "sawedoff": WeaponDefinition(
+        weapon_id="sawedoff",
+        slot=4,
+        ammo_pool="SHEL",
+        ammo_per_shot=1,
+        damage=65,
+        cooldown=1.42,
+        anim_frames=[1, 2, 2, 3, 0],
+        recoil=0.92,
+        automatic=False,
+        audio_key="sawedoff_fire",
+        pickup_name="SAWED-OFF",
+        spread=0.014,
+    ),
     "chaingun": WeaponDefinition(
         weapon_id="chaingun",
-        slot=4,
+        slot=5,
         ammo_pool="BULL",
         ammo_per_shot=1,
         damage=11,
@@ -141,13 +217,13 @@ class DoomGame:
         self.run_state: RunState | None = None
         self.sequence_director = CampaignSequenceDirector()
         self.ammo_pools = {
-            "BULL": 0,
+            "BULL": 60,
             "SHEL": self.ammo,
             "RCKT": 0,
             "CELL": 0,
         }
-        self.owned_weapons = {"shotgun"}
-        self.current_weapon_id = "shotgun"
+        self.owned_weapons = {"pistol", "shotgun", "sawedoff"}
+        self.current_weapon_id = "pistol"
         self.level_start_snapshot = {
             "health": self.health,
             "armor": self.armor,
@@ -181,6 +257,10 @@ class DoomGame:
         self.dev_start_level = dev_start_level
         self.dev_immortal = dev_immortal
         self.dev_auto_difficulty = dev_auto_difficulty
+        self.pending_dev_level_index: int | None = None
+        self.level_load_request_id = 0
+        self.pending_level_load: PendingLevelLoad | None = None
+        self._process_context = multiprocessing.get_context("spawn")
 
         self.world: World | None = None
         self.player: Player | None = None
@@ -205,12 +285,24 @@ class DoomGame:
         self,
         seed: int | None = None,
         generation_request: LevelGenerationRequest | None = None,
+        runtime_pressure_bias: float | None = None,
+        difficulty_id: str | None = None,
     ) -> World:
+        if generation_request is not None:
+            generated = _generate_map_payload(
+                generation_request,
+                difficulty_id or self.difficulty_id,
+                self._enemy_difficulty_rating() if runtime_pressure_bias is None else runtime_pressure_bias,
+            )
+            return World.from_generated_map(generated)
         generator = MapGenerator(
             seed=seed,
-            difficulty_id=self.difficulty_id,
-            runtime_pressure_bias=self._enemy_difficulty_rating(),
-            generation_request=generation_request,
+            difficulty_id=difficulty_id or self.difficulty_id,
+            runtime_pressure_bias=(
+                self._enemy_difficulty_rating()
+                if runtime_pressure_bias is None
+                else runtime_pressure_bias
+            ),
         )
         return World.from_generated_map(generator.generate())
 
@@ -224,18 +316,17 @@ class DoomGame:
         self.armor = 50
         self.ammo = 32
         self.ammo_pools = {
-            "BULL": 0,
+            "BULL": 60,
             "SHEL": self.ammo,
             "RCKT": 0,
             "CELL": 0,
         }
-        self.owned_weapons = {"shotgun"}
-        self.current_weapon_id = "shotgun"
+        self.owned_weapons = {"pistol", "shotgun"}
+        self.current_weapon_id = "pistol"
         self._sync_selected_weapon_slot()
         resolved_run_seed = run_seed if run_seed is not None else random.randrange(1, 999_999)
         self.run_state = self.sequence_director.build_run_state(difficulty_id, resolved_run_seed)
         self.load_campaign_level(1, preserve_player_state=False, show_intermission=False)
-        self._apply_dev_loadout()
 
     def load_campaign_level(
         self,
@@ -250,31 +341,74 @@ class DoomGame:
             self.armor = 50
             self.ammo = 32
             self.ammo_pools = {
-                "BULL": 0,
+                "BULL": 60,
                 "SHEL": self.ammo,
                 "RCKT": 0,
                 "CELL": 0,
             }
-            self.owned_weapons = {"shotgun"}
-            self.current_weapon_id = "shotgun"
+            self.owned_weapons = {"pistol", "shotgun", "sawedoff"}
+            self.current_weapon_id = "pistol"
             self._sync_selected_weapon_slot()
 
         generation_request = self.sequence_director.build_generation_request(self.run_state, level_index)
         clear_debug_log()
-        self.world = self._generate_world(generation_request=generation_request)
+        self.level_load_request_id += 1
+        loading_label = (
+            "INITIALIZING NEW RUN"
+            if level_index == 1 and not preserve_player_state
+            else f"GENERATING LEVEL {level_index}"
+        )
+        task = PendingLevelLoad(
+            request_id=self.level_load_request_id,
+            level_index=level_index,
+            preserve_player_state=preserve_player_state,
+            show_intermission=show_intermission,
+            generation_request=generation_request,
+            difficulty_id=self.difficulty_id,
+            runtime_pressure_bias=self._enemy_difficulty_rating(),
+            loading_label=loading_label,
+            started_at=self.time_seconds,
+        )
+        result_file = tempfile.NamedTemporaryFile(
+            prefix=f"doom-level-{task.request_id:04d}-",
+            suffix=".bin",
+            delete=False,
+        )
+        result_file.close()
+        task.result_path = result_file.name
+        process = self._process_context.Process(
+            target=_run_level_generation_process,
+            args=(
+                task.result_path,
+                task.generation_request,
+                task.difficulty_id,
+                task.runtime_pressure_bias,
+            ),
+            name=f"level-load-{task.request_id}",
+            daemon=True,
+        )
+        task.process = process
+        self.pending_level_load = task
+        self._draw_loading_screen()
+        pygame.display.flip()
+        pygame.event.pump()
+        process.start()
+
+    def _finalize_level_load(self, task: PendingLevelLoad, generated_map: GeneratedMap) -> None:
+        self.world = World.from_generated_map(generated_map)
         self.raycaster.set_world(self.world)
         spawn_z = self.world.get_floor_height(*self.world.spawn)
         self.player = Player(*self.world.spawn, angle=math.radians(15), z=float(spawn_z))
-        self.run_state.current_level_index = level_index
-        self.run_state.current_level_seed = generation_request.per_level_seed
+        self.run_state.current_level_index = task.level_index
+        self.run_state.current_level_seed = task.generation_request.per_level_seed
         self.keys_owned.clear()
         self.pickup_message = ""
         self.pickup_message_timer = 0.0
         self.pickup_flash_timer = 0.0
         self.level_complete_timer = 0.0
-        self.intermission_timer = 1.6 if show_intermission else 0.0
+        self.intermission_timer = 1.6 if task.show_intermission else 0.0
         self.intermission_data = {
-            "level_index": level_index,
+            "level_index": task.level_index,
             "total_level_count": self.run_state.total_level_count,
             "title": self.world.level_title,
             "subtitle": self.world.level_subtitle,
@@ -309,6 +443,60 @@ class DoomGame:
         )
         self._apply_dev_loadout()
 
+    def _cancel_pending_level_load(self) -> None:
+        task = self.pending_level_load
+        self.pending_level_load = None
+        if task is None:
+            return
+        if task.process is not None and task.process.is_alive():
+            task.process.terminate()
+            task.process.join(timeout=0.2)
+        if task.result_path:
+            try:
+                os.remove(task.result_path)
+            except FileNotFoundError:
+                pass
+
+    def _finish_pending_level_load(self) -> None:
+        task = self.pending_level_load
+        if task is None or task.process is None:
+            return
+        if task.process.is_alive():
+            return
+        task.process.join(timeout=0.2)
+        if not task.result_path or not os.path.exists(task.result_path):
+            status, payload = "error", "Level generation process exited without producing a result file."
+        else:
+            with open(task.result_path, "rb") as result_file:
+                status, payload = pickle.load(result_file)
+            try:
+                os.remove(task.result_path)
+            except FileNotFoundError:
+                pass
+        self.pending_level_load = None
+        if status != "ok":
+            self.awaiting_difficulty_selection = True
+            self.run_state = None
+            self.world = None
+            self.player = None
+            self.campaign_complete = False
+            self._set_mouse_capture(False)
+            append_debug_log(f"campaign-level-load-failed\n{payload}")
+            self._show_message("LEVEL GENERATION FAILED", (255, 112, 96))
+            return
+        self._finalize_level_load(task, payload)
+        if self.pending_dev_level_index is not None and self.run_state is not None:
+            target_level = self.pending_dev_level_index
+            if task.level_index != target_level:
+                self.pending_dev_level_index = None
+                self.load_campaign_level(
+                    target_level,
+                    preserve_player_state=True,
+                    show_intermission=False,
+                )
+                return
+            self.pending_dev_level_index = None
+
     def advance_to_next_level(self) -> None:
         if self.run_state is None or self.world is None:
             return
@@ -333,7 +521,7 @@ class DoomGame:
         self.owned_weapons = set(self.level_start_snapshot.get("owned_weapons", {"shotgun"}))
         self.current_weapon_id = str(self.level_start_snapshot.get("current_weapon_id", "shotgun"))
         if self.current_weapon_id not in self.owned_weapons:
-            self.current_weapon_id = "shotgun"
+            self.current_weapon_id = "pistol" if "pistol" in self.owned_weapons else "shotgun"
         self._sync_selected_weapon_slot()
         self.load_campaign_level(
             self.run_state.current_level_index,
@@ -442,7 +630,7 @@ class DoomGame:
             "RCKT": 99,
             "CELL": 300,
         }
-        self.owned_weapons = {"shotgun", "chaingun"}
+        self.owned_weapons = {"pistol", "shotgun", "sawedoff", "chaingun"}
         self.current_weapon_id = "chaingun"
         self._sync_selected_weapon_slot()
         self.level_start_snapshot = {
@@ -462,16 +650,12 @@ class DoomGame:
         )
         self.start_run(difficulty_id)
         if self.dev_start_level is not None and self.dev_start_level > 1:
-            target_level = min(
+            self.pending_dev_level_index = min(
                 max(1, self.dev_start_level),
                 self.run_state.total_level_count if self.run_state is not None else self.dev_start_level,
             )
-            self.load_campaign_level(
-                target_level,
-                preserve_player_state=True,
-                show_intermission=False,
-            )
-        self._apply_dev_loadout()
+        else:
+            self.pending_dev_level_index = None
         self._show_message("DEV MODE - LEVEL 5 IMMORTAL", (132, 236, 255))
 
     def _draw_difficulty_menu(self) -> None:
@@ -509,6 +693,20 @@ class DoomGame:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+            elif self.pending_level_load is not None:
+                if event.type != pygame.KEYDOWN:
+                    continue
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+                elif event.key == pygame.K_F2:
+                    self.awaiting_difficulty_selection = True
+                    self.campaign_complete = False
+                    self.run_state = None
+                    self.world = None
+                    self.player = None
+                    self.pending_dev_level_index = None
+                    self._cancel_pending_level_load()
+                    self._set_mouse_capture(False)
             elif self.awaiting_difficulty_selection:
                 if event.type != pygame.KEYDOWN:
                     continue
@@ -546,10 +744,14 @@ class DoomGame:
                     self._try_use_door()
                 elif event.key == pygame.K_SPACE and self.mouse_captured:
                     self.player.jump(self.world)
+                elif event.key in (pygame.K_2, pygame.K_KP2):
+                    self._select_weapon_by_slot(2)
                 elif event.key in (pygame.K_3, pygame.K_KP3):
                     self._select_weapon_by_slot(3)
                 elif event.key in (pygame.K_4, pygame.K_KP4):
                     self._select_weapon_by_slot(4)
+                elif event.key in (pygame.K_5, pygame.K_KP5):
+                    self._select_weapon_by_slot(5)
                 elif event.key == pygame.K_TAB:
                     self.show_minimap = not self.show_minimap
             elif event.type == pygame.WINDOWFOCUSGAINED:
@@ -567,6 +769,10 @@ class DoomGame:
 
     def _update(self, delta_time: float) -> None:
         self._decay_music_impulses(delta_time)
+        self._finish_pending_level_load()
+        if self.pending_level_load is not None:
+            self.music.update(MusicSnapshot(), delta_time)
+            return
         if self.awaiting_difficulty_selection or self.world is None or self.player is None:
             self.music.update(MusicSnapshot(), delta_time)
             return
@@ -624,6 +830,10 @@ class DoomGame:
         self.music.update(self._build_music_snapshot(), delta_time)
 
     def _render(self) -> None:
+        if self.pending_level_load is not None:
+            self._draw_loading_screen()
+            pygame.display.flip()
+            return
         if self.awaiting_difficulty_selection or self.world is None or self.player is None:
             self._draw_difficulty_menu()
             pygame.display.flip()
@@ -658,6 +868,52 @@ class DoomGame:
         if self.campaign_complete:
             self._draw_campaign_complete_overlay()
         pygame.display.flip()
+
+    def _draw_loading_screen(self) -> None:
+        task = self.pending_level_load
+        self.screen.fill((8, 6, 10))
+        overlay = pygame.Surface((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((20, 10, 10, 186))
+        self.screen.blit(overlay, (0, 0))
+
+        panel = pygame.Rect(
+            settings.SCREEN_WIDTH // 2 - 280,
+            settings.SCREEN_HEIGHT // 2 - 120,
+            560,
+            240,
+        )
+        pygame.draw.rect(self.screen, (28, 16, 16), panel, border_radius=8)
+        pygame.draw.rect(self.screen, (166, 124, 84), panel, 3, border_radius=8)
+
+        title = self.title_font.render("PROCEDURAL GENERATION", True, (248, 226, 172))
+        subtitle = self.font.render("Building level layout. Please wait...", True, (214, 194, 154))
+        self.screen.blit(title, title.get_rect(center=(panel.centerx, panel.y + 54)))
+        self.screen.blit(subtitle, subtitle.get_rect(center=(panel.centerx, panel.y + 96)))
+
+        if task is not None:
+            level_line = self.font.render(task.loading_label, True, (236, 208, 152))
+            meta = self.small_font.render(
+                f"Difficulty {task.difficulty_id.upper()}  |  level {task.level_index}  |  seed {task.generation_request.per_level_seed}",
+                True,
+                (188, 170, 136),
+            )
+            elapsed = max(0.0, self.time_seconds - task.started_at)
+            elapsed_line = self.small_font.render(
+                f"Elapsed {elapsed:0.1f}s",
+                True,
+                (188, 170, 136),
+            )
+            self.screen.blit(level_line, level_line.get_rect(center=(panel.centerx, panel.y + 138)))
+            self.screen.blit(meta, meta.get_rect(center=(panel.centerx, panel.y + 174)))
+            self.screen.blit(elapsed_line, elapsed_line.get_rect(center=(panel.centerx, panel.y + 198)))
+
+        pulse = 0.5 + 0.5 * math.sin(self.time_seconds * 4.0)
+        bar_rect = pygame.Rect(panel.x + 74, panel.bottom - 42, panel.width - 148, 14)
+        pygame.draw.rect(self.screen, (42, 28, 24), bar_rect, border_radius=5)
+        pygame.draw.rect(self.screen, (122, 96, 72), bar_rect, 2, border_radius=5)
+        fill_width = max(28, int((bar_rect.width - 4) * (0.18 + pulse * 0.64)))
+        fill_rect = pygame.Rect(bar_rect.x + 2, bar_rect.y + 2, fill_width, bar_rect.height - 4)
+        pygame.draw.rect(self.screen, (198, 78, 58), fill_rect, border_radius=4)
 
     def _draw_minimap(self) -> None:
         scale = settings.MINIMAP_SCALE
@@ -760,10 +1016,14 @@ class DoomGame:
         self.shot_anim_time = 0.0
         self.shot_anim_frames = list(weapon.anim_frames)
         self.shot_anim_index = 0
-        self.muzzle_flash = 1.0 if weapon.weapon_id == "shotgun" else 0.82
+        self.muzzle_flash = 1.0 if weapon.weapon_id in {"shotgun", "sawedoff"} else 0.82
         self.weapon_recoil = weapon.recoil
-        self._bump_music_impulse("music_recent_shots", 0.42 if weapon.weapon_id == "shotgun" else 0.26)
-        if weapon.audio_key == "chaingun_fire":
+        self._bump_music_impulse("music_recent_shots", 0.42 if weapon.weapon_id in {"shotgun", "sawedoff"} else 0.26)
+        if weapon.audio_key == "pistol_fire":
+            self.audio.play_pistol_fire()
+        elif weapon.audio_key == "sawedoff_fire":
+            self.audio.play_sawedoff_fire()
+        elif weapon.audio_key == "chaingun_fire":
             self.audio.play_chaingun_fire()
         else:
             self.audio.play_shotgun_fire()
@@ -790,7 +1050,7 @@ class DoomGame:
                 self.shot_anim_time = 0.0
 
         self.muzzle_flash = max(0.0, self.muzzle_flash - delta_time * settings.SHOT_FLASH_DECAY)
-        recoil_decay = 4.2 if weapon.weapon_id == "shotgun" else 5.4
+        recoil_decay = 4.2 if weapon.weapon_id in {"shotgun", "sawedoff"} else 5.4
         self.weapon_recoil = max(0.0, self.weapon_recoil - delta_time * recoil_decay)
 
     def _fire_hitscan(self, weapon: WeaponDefinition) -> None:
@@ -799,6 +1059,13 @@ class DoomGame:
             shot_angle += random.uniform(-weapon.spread, weapon.spread)
         ray_x = math.cos(shot_angle)
         ray_y = math.sin(shot_angle)
+        self.world.register_player_shot(
+            self.player.x,
+            self.player.y,
+            ray_x,
+            ray_y,
+            settings.MAX_RAY_DISTANCE,
+        )
         impact = self.world.resolve_hitscan(self.player.x, self.player.y, ray_x, ray_y, damage=weapon.damage)
         if impact.enemy is None:
             return
@@ -936,6 +1203,16 @@ class DoomGame:
         self._reset_weapon_state()
 
     def _apply_loot(self, kind: str, amount: int) -> str | None:
+        if kind == "pistol":
+            gained_weapon = "pistol" not in self.owned_weapons
+            if gained_weapon:
+                self.owned_weapons.add("pistol")
+            bullets_before = self.ammo_pools["BULL"]
+            self.ammo_pools["BULL"] = min(settings.MAX_BULLETS, bullets_before + amount)
+            if not gained_weapon and self.ammo_pools["BULL"] == bullets_before:
+                return None
+            self._switch_weapon("pistol")
+            return "FOUND THE PISTOL" if gained_weapon else f"PISTOL AMMO +{self.ammo_pools['BULL'] - bullets_before}"
         if kind == "chaingun":
             gained_weapon = "chaingun" not in self.owned_weapons
             if gained_weapon:
@@ -946,6 +1223,17 @@ class DoomGame:
                 return None
             self._switch_weapon("chaingun")
             return "FOUND THE CHAINGUN" if gained_weapon else f"CHAINGUN AMMO +{self.ammo_pools['BULL'] - bullets_before}"
+        if kind == "sawedoff":
+            gained_weapon = "sawedoff" not in self.owned_weapons
+            if gained_weapon:
+                self.owned_weapons.add("sawedoff")
+            shells_before = self.ammo_pools["SHEL"]
+            self.ammo_pools["SHEL"] = min(settings.MAX_SHELLS, shells_before + amount)
+            self.ammo = self.ammo_pools["SHEL"]
+            if not gained_weapon and self.ammo_pools["SHEL"] == shells_before:
+                return None
+            self._switch_weapon("sawedoff")
+            return "FOUND THE SAWED-OFF" if gained_weapon else f"SAWED-OFF AMMO +{self.ammo_pools['SHEL'] - shells_before}"
         definition = get_pickup_definition(kind)
         current_value = self._get_pickup_stat(definition.effect.stat)
         result = definition.effect.apply(current_value, amount)
@@ -1062,6 +1350,10 @@ class DoomGame:
         if self.world is None or self.player is None:
             return MusicSnapshot()
         live_enemies = self.world.active_enemies(include_corpses=False)
+        _, planned_room_pressure, room_enemy_count, room_dormant_enemy_count = self.world.room_music_state(
+            self.player.x,
+            self.player.y,
+        )
         nearby_enemies = 0
         attacking_enemies = 0
         active_threat = 0.0
@@ -1101,6 +1393,9 @@ class DoomGame:
             recent_event=self.music_recent_event,
             boss_nearby_threat=boss_nearby_threat,
             player_health_ratio=max(0.0, min(1.0, self.health / max(1, settings.MAX_HEALTH))),
+            planned_room_pressure=planned_room_pressure,
+            room_enemy_count=room_enemy_count,
+            room_dormant_enemy_count=room_dormant_enemy_count,
         )
 
     def _enemy_music_threat(self, enemy_type: str) -> float:

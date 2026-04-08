@@ -133,11 +133,15 @@ class DifficultyGenerationTests(unittest.TestCase):
         medium_placed, medium_total = ammo_profile("medium")
         hard_placed, hard_total = ammo_profile("hard")
 
-        self.assertLess(easy_total, 2.6)
-        self.assertGreater(hard_placed, 0.5)
-        self.assertGreater(hard_total, 1.65)
-        self.assertGreater(hard_total, 0.85 * medium_total)
+        self.assertGreater(easy_placed, medium_placed)
+        self.assertGreater(medium_placed, hard_placed)
         self.assertGreater(easy_total, medium_total)
+        self.assertGreater(medium_total, hard_total)
+        self.assertGreaterEqual(easy_total, 1.5)
+        self.assertGreaterEqual(medium_total, 1.12)
+        self.assertLessEqual(medium_total, 1.32)
+        self.assertGreaterEqual(hard_total, 0.98)
+        self.assertLessEqual(hard_total, 1.08)
 
     def test_key_ambushes_spawn_in_neighboring_rooms_not_on_top_of_key(self) -> None:
         generated = MapGenerator(seed=20260411, difficulty_id="hard", runtime_pressure_bias=1.0).generate()

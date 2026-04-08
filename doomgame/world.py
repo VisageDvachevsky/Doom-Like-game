@@ -9,7 +9,7 @@ from doomgame.enemies import EnemyProjectile, EnemySpawn, WorldEnemy, build_enem
 from doomgame import settings
 from doomgame.doors import DoorSpawn, KeyPickup, KeySpawn, WorldDoor
 from doomgame.loot import PickupDefinition, get_pickup_definition
-from doomgame.mapgen import GeneratedMap
+from doomgame.mapgen import GeneratedMap, GeneratedRoomRuntimeInfo
 from doomgame.progression import (
     ACTION_ACTIVATE_EXIT_ROUTE,
     ACTION_ACTIVATE_SECRET,
@@ -136,6 +136,7 @@ class World:
     macro_layout_type: str
     macro_signature: str
     room_metadata: tuple[RoomMetadata, ...]
+    room_runtime_infos: tuple[GeneratedRoomRuntimeInfo, ...]
     switches: list[WorldSwitch]
     triggers: list[WorldTrigger]
     secrets: list[WorldSecret]
@@ -146,6 +147,10 @@ class World:
     noise_position: tuple[float, float] | None = None
     noise_radius: float = 0.0
     noise_timer: float = 0.0
+    player_shot_origin: tuple[float, float] | None = None
+    player_shot_dir: tuple[float, float] | None = None
+    player_shot_timer: float = 0.0
+    player_shot_range: float = 0.0
     activated_events: set[str] = None
     activated_triggers: set[str] = None
     player_hazard_exposure: float = 0.0
@@ -180,6 +185,7 @@ class World:
             macro_layout_type=generated.macro_layout_type,
             macro_signature=generated.macro_signature,
             room_metadata=generated.room_metadata,
+            room_runtime_infos=generated.room_runtime_infos,
             switches=[cls._switch_from_generated(entry) for entry in generated.switch_spawns],
             triggers=[cls._trigger_from_generated(entry) for entry in generated.trigger_spawns],
             secrets=[cls._secret_from_generated(entry) for entry in generated.secret_spawns],
@@ -310,6 +316,11 @@ class World:
         if self.noise_timer <= 0.0:
             self.noise_position = None
             self.noise_radius = 0.0
+        self.player_shot_timer = max(0.0, self.player_shot_timer - delta_time)
+        if self.player_shot_timer <= 0.0:
+            self.player_shot_origin = None
+            self.player_shot_dir = None
+            self.player_shot_range = 0.0
         if player is None or damage_player is None or audio is None:
             return
         self._process_proximity_triggers(player, audio)
@@ -428,6 +439,34 @@ class World:
 
     def active_enemy_projectiles(self) -> list[EnemyProjectile]:
         return [projectile for projectile in self.enemy_projectiles if not projectile.removed]
+
+    def room_info_for_position(self, x: float, y: float) -> GeneratedRoomRuntimeInfo | None:
+        if not self.room_runtime_infos:
+            return None
+        grid_x = int(x)
+        grid_y = int(y)
+        containing = [info for info in self.room_runtime_infos if info.contains_tile(grid_x, grid_y)]
+        if containing:
+            return min(containing, key=lambda info: info.width * info.height)
+        return min(
+            self.room_runtime_infos,
+            key=lambda info: math.hypot(info.center[0] - x, info.center[1] - y),
+        )
+
+    def room_music_state(
+        self,
+        x: float,
+        y: float,
+    ) -> tuple[GeneratedRoomRuntimeInfo | None, float, int, int]:
+        room_info = self.room_info_for_position(x, y)
+        if room_info is None:
+            return None, 0.0, 0, 0
+        return (
+            room_info,
+            room_info.planned_music_pressure,
+            room_info.planned_enemy_count,
+            room_info.dormant_enemy_count,
+        )
 
     def active_switches(self) -> list[WorldSwitch]:
         return [switch for switch in self.switches if not switch.activated]
@@ -588,7 +627,78 @@ class World:
     def enemy_can_hear_player(self, enemy: WorldEnemy, player_distance: float) -> bool:
         if self.noise_position is None or self.noise_timer <= 0.0:
             return False
-        return player_distance <= self.noise_radius
+        noise_distance = math.hypot(enemy.x - self.noise_position[0], enemy.y - self.noise_position[1])
+        return min(player_distance, noise_distance) <= self.noise_radius
+
+    def register_player_shot(
+        self,
+        origin_x: float,
+        origin_y: float,
+        dir_x: float,
+        dir_y: float,
+        max_distance: float,
+    ) -> None:
+        self.player_shot_origin = (origin_x, origin_y)
+        self.player_shot_dir = (dir_x, dir_y)
+        self.player_shot_range = max_distance
+        self.player_shot_timer = settings.ENEMY_SHOT_REACTION_TIME
+
+    def was_enemy_threatened_by_player_shot(self, enemy: WorldEnemy) -> bool:
+        if (
+            self.player_shot_timer <= 0.0
+            or self.player_shot_origin is None
+            or self.player_shot_dir is None
+            or enemy.dead
+            or enemy.removed
+        ):
+            return False
+        origin_x, origin_y = self.player_shot_origin
+        dir_x, dir_y = self.player_shot_dir
+        offset_x = enemy.x - origin_x
+        offset_y = enemy.y - origin_y
+        projected = offset_x * dir_x + offset_y * dir_y
+        if projected <= 0.0 or projected > min(self.player_shot_range, settings.ENEMY_SHOT_THREAT_DISTANCE):
+            return False
+        closest_x = origin_x + dir_x * projected
+        closest_y = origin_y + dir_y * projected
+        lateral = math.hypot(enemy.x - closest_x, enemy.y - closest_y)
+        if lateral > enemy.radius + settings.ENEMY_SHOT_THREAT_PADDING:
+            return False
+        return self.has_line_of_sight(origin_x, origin_y, enemy.x, enemy.y)
+
+    def get_enemy_local_support(self, source_enemy: WorldEnemy, radius: float = settings.ENEMY_SUPPORT_RADIUS) -> int:
+        count = 0
+        for enemy in self.enemies:
+            if enemy.enemy_id == source_enemy.enemy_id or enemy.dead or enemy.removed or not enemy.active:
+                continue
+            if math.hypot(enemy.x - source_enemy.x, enemy.y - source_enemy.y) <= radius:
+                count += 1
+        return count
+
+    def propagate_enemy_alert(
+        self,
+        source_enemy: WorldEnemy,
+        target_x: float,
+        target_y: float,
+        radius: float,
+    ) -> None:
+        for enemy in self.enemies:
+            if enemy.enemy_id == source_enemy.enemy_id or enemy.removed or enemy.dead:
+                continue
+            if not enemy.active:
+                continue
+            if math.hypot(enemy.x - source_enemy.x, enemy.y - source_enemy.y) > radius:
+                continue
+            enemy.has_alerted = True
+            enemy.memory_timer = max(enemy.memory_timer, enemy.definition.memory_time * 0.72)
+            enemy.last_seen_x = target_x
+            enemy.last_seen_y = target_y
+            enemy.target_x = target_x
+            enemy.target_y = target_y
+            if enemy.ai_state in {"idle", "wander"}:
+                enemy.ai_state = "alert"
+                enemy.state_timer = max(enemy.state_timer, enemy.definition.reaction_time * 0.8)
+                enemy.animation_timer = 0.0
 
     def add_loot_drop(self, kind: str, amount: int, x: float, y: float) -> None:
         pickup_id = f"drop-{self.seed}-{len(self.loot):03d}"
