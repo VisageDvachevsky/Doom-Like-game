@@ -823,8 +823,18 @@ class World:
         if door.state in {"opening", "open"}:
             return door, None, False
         if door.guard_enemy_id is not None and not self.is_enemy_defeated(door.guard_enemy_id):
+            guard_name = "BOSS"
+            for enemy in self.enemies:
+                if enemy.enemy_id == door.guard_enemy_id:
+                    if enemy.enemy_type == "cyberdemon":
+                        guard_name = "CYBERDEMON"
+                    elif enemy.enemy_type == "warden":
+                        guard_name = "WARDEN"
+                    else:
+                        guard_name = enemy.definition.display_name.upper()
+                    break
             door.state = "locked"
-            return door, "FINAL DOOR LOCKED - WARDEN ALIVE", False
+            return door, f"FINAL DOOR LOCKED - {guard_name} ALIVE", False
         if door.required_trigger_id is not None and not door.trigger_unlocked:
             door.state = "locked"
             return door, door.locked_message or "ACCESS ROUTE LOCKED", False

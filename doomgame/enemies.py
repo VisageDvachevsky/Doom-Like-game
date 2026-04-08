@@ -114,7 +114,7 @@ class EnemyProjectile:
         self.animation_timer += delta_time
         self.ttl -= delta_time
         if self.ttl <= 0.0:
-            self.removed = True
+            self._explode(player, damage_player, audio)
             return
 
         step = max(0.02, self.speed * delta_time / 3.0)
@@ -125,13 +125,32 @@ class EnemyProjectile:
             self.x += self.dir_x * segment
             self.y += self.dir_y * segment
             if world.is_blocked_circle(self.x, self.y, max(self.radius, settings.ENEMY_PROJECTILE_WALL_RADIUS)):
-                self.removed = True
+                self._explode(player, damage_player, audio)
                 return
             if math.hypot(self.x - player.x, self.y - player.y) <= self.radius + settings.ENEMY_PROJECTILE_PLAYER_HIT_RADIUS:
-                damage_player(self.damage, self.owner_type)
-                audio.play_enemy_attack_hit(self.owner_type)
-                self.removed = True
+                self._explode(player, damage_player, audio, direct_hit=True)
                 return
+
+    def _explosion_profile(self) -> tuple[float, int]:
+        if self.owner_type == "cyberdemon":
+            return (1.15, self.damage + 10)
+        return (0.0, self.damage)
+
+    def _explode(self, player: "Player", damage_player, audio, direct_hit: bool = False) -> None:
+        splash_radius, max_damage = self._explosion_profile()
+        if direct_hit:
+            damage_player(max_damage, self.owner_type)
+            audio.play_enemy_attack_hit(self.owner_type)
+            self.removed = True
+            return
+        if splash_radius > 0.0:
+            distance = math.hypot(self.x - player.x, self.y - player.y)
+            if distance <= splash_radius:
+                falloff = 1.0 - min(1.0, distance / splash_radius)
+                splash_damage = max(8, int(max_damage * (0.42 + falloff * 0.58)))
+                damage_player(splash_damage, self.owner_type)
+        audio.play_enemy_attack_hit(self.owner_type)
+        self.removed = True
 
 
 @dataclass
@@ -173,6 +192,7 @@ class WorldEnemy:
     cached_los: bool = False
     recent_hit_flash: float = 0.0
     sprite_phase: float = 0.0
+    step_sound_timer: float = 0.0
 
     def __post_init__(self) -> None:
         self.origin_x = self.x
@@ -238,7 +258,7 @@ class WorldEnemy:
             return result
 
         self.hp = max(0, self.hp - amount)
-        self.recent_hit_flash = 0.22
+        self.recent_hit_flash = max(0.32, self.definition.pain_time + 0.12)
         self.has_alerted = True
         self.memory_timer = max(self.memory_timer, self.definition.memory_time)
         self.last_seen_x = self.x
@@ -307,6 +327,7 @@ class WorldEnemy:
         self.think_timer = max(0.0, self.think_timer - delta_time)
         self.memory_timer = max(0.0, self.memory_timer - delta_time)
         self.wander_timer = max(0.0, self.wander_timer - delta_time)
+        self.step_sound_timer = max(0.0, self.step_sound_timer - delta_time)
 
         player_dx = player.x - self.x
         player_dy = player.y - self.y
@@ -370,18 +391,26 @@ class WorldEnemy:
 
         if self.memory_timer > 0.0:
             self.ai_state = "chase"
-            self._move_towards(world, player, self.target_x, self.target_y, delta_time, rng)
+            if self._should_kite_player(player_distance, can_see_player):
+                self._move_away_from(world, player, player.x, player.y, delta_time, rng, audio, speed_scale=0.82)
+            else:
+                self._move_towards(world, player, self.target_x, self.target_y, delta_time, rng, audio)
             return
 
         if self.ai_state not in {"idle", "wander"}:
             self.ai_state = "wander"
             self.wander_timer = 0.0
-        self._update_wander(world, player, delta_time, rng)
+        self._update_wander(world, player, delta_time, rng, audio)
 
     def _can_begin_attack(self, player_distance: float, can_see_player: bool) -> bool:
         if not can_see_player:
             return False
         return player_distance <= self.definition.attack_range
+
+    def _should_kite_player(self, player_distance: float, can_see_player: bool) -> bool:
+        if self.enemy_type != "cacodemon" or not can_see_player:
+            return False
+        return player_distance <= self.definition.attack_range * 0.58
 
     def _begin_attack(self, audio) -> None:
         self.ai_state = "attack"
@@ -428,6 +457,7 @@ class WorldEnemy:
         player: "Player",
         delta_time: float,
         rng: random.Random,
+        audio,
     ) -> None:
         if self.wander_timer <= 0.0:
             if rng.random() < 0.28:
@@ -443,7 +473,7 @@ class WorldEnemy:
             self.wander_timer = rng.uniform(0.8, 1.8)
             self.animation_timer = 0.0
         if self.ai_state == "wander":
-            self._move_towards(world, player, self.target_x, self.target_y, delta_time, rng, speed_scale=0.52)
+            self._move_towards(world, player, self.target_x, self.target_y, delta_time, rng, audio, speed_scale=0.52)
 
     def _move_towards(
         self,
@@ -453,6 +483,7 @@ class WorldEnemy:
         target_y: float,
         delta_time: float,
         rng: random.Random,
+        audio,
         speed_scale: float = 1.0,
     ) -> None:
         dx = target_x - self.x
@@ -465,22 +496,76 @@ class WorldEnemy:
         step_x = dx / distance * speed
         step_y = dy / distance * speed
         if world.move_enemy(self, step_x, step_y, player):
+            self._maybe_play_step(audio)
             return
 
         perp_x = -step_y
         perp_y = step_x
         if world.move_enemy(self, perp_x, perp_y, player):
+            self._maybe_play_step(audio)
             return
         if world.move_enemy(self, -perp_x, -perp_y, player):
+            self._maybe_play_step(audio)
             return
 
         angle = math.atan2(dy, dx) + rng.choice((-0.72, 0.72))
-        world.move_enemy(
+        if world.move_enemy(
             self,
             math.cos(angle) * speed * 0.84,
             math.sin(angle) * speed * 0.84,
             player,
-        )
+        ):
+            self._maybe_play_step(audio)
+
+    def _move_away_from(
+        self,
+        world: "World",
+        player: "Player",
+        target_x: float,
+        target_y: float,
+        delta_time: float,
+        rng: random.Random,
+        audio,
+        speed_scale: float = 1.0,
+    ) -> None:
+        dx = self.x - target_x
+        dy = self.y - target_y
+        distance = math.hypot(dx, dy)
+        if distance <= 0.001:
+            return
+
+        speed = self.definition.move_speed * speed_scale * delta_time
+        step_x = dx / distance * speed
+        step_y = dy / distance * speed
+        if world.move_enemy(self, step_x, step_y, player):
+            self._maybe_play_step(audio)
+            return
+
+        strafe_angle = math.atan2(dy, dx) + rng.choice((-0.92, 0.92))
+        if world.move_enemy(
+            self,
+            math.cos(strafe_angle) * speed * 0.9,
+            math.sin(strafe_angle) * speed * 0.9,
+            player,
+        ):
+            self._maybe_play_step(audio)
+            return
+
+        if world.move_enemy(
+            self,
+            -step_y * 0.7,
+            step_x * 0.7,
+            player,
+        ):
+            self._maybe_play_step(audio)
+
+    def _maybe_play_step(self, audio) -> None:
+        if self.enemy_type != "cyberdemon" or audio is None:
+            return
+        if self.step_sound_timer > 0.0:
+            return
+        self.step_sound_timer = 0.52
+        audio.play_enemy_step(self.enemy_type)
 
 
 ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
@@ -585,7 +670,7 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         display_name="Cacodemon",
         attack_kind="projectile",
         max_hp=172,
-        collision_radius=0.38,
+        collision_radius=0.54,
         move_speed=1.72,
         aggro_range=14.6,
         attack_range=11.6,
@@ -595,7 +680,7 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         projectile_speed=4.9,
         projectile_radius=0.24,
         reaction_time=0.24,
-        pain_time=0.24,
+        pain_time=0.42,
         memory_time=5.1,
         wander_radius=1.8,
         hit_reaction_chance=0.3,
@@ -607,8 +692,8 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
             glow_color=(255, 96, 82),
             projectile_color=(255, 120, 74),
             corpse_color=(92, 34, 28),
-            sprite_scale=1.22,
-            height_scale=1.16,
+            sprite_scale=1.0,
+            height_scale=0.98,
             minimap_color=(222, 92, 78),
         ),
     ),
@@ -642,6 +727,38 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
             sprite_scale=1.10,
             height_scale=1.34,
             minimap_color=(182, 118, 224),
+        ),
+    ),
+    "cyberdemon": EnemyDefinition(
+        enemy_type="cyberdemon",
+        display_name="Cyberdemon",
+        attack_kind="projectile",
+        max_hp=460,
+        collision_radius=0.46,
+        move_speed=1.18,
+        aggro_range=16.0,
+        attack_range=13.0,
+        attack_cooldown=1.72,
+        attack_windup=0.96,
+        damage=40,
+        projectile_speed=4.4,
+        projectile_radius=0.26,
+        reaction_time=0.22,
+        pain_time=0.34,
+        memory_time=7.5,
+        wander_radius=1.25,
+        hit_reaction_chance=0.08,
+        corpse_time=settings.ENEMY_CORPSE_TIME + 3.0,
+        drops=(EnemyDrop("shell_box", 1.0, 20), EnemyDrop("medkit", 1.0, 25), EnemyDrop("green_armor", 0.4, 100)),
+        visual=EnemyVisual(
+            base_color=(116, 82, 72),
+            accent_color=(228, 92, 64),
+            glow_color=(255, 126, 74),
+            projectile_color=(255, 126, 64),
+            corpse_color=(62, 42, 36),
+            sprite_scale=1.18,
+            height_scale=1.28,
+            minimap_color=(214, 118, 88),
         ),
     ),
 }

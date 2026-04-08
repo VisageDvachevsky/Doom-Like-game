@@ -432,12 +432,38 @@ class MapGenerator:
                 return generated
         if best_valid_map is not None:
             return best_valid_map
+        repaired_map = self._repair_invalid_door_choke()
+        if repaired_map is not None:
+            return repaired_map
         if best_map is not None:
             return best_map
         fallback = self._generate_structured_fallback()
         if fallback is not None:
             return fallback
         raise RuntimeError(f"Unable to generate a valid progression layout for seed {self.seed}")
+
+    def _repair_invalid_door_choke(self) -> GeneratedMap | None:
+        if self.generation_request is None:
+            return None
+        alternate_seed_offsets = (
+            0x9E3779B1,
+            0x7F4A7C15,
+            0xA511E9B3,
+            0xC2B2AE35,
+        )
+        for offset in alternate_seed_offsets:
+            repair_generator = MapGenerator(
+                seed=self.seed ^ offset,
+                difficulty_id=self.difficulty_id,
+                runtime_pressure_bias=self.runtime_pressure_bias,
+                generation_request=self.generation_request,
+            )
+            for attempt in range(24):
+                repair_generator.rng = random.Random(f"topology:{repair_generator.seed}:{attempt}")
+                repaired = repair_generator._generate_once()
+                if repaired is not None and repaired.validation_report.valid:
+                    return repaired
+        return None
 
     def _campaign_field(self, field_name: str, default):
         if self.generation_request is None:
@@ -650,6 +676,7 @@ class MapGenerator:
             locked_doors,
         )
         door_spawns = [*locked_doors, *normal_doors]
+        self._enforce_door_choke_tiles(tiles, door_spawns)
         shortcut_closed_positions = {
             connection.door_candidate[:2]
             for connection in connections
@@ -737,6 +764,7 @@ class MapGenerator:
             enemy_spawns,
             exit_spawn,
         )
+        self._enforce_door_choke_tiles(tiles, door_spawns)
         validation_report = self._build_validation_report(
             progression_valid=self._validate_progression_layout(
                 tiles,
@@ -3001,6 +3029,28 @@ class MapGenerator:
             )
         return normal_doors
 
+    def _enforce_door_choke_tiles(
+        self,
+        tiles: list[list[int]],
+        door_spawns: list[DoorSpawn],
+    ) -> None:
+        door_positions = {(door.grid_x, door.grid_y) for door in door_spawns}
+        for door in door_spawns:
+            if self._door_orientation_at(tiles, door.grid_x, door.grid_y) == door.orientation:
+                continue
+            grid_x = door.grid_x
+            grid_y = door.grid_y
+            if door.orientation == "vertical":
+                wall_targets = ((grid_x, grid_y - 1), (grid_x, grid_y + 1))
+            else:
+                wall_targets = ((grid_x - 1, grid_y), (grid_x + 1, grid_y))
+            if any(target in door_positions for target in wall_targets):
+                continue
+            for wall_x, wall_y in wall_targets:
+                if 0 < wall_x < self.width - 1 and 0 < wall_y < self.height - 1:
+                    tiles[wall_y][wall_x] = 1
+            tiles[grid_y][grid_x] = 0
+
     def _validate_progression_layout(
         self,
         tiles: list[list[int]],
@@ -3704,7 +3754,7 @@ class MapGenerator:
                 enemy_spawns.append(
                     EnemySpawn(
                         enemy_id=guard_enemy_id,
-                        enemy_type="warden",
+                        enemy_type=self._boss_enemy_type(),
                         x=boss_position[0],
                         y=boss_position[1],
                         room_index=int(boss_position[2]),
@@ -4108,6 +4158,9 @@ class MapGenerator:
         if weighted_roll < 0.3:
             return "charger"
         return "grunt"
+
+    def _boss_enemy_type(self) -> str:
+        return "cyberdemon" if self._campaign_field("level_index", 1) >= 5 else "warden"
 
     def _encounter_template_for_room(
         self,
@@ -5285,7 +5338,6 @@ class MapGenerator:
             softened_prefixes = (
                 "progression-invalid",
                 "future-stage-leak:",
-                "invalid-door-choke:",
                 "missing-shortcut-door:",
                 "shortcut-not-meaningful:",
                 "exit-reachable-before-final",

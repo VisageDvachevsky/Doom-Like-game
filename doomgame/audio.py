@@ -46,18 +46,23 @@ class DoomAudio:
         grunt_attack = self._load_asset_sound("dsshotgn.wav")
         heavy_attack = self._load_asset_sound("dsrlaunc.wav")
         cacodemon_attack = self._load_asset_sound("dsfirshtcaco.wav")
+        cyberdemon_attack = self._load_asset_sound("dsrlaunc (1).wav")
         warden_attack = self._load_asset_sound("dsmanatk.wav")
         charger_death = self._load_asset_sound("dsbgdth1.wav")
         grunt_death = self._load_asset_sound("dsskedth.wav")
         heavy_death = self._load_asset_sound("dscybdth.wav")
         cacodemon_death = self._load_asset_sound("dscacdth.wav")
+        cyberdemon_death = self._load_asset_sound("dsslop.wav")
         warden_death = self._load_asset_sound("dsmandth.wav")
         charger_pain = self._load_asset_sound("dspopain.wav")
         grunt_pain = self._load_asset_sound("dchopain.wav")
         heavy_pain = self._load_asset_sound("dsdmpain.wav")
         cacodemon_pain = self._load_asset_sound("dsdmpain.wav")
+        cyberdemon_pain = self._load_asset_sound("dspopain.wav")
         warden_pain = self._load_asset_sound("dsbospn.wav")
         cacodemon_alert = self._load_asset_sound("dsdmact.wav")
+        cyberdemon_alert = self._load_asset_sound("dscybsit.wav")
+        cyberdemon_step = self._load_asset_sound("dshoof.wav")
         player_pain = self._load_asset_sound("dsplpain.wav")
         player_oof = self._load_asset_sound("dsoof.wav")
         player_death = self._load_asset_sound("dspldeth.wav")
@@ -77,18 +82,23 @@ class DoomAudio:
             "grunt_attack": grunt_attack if grunt_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "heavy_attack": heavy_attack if heavy_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "cacodemon_attack": cacodemon_attack if cacodemon_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
+            "cyberdemon_attack": cyberdemon_attack if cyberdemon_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "warden_attack": warden_attack if warden_attack is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "charger_death": charger_death if charger_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
             "grunt_death": grunt_death if grunt_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
             "heavy_death": heavy_death if heavy_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
             "cacodemon_death": cacodemon_death if cacodemon_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
+            "cyberdemon_death": cyberdemon_death if cyberdemon_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
             "warden_death": warden_death if warden_death is not None else pygame.mixer.Sound(buffer=self._render_enemy_death()),
             "charger_pain": charger_pain if charger_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
             "grunt_pain": grunt_pain if grunt_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
             "heavy_pain": heavy_pain if heavy_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
             "cacodemon_pain": cacodemon_pain if cacodemon_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
+            "cyberdemon_pain": cyberdemon_pain if cyberdemon_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
             "warden_pain": warden_pain if warden_pain is not None else pygame.mixer.Sound(buffer=self._render_enemy_pain()),
             "cacodemon_alert": cacodemon_alert if cacodemon_alert is not None else pygame.mixer.Sound(buffer=self._render_enemy_alert()),
+            "cyberdemon_alert": cyberdemon_alert if cyberdemon_alert is not None else pygame.mixer.Sound(buffer=self._render_enemy_alert()),
+            "cyberdemon_step": cyberdemon_step if cyberdemon_step is not None else pygame.mixer.Sound(buffer=self._render_enemy_melee()),
             "player_pain": player_pain,
             "player_oof": player_oof,
             "player_death": player_death,
@@ -132,6 +142,7 @@ class DoomAudio:
     def play_enemy_alert(self, enemy_type: str) -> None:
         sound_key = {
             "cacodemon": "cacodemon_alert",
+            "cyberdemon": "cyberdemon_alert",
         }.get(enemy_type)
         if sound_key is None:
             return
@@ -145,6 +156,7 @@ class DoomAudio:
             "grunt": "grunt_attack",
             "heavy": "heavy_attack",
             "cacodemon": "cacodemon_attack",
+            "cyberdemon": "cyberdemon_attack",
             "warden": "warden_attack",
         }.get(enemy_type)
         if sound_key is None:
@@ -160,6 +172,7 @@ class DoomAudio:
             "grunt": "grunt_pain",
             "heavy": "heavy_pain",
             "cacodemon": "cacodemon_pain",
+            "cyberdemon": "cyberdemon_pain",
             "warden": "warden_pain",
         }.get(enemy_type)
         if sound_key is None:
@@ -172,9 +185,18 @@ class DoomAudio:
             "grunt": "grunt_death",
             "heavy": "heavy_death",
             "cacodemon": "cacodemon_death",
+            "cyberdemon": "cyberdemon_death",
             "warden": "warden_death",
         }.get(enemy_type, "enemy_death")
         self._play_sound("enemy", sound_key, cooldown=0.12)
+
+    def play_enemy_step(self, enemy_type: str) -> None:
+        sound_key = {
+            "cyberdemon": "cyberdemon_step",
+        }.get(enemy_type)
+        if sound_key is None:
+            return
+        self._play_sound("enemy", sound_key, cooldown=0.32)
 
     def play_player_hit(self) -> None:
         if not self.enabled:

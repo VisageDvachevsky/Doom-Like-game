@@ -747,11 +747,7 @@ class Raycaster:
                 continue
             visual = enemy.definition.visual
             projected_transform_y = max(transform_y, 0.42)
-            floor_z = world.get_floor_height(enemy.x, enemy.y)
-            if enemy.dead:
-                floor_z += 0.06
-            else:
-                floor_z += 0.02 + math.sin(time_seconds * 3.2 + enemy.room_index * 0.7) * 0.012
+            floor_z = world.get_floor_height(enemy.x, enemy.y) + self._enemy_z_offset(enemy, time_seconds)
             screen_x = int((self.width / 2) * (1 + transform_x / projected_transform_y))
             projected_scale = visual.height_scale * visual.sprite_scale * settings.ENEMY_VISUAL_SCALE
             sprite_height = max(24, int(self.height / projected_transform_y * projected_scale))
@@ -834,8 +830,12 @@ class Raycaster:
             owner_visual = ENEMY_DEFINITIONS[projectile.owner_type].visual
             screen_x = int((self.width / 2) * (1 + transform_x / transform_y))
             small_projectile = projectile.owner_type in {"grunt", "heavy"}
-            base_scale = 0.14 if small_projectile else 0.6
-            min_size = 4 if small_projectile else 10
+            if projectile.owner_type == "cyberdemon":
+                base_scale = 0.86
+                min_size = 14
+            else:
+                base_scale = 0.14 if small_projectile else 0.6
+                min_size = 4 if small_projectile else 10
             sprite_height = max(min_size, int(self.height / transform_y * base_scale))
             sprite_width = max(min_size, int(sprite_height * sprite.get_width() / max(1, sprite.get_height())))
             scaled = self._get_scaled_sprite(sprite, sprite_width, sprite_height)
@@ -1100,7 +1100,7 @@ class Raycaster:
             if sprite_index is None:
                 continue
             visual = enemy.definition.visual
-            z_offset = 0.06 if enemy.dead else 0.02 + math.sin(time_seconds * 3.2 + enemy.room_index * 0.7) * 0.012
+            z_offset = self._enemy_z_offset(enemy, time_seconds)
             projected_scale = visual.height_scale * visual.sprite_scale * settings.ENEMY_VISUAL_SCALE
             instances.extend(
                 struct.pack(
@@ -1117,6 +1117,15 @@ class Raycaster:
             count += 1
         return bytes(instances), count
 
+    def _enemy_z_offset(self, enemy, time_seconds: float) -> float:
+        if enemy.dead:
+            return 0.1 if enemy.enemy_type == "cacodemon" else 0.06
+        bob = math.sin(time_seconds * 3.2 + enemy.room_index * 0.7) * 0.012
+        if enemy.enemy_type == "cacodemon":
+            float_bob = math.sin(time_seconds * 2.1 + enemy.sprite_phase) * 0.06
+            return 0.38 + float_bob + bob * 0.6
+        return 0.02 + bob
+
     def _build_native_projectile_instance_buffer(self, world: World) -> tuple[bytes, int]:
         instances = bytearray()
         count = 0
@@ -1128,8 +1137,12 @@ class Raycaster:
             if sprite_index is None:
                 continue
             small_projectile = projectile.owner_type in {"grunt", "heavy"}
-            base_scale = 0.14 if small_projectile else 0.6
-            min_size = 4 if small_projectile else 10
+            if projectile.owner_type == "cyberdemon":
+                base_scale = 0.86
+                min_size = 14
+            else:
+                base_scale = 0.14 if small_projectile else 0.6
+                min_size = 4 if small_projectile else 10
             z_offset = 0.34 + math.sin(projectile.bob_phase) * 0.04
             instances.extend(
                 struct.pack(
@@ -1375,7 +1388,7 @@ class Raycaster:
             attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
             dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
             projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
-            pain = self._load_sprite_asset(f"{enemy_type}_damage.png")
+            pain = self._load_enemy_pain_asset(enemy_type, idle)
 
             if idle is None or walk_01 is None or walk_02 is None or attack is None or dead is None:
                 return None
@@ -1397,7 +1410,7 @@ class Raycaster:
             attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
             dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
             projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
-            pain = self._load_sprite_asset(f"{enemy_type}_damage.png")
+            pain = self._load_enemy_pain_asset(enemy_type, idle)
 
             if idle is None or walk_01 is None or attack is None or dead is None:
                 return None
@@ -1419,9 +1432,31 @@ class Raycaster:
             attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
             dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
             projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
-            pain = self._load_sprite_asset(f"{enemy_type}_damage.png")
+            pain = self._load_enemy_pain_asset(enemy_type, idle)
 
             if idle is None or walk_01 is None or walk_02 is None or attack is None or dead is None:
+                return None
+
+            return {
+                "idle": [idle],
+                "alert": [idle],
+                "walk": [walk_01, walk_02],
+                "attack": [attack],
+                "pain": [pain if pain is not None else self._make_pain_variant(idle)],
+                "dead": [dead],
+                "projectile": [projectile] if projectile is not None else [],
+            }
+
+        if enemy_type == "cyberdemon":
+            idle = self._load_sprite_asset(f"{enemy_type}_idle.png")
+            walk_01 = self._load_sprite_asset(f"{enemy_type}_walk_01.png")
+            walk_02 = self._load_sprite_asset(f"{enemy_type}_walk_02.png") or walk_01
+            attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
+            dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
+            projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
+            pain = self._load_enemy_pain_asset(enemy_type, idle)
+
+            if idle is None or walk_01 is None or attack is None or dead is None:
                 return None
 
             return {
@@ -1441,6 +1476,26 @@ class Raycaster:
         if not path.exists():
             return None
         return pygame.image.load(str(path)).convert_alpha()
+
+    def _load_enemy_pain_asset(
+        self,
+        enemy_type: str,
+        idle_sprite: pygame.Surface | None,
+    ) -> pygame.Surface | None:
+        pain = self._load_sprite_asset(f"{enemy_type}_damage.png")
+        if pain is None or idle_sprite is None:
+            return pain
+        idle_width = max(1, idle_sprite.get_width())
+        idle_height = max(1, idle_sprite.get_height())
+        pain_width = max(1, pain.get_width())
+        pain_height = max(1, pain.get_height())
+        idle_aspect = idle_height / idle_width
+        pain_aspect = pain_height / pain_width
+        if abs(idle_aspect - pain_aspect) > 0.2:
+            return None
+        if pain_height < int(idle_height * 0.75):
+            return None
+        return pain
 
     def _make_pain_variant(self, sprite: pygame.Surface) -> pygame.Surface:
         tinted = sprite.copy()

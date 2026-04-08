@@ -39,7 +39,12 @@ DIGIT_PATTERNS = {
 
 
 class DoomGame:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        dev_start_level: int | None = None,
+        dev_immortal: bool = False,
+        dev_auto_difficulty: str | None = None,
+    ) -> None:
         pygame.init()
         pygame.display.set_caption("Doom-like Pygame")
         self.screen = pygame.display.set_mode((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT))
@@ -121,11 +126,16 @@ class DoomGame:
         self.music_recent_kills = 0.0
         self.music_recent_event = 0.0
         self.music_seen_enemy_ids: set[str] = set()
+        self.dev_start_level = dev_start_level
+        self.dev_immortal = dev_immortal
+        self.dev_auto_difficulty = dev_auto_difficulty
 
         self.world: World | None = None
         self.player: Player | None = None
         self.audio.start()
         self.music.start()
+        if self.dev_auto_difficulty is not None:
+            self._start_dev_session()
 
     def run(self) -> None:
         while self.running:
@@ -170,6 +180,7 @@ class DoomGame:
         resolved_run_seed = run_seed if run_seed is not None else random.randrange(1, 999_999)
         self.run_state = self.sequence_director.build_run_state(difficulty_id, resolved_run_seed)
         self.load_campaign_level(1, preserve_player_state=False, show_intermission=False)
+        self._apply_dev_loadout()
 
     def load_campaign_level(
         self,
@@ -236,6 +247,7 @@ class DoomGame:
             f"skeleton={self.world.skeleton_profile_id} "
             f"seed={self.world.per_level_seed}"
         )
+        self._apply_dev_loadout()
 
     def advance_to_next_level(self) -> None:
         if self.run_state is None or self.world is None:
@@ -310,6 +322,47 @@ class DoomGame:
 
     def _begin_run_with_difficulty(self, difficulty_id: str) -> None:
         self.start_run(difficulty_id)
+
+    def _apply_dev_loadout(self) -> None:
+        if self.run_state is None:
+            return
+        if not self.dev_immortal and self.dev_start_level is None:
+            return
+        self.health = settings.MAX_HEALTH
+        self.armor = settings.MAX_ARMOR
+        self.ammo = settings.MAX_SHELLS
+        self.ammo_pools = {
+            "BULL": 400,
+            "SHEL": settings.MAX_SHELLS,
+            "RCKT": 99,
+            "CELL": 300,
+        }
+        self.level_start_snapshot = {
+            "health": self.health,
+            "armor": self.armor,
+            "ammo": self.ammo,
+            "ammo_pools": dict(self.ammo_pools),
+        }
+
+    def _start_dev_session(self) -> None:
+        difficulty_id = (
+            self.dev_auto_difficulty
+            if self.dev_auto_difficulty in self.difficulty_ids
+            else self.difficulty_ids[-1]
+        )
+        self.start_run(difficulty_id)
+        if self.dev_start_level is not None and self.dev_start_level > 1:
+            target_level = min(
+                max(1, self.dev_start_level),
+                self.run_state.total_level_count if self.run_state is not None else self.dev_start_level,
+            )
+            self.load_campaign_level(
+                target_level,
+                preserve_player_state=True,
+                show_intermission=False,
+            )
+        self._apply_dev_loadout()
+        self._show_message("DEV MODE - LEVEL 5 IMMORTAL", (132, 236, 255))
 
     def _draw_difficulty_menu(self) -> None:
         self.screen.fill((10, 8, 12))
@@ -613,11 +666,14 @@ class DoomGame:
         impact = self.world.resolve_hitscan(self.player.x, self.player.y, ray_x, ray_y, damage=24)
         if impact.enemy is None:
             return
-        if impact.enemy.enemy_type == "warden" and impact.enemy_killed:
-            self._show_message("WARDEN DOWN - FINAL DOOR UNLOCKED", (255, 182, 104))
+        if impact.enemy.enemy_type in {"warden", "cyberdemon"} and impact.enemy_killed:
+            boss_name = "CYBERDEMON" if impact.enemy.enemy_type == "cyberdemon" else "WARDEN"
+            self._show_message(f"{boss_name} DOWN - FINAL DOOR UNLOCKED", (255, 182, 104))
         if impact.enemy_killed:
             self._bump_music_impulse("music_recent_kills", 0.34)
-            if impact.enemy.enemy_type == "warden":
+            if impact.enemy.enemy_type == "cyberdemon":
+                self._bump_music_impulse("music_recent_event", 0.82)
+            elif impact.enemy.enemy_type == "warden":
                 self._bump_music_impulse("music_recent_event", 0.58)
             elif impact.enemy.enemy_type == "cacodemon":
                 self._bump_music_impulse("music_recent_event", 0.34)
@@ -789,6 +845,15 @@ class DoomGame:
         if amount <= 0 or self.player_death_timer > 0.0:
             return
         self._bump_music_impulse("music_recent_damage", min(1.0, amount / 30.0))
+        if self.dev_immortal:
+            self.audio.play_player_hit()
+            if source == "acid":
+                self._show_message("ACID BURNS", (132, 236, 118))
+            self.face_hit_state = "hit_heavy" if amount >= 18 else "hit_light"
+            self.face_hit_timer = 0.32 if amount >= 18 else 0.18
+            flash_color = (148, 236, 88) if source == "acid" else (255, 72, 52)
+            self._trigger_damage_flash(flash_color, settings.PLAYER_DAMAGE_FLASH_TIME)
+            return
         absorbed = min(self.armor, int(math.ceil(amount * settings.PLAYER_ARMOR_ABSORB)))
         self.armor = max(0, self.armor - absorbed)
         damage_taken = max(0, amount - absorbed)
@@ -825,7 +890,9 @@ class DoomGame:
             if not self.world.has_line_of_sight(self.player.x, self.player.y, enemy.x, enemy.y):
                 continue
             self.music_seen_enemy_ids.add(enemy.enemy_id)
-            if enemy.enemy_type == "warden":
+            if enemy.enemy_type == "cyberdemon":
+                self._bump_music_impulse("music_recent_event", 0.88)
+            elif enemy.enemy_type == "warden":
                 self._bump_music_impulse("music_recent_event", 0.62)
             elif enemy.enemy_type == "cacodemon":
                 self._bump_music_impulse("music_recent_event", 0.4)
@@ -857,7 +924,7 @@ class DoomGame:
             if distance <= 7.5:
                 nearby_enemies += 1
                 nearby_threat += threat
-                if enemy.enemy_type in {"warden", "cacodemon"}:
+                if enemy.enemy_type in {"warden", "cacodemon", "cyberdemon"}:
                     boss_nearby_threat += threat
             if enemy.ai_state == "attack":
                 attacking_enemies += 1
@@ -892,6 +959,7 @@ class DoomGame:
             "heavy": 2.35,
             "cacodemon": 2.82,
             "warden": 3.15,
+            "cyberdemon": 4.8,
         }.get(enemy_type, 1.0)
 
     def _draw_pickup_message(self) -> None:
@@ -1006,7 +1074,7 @@ class DoomGame:
         if door.required_trigger_id is not None:
             state_parts.append(f"route={'OPEN' if door.trigger_unlocked else 'LOCKED'}")
         if door.guard_enemy_id is not None:
-            state_parts.append("warden-lock")
+            state_parts.append("boss-lock")
         return [
             f"TARGET {title}",
             " | ".join(state_parts),
