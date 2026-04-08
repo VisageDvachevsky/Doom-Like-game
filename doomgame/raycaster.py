@@ -63,11 +63,18 @@ class Raycaster:
         self.vignette = self._build_vignette()
         self.horizon_glow = pygame.Surface((self.width, 48), pygame.SRCALPHA)
         self.horizon_glow.fill((118, 214, 140, 255))
+        self.weapon_scale_multipliers = {
+            "shotgun": 1.0,
+            "chaingun": 0.2,
+        }
         self.weapon_frames = self._load_weapon_frames()
         self.weapon_idle_frames = self._load_weapon_idle_frames()
         self.scaled_weapon_frames = self._prepare_weapon_frames()
         self.scaled_weapon_idle_frames = {
-            weapon_id: self._prepare_single_weapon_frame(frame)
+            weapon_id: self._prepare_single_weapon_frame(
+                frame,
+                self.weapon_scale_multipliers.get(weapon_id, 1.0),
+            )
             for weapon_id, frame in self.weapon_idle_frames.items()
         }
         self.pickup_sprites = self._build_pickup_sprites()
@@ -1256,9 +1263,12 @@ class Raycaster:
     def _prepare_weapon_frames(self) -> dict[str, list[pygame.Surface]]:
         scaled_frames: dict[str, list[pygame.Surface]] = {}
         for weapon_id, frames in self.weapon_frames.items():
+            scale_multiplier = self.weapon_scale_multipliers.get(weapon_id, 1.0)
             prepared_frames = [
                 prepared
-                for prepared in (self._prepare_single_weapon_frame(frame) for frame in frames)
+                for prepared in (
+                    self._prepare_single_weapon_frame(frame, scale_multiplier) for frame in frames
+                )
                 if prepared is not None
             ]
             scaled_frames[weapon_id] = prepared_frames
