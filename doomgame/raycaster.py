@@ -1375,6 +1375,7 @@ class Raycaster:
             attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
             dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
             projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
+            pain = self._load_sprite_asset(f"{enemy_type}_damage.png")
 
             if idle is None or walk_01 is None or walk_02 is None or attack is None or dead is None:
                 return None
@@ -1384,7 +1385,29 @@ class Raycaster:
                 "alert": [idle],
                 "walk": [walk_01, walk_02],
                 "attack": [attack],
-                "pain": [self._make_pain_variant(idle)],
+                "pain": [pain if pain is not None else self._make_pain_variant(idle)],
+                "dead": [dead],
+                "projectile": [projectile] if projectile is not None else [],
+            }
+
+        if enemy_type == "cacodemon":
+            idle = self._load_sprite_asset(f"{enemy_type}_idle.png")
+            walk_01 = self._load_sprite_asset(f"{enemy_type}_walk_01.png")
+            walk_02 = self._load_sprite_asset(f"{enemy_type}_walk_02.png") or walk_01
+            attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
+            dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
+            projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
+            pain = self._load_sprite_asset(f"{enemy_type}_damage.png")
+
+            if idle is None or walk_01 is None or attack is None or dead is None:
+                return None
+
+            return {
+                "idle": [idle],
+                "alert": [idle],
+                "walk": [walk_01, walk_02],
+                "attack": [attack],
+                "pain": [pain if pain is not None else self._make_pain_variant(idle)],
                 "dead": [dead],
                 "projectile": [projectile] if projectile is not None else [],
             }
@@ -1396,6 +1419,7 @@ class Raycaster:
             attack = self._load_sprite_asset(f"{enemy_type}_attack.png")
             dead = self._load_sprite_asset(f"{enemy_type}_dead.png")
             projectile = self._load_sprite_asset(f"{enemy_type}_projectile.png")
+            pain = self._load_sprite_asset(f"{enemy_type}_damage.png")
 
             if idle is None or walk_01 is None or walk_02 is None or attack is None or dead is None:
                 return None
@@ -1405,7 +1429,7 @@ class Raycaster:
                 "alert": [idle],
                 "walk": [walk_01, walk_02],
                 "attack": [attack],
-                "pain": [self._make_pain_variant(idle)],
+                "pain": [pain if pain is not None else self._make_pain_variant(idle)],
                 "dead": [dead],
                 "projectile": [projectile] if projectile is not None else [],
             }

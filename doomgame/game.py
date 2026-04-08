@@ -119,6 +119,8 @@ class DoomGame:
         self.music_recent_shots = 0.0
         self.music_recent_damage = 0.0
         self.music_recent_kills = 0.0
+        self.music_recent_event = 0.0
+        self.music_seen_enemy_ids: set[str] = set()
 
         self.world: World | None = None
         self.player: Player | None = None
@@ -217,6 +219,8 @@ class DoomGame:
         self.music_recent_shots = 0.0
         self.music_recent_damage = 0.0
         self.music_recent_kills = 0.0
+        self.music_recent_event = 0.0
+        self.music_seen_enemy_ids.clear()
         self._reset_weapon_state()
         self.level_start_snapshot = {
             "health": self.health,
@@ -401,12 +405,14 @@ class DoomGame:
         if self.player_death_timer > 0.0:
             self.player_death_timer = max(0.0, self.player_death_timer - delta_time)
             self.damage_flash_timer = max(0.0, self.damage_flash_timer - delta_time * 2.6)
+            self._update_music_events()
             self.music.update(self._build_music_snapshot(), delta_time)
             if self.player_death_timer <= 0.0:
                 self.restart_current_level_after_death()
             return
         if self.level_complete_timer > 0.0:
             self.level_complete_timer = max(0.0, self.level_complete_timer - delta_time)
+            self._update_music_events()
             self.music.update(self._build_music_snapshot(), delta_time)
             if self.level_complete_timer <= 0.0:
                 self.advance_to_next_level()
@@ -438,6 +444,7 @@ class DoomGame:
         if self.move_amount > 0.0:
             self.walk_time += delta_time * (4.5 + self.move_amount * 5.0)
             self.ammo = max(0, self.ammo - 0)
+        self._update_music_events()
         self.music.update(self._build_music_snapshot(), delta_time)
 
     def _render(self) -> None:
@@ -610,6 +617,12 @@ class DoomGame:
             self._show_message("WARDEN DOWN - FINAL DOOR UNLOCKED", (255, 182, 104))
         if impact.enemy_killed:
             self._bump_music_impulse("music_recent_kills", 0.34)
+            if impact.enemy.enemy_type == "warden":
+                self._bump_music_impulse("music_recent_event", 0.58)
+            elif impact.enemy.enemy_type == "cacodemon":
+                self._bump_music_impulse("music_recent_event", 0.34)
+            elif impact.enemy.enemy_type == "heavy":
+                self._bump_music_impulse("music_recent_event", 0.22)
             self.audio.play_enemy_death(impact.enemy.enemy_type)
             self._trigger_damage_flash((255, 126, 96), settings.ENEMY_HIT_FLASH_TIME)
         elif impact.enemy_pain:
@@ -801,10 +814,31 @@ class DoomGame:
         current = getattr(self, attr, 0.0)
         setattr(self, attr, min(1.0, current + amount))
 
+    def _update_music_events(self) -> None:
+        if self.world is None or self.player is None:
+            return
+        for enemy in self.world.active_enemies(include_corpses=False):
+            if enemy.enemy_id in self.music_seen_enemy_ids:
+                continue
+            if math.hypot(enemy.x - self.player.x, enemy.y - self.player.y) > 8.0:
+                continue
+            if not self.world.has_line_of_sight(self.player.x, self.player.y, enemy.x, enemy.y):
+                continue
+            self.music_seen_enemy_ids.add(enemy.enemy_id)
+            if enemy.enemy_type == "warden":
+                self._bump_music_impulse("music_recent_event", 0.62)
+            elif enemy.enemy_type == "cacodemon":
+                self._bump_music_impulse("music_recent_event", 0.4)
+            elif enemy.enemy_type == "heavy":
+                self._bump_music_impulse("music_recent_event", 0.28)
+            else:
+                self._bump_music_impulse("music_recent_event", 0.12)
+
     def _decay_music_impulses(self, delta_time: float) -> None:
         self.music_recent_shots = max(0.0, self.music_recent_shots - delta_time * 0.55)
         self.music_recent_damage = max(0.0, self.music_recent_damage - delta_time * 0.42)
         self.music_recent_kills = max(0.0, self.music_recent_kills - delta_time * 0.26)
+        self.music_recent_event = max(0.0, self.music_recent_event - delta_time * 0.34)
 
     def _build_music_snapshot(self) -> MusicSnapshot:
         if self.world is None or self.player is None:
@@ -815,6 +849,7 @@ class DoomGame:
         active_threat = 0.0
         nearby_threat = 0.0
         attacking_threat = 0.0
+        boss_nearby_threat = 0.0
         for enemy in live_enemies:
             threat = self._enemy_music_threat(enemy.enemy_type)
             distance = math.hypot(enemy.x - self.player.x, enemy.y - self.player.y)
@@ -822,6 +857,8 @@ class DoomGame:
             if distance <= 7.5:
                 nearby_enemies += 1
                 nearby_threat += threat
+                if enemy.enemy_type in {"warden", "cacodemon"}:
+                    boss_nearby_threat += threat
             if enemy.ai_state == "attack":
                 attacking_enemies += 1
                 attacking_threat += threat
@@ -843,6 +880,8 @@ class DoomGame:
             recent_shots=self.music_recent_shots,
             recent_damage=self.music_recent_damage,
             recent_kills=self.music_recent_kills,
+            recent_event=self.music_recent_event,
+            boss_nearby_threat=boss_nearby_threat,
             player_health_ratio=max(0.0, min(1.0, self.health / max(1, settings.MAX_HEALTH))),
         )
 
@@ -851,6 +890,7 @@ class DoomGame:
             "charger": 1.15,
             "grunt": 1.0,
             "heavy": 2.35,
+            "cacodemon": 2.82,
             "warden": 3.15,
         }.get(enemy_type, 1.0)
 

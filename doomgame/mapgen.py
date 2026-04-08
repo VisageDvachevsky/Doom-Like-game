@@ -4054,6 +4054,7 @@ class MapGenerator:
         progress = room_index / max(1, room_count - 1)
         roll = self.rng.random()
         weighted_roll = roll / max(0.68, self.difficulty.damage_pressure_bias)
+        campaign_level_index = self._campaign_field("level_index", 1)
         hazardous_room = room.spatial_archetype in {
             ARCHETYPE_TOXIC_PIT_ROOM,
             ARCHETYPE_BRIDGE_CROSSING,
@@ -4065,11 +4066,22 @@ class MapGenerator:
             ARCHETYPE_OVERLOOK_VISTA,
             ARCHETYPE_GRAND_CHAMBER,
         }
+        large_room = room.width * room.height >= 95
+        cacodemon_room = high_ceiling_room and not hazardous_room and (
+            large_room or room.kind in {"arena", "shrine", "tech", "cross"}
+        )
         if progress < 0.24:
             if hazardous_room and weighted_roll < 0.42:
                 return "grunt"
             return "charger" if weighted_roll < 0.34 else "grunt"
         if progress < 0.58:
+            if (
+                campaign_level_index >= 2
+                and difficulty_tier >= 1
+                and cacodemon_room
+                and weighted_roll < 0.16
+            ):
+                return "cacodemon"
             if hazardous_room and weighted_roll < 0.52:
                 return "heavy"
             if room.kind in {"arena", "tech", "cross"} and weighted_roll < 0.38:
@@ -4079,6 +4091,12 @@ class MapGenerator:
             if weighted_roll < 0.46:
                 return "charger"
             return "grunt"
+        if (
+            campaign_level_index >= 2
+            and cacodemon_room
+            and weighted_roll < (0.44 if campaign_level_index >= 4 else 0.3)
+        ):
+            return "cacodemon"
         if hazardous_room and weighted_roll < 0.68:
             return "heavy"
         if high_ceiling_room and weighted_roll < 0.54:

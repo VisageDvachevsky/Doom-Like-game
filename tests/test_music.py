@@ -24,6 +24,7 @@ class AdaptiveMusicLogicTests(unittest.TestCase):
     def test_track_classification_uses_filename_intent(self) -> None:
         self.assertEqual(STATE_CLIMAX, AdaptiveMusicLogic.classify_track(Path("doom_02. Rip & Tear.mp3")))
         self.assertEqual(STATE_CLIMAX, AdaptiveMusicLogic.classify_track(Path("Mick Gordon - Bfg Division.mp3")))
+        self.assertEqual(STATE_COMBAT, AdaptiveMusicLogic.classify_track(Path("at dooms morgen.mp3")))
         self.assertEqual(STATE_COMBAT, AdaptiveMusicLogic.classify_track(Path("at dooms gate.mp3")))
         self.assertEqual(STATE_COMBAT, AdaptiveMusicLogic.classify_track(Path("Mick Gordon - Cultist Base.mp3")))
         self.assertEqual(STATE_THREAT, AdaptiveMusicLogic.classify_track(Path("Mick Gordon - Faust.mp3")))
@@ -181,6 +182,7 @@ class DoomMusicPlayerTests(unittest.TestCase):
         self.assertFalse(player._is_music_asset(Path("dspistol.wav")))
         self.assertFalse(player._is_music_asset(Path("dsplpain.wav")))
         self.assertTrue(player._is_music_asset(Path("doom_02. Rip & Tear.mp3")))
+        self.assertTrue(player._is_music_asset(Path("at dooms morgen.mp3")))
         self.assertTrue(player._is_music_asset(Path("DooM_-_Main_Theme_OST.mp3")))
         self.assertTrue(player._is_music_asset(Path("Mick Gordon - Bfg Division.mp3")))
         self.assertTrue(player._is_music_asset(Path("Mick Gordon - Faust.mp3")))
@@ -201,10 +203,11 @@ class DoomMusicPlayerTests(unittest.TestCase):
             played = player._play_file_track(track, fade_ms=400)
 
         self.assertTrue(played)
-        second_channel.play.assert_called_once_with(track.sound, loops=-1, fade_ms=400)
+        second_channel.play.assert_called_once_with(track.sound, loops=-1)
         first_channel.set_volume.assert_called_with(0.0)
         streamed_music.load.assert_not_called()
         streamed_music.play.assert_not_called()
+        self.assertEqual(1.0, player._channel_target_volume[player._current_music_channel_index])
 
     def test_available_moods_are_derived_from_loaded_tracks(self) -> None:
         player = DoomMusicPlayer()
@@ -333,9 +336,30 @@ class DoomMusicPlayerTests(unittest.TestCase):
 
         self.assertTrue(resumed)
         suspended_channel.play.assert_not_called()
-        suspended_channel.set_volume.assert_called_with(1.0)
         current_channel.set_volume.assert_called_with(0.0)
         self.assertEqual(combat_track, player._current_track)
+        self.assertEqual(1.0, player._channel_target_volume[1])
+        self.assertEqual(0.0, player._channel_target_volume[0])
+
+    def test_same_mood_can_retarget_to_better_energy_match(self) -> None:
+        player = DoomMusicPlayer()
+        player.enabled = True
+        player.using_file_music = True
+        lower_combat = MusicTrack(path=Path("combat_low.mp3"), mood=STATE_COMBAT, sound=mock.Mock(), energy=0.42)
+        higher_combat = MusicTrack(path=Path("combat_high.mp3"), mood=STATE_COMBAT, sound=mock.Mock(), energy=0.74)
+        player._tracks = [lower_combat, higher_combat]
+        player._current_track = lower_combat
+        player._session_time = 20.0
+        player._current_track_started_at = 0.0
+        player._logic.intensity = 0.74
+
+        with (
+            mock.patch.object(player._logic, "update", return_value=STATE_COMBAT),
+            mock.patch.object(player, "_play_file_track") as play_track,
+        ):
+            player.update(MusicSnapshot(recent_shots=1.0), 0.5)
+
+        play_track.assert_called_once_with(higher_combat, fade_ms=450)
 
 
 if __name__ == "__main__":

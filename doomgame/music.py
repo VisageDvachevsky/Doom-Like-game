@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from array import array
 from dataclasses import dataclass
+import json
 import math
 from pathlib import Path
 import random
@@ -53,14 +54,20 @@ STATE_URGENCY = {
     STATE_CLIMAX: 3.0,
 }
 MIN_TRACK_TIME_BY_MOOD = {
-    STATE_EXPLORATION: 6.0,
-    STATE_THREAT: 10.0,
-    STATE_COMBAT: 20.0,
-    STATE_CLIMAX: 26.0,
-    STATE_AFTERMATH: 12.0,
+    STATE_EXPLORATION: 14.0,
+    STATE_THREAT: 14.0,
+    STATE_COMBAT: 22.0,
+    STATE_CLIMAX: 30.0,
+    STATE_AFTERMATH: 14.0,
 }
-MIN_ESCALATION_TIME = 6.0
+MIN_ESCALATION_TIME = 8.0
 TRACK_RESUME_WINDOW = 8.0
+INTRA_MOOD_RETARGET_DELTA = 0.28
+INTRA_MOOD_RETARGET_SCORE_MARGIN = 0.12
+INTRA_MOOD_RETARGET_MIN_SECONDS = 18.0
+GLOBAL_SWITCH_COOLDOWN = 5.0
+DEFAULT_TRACK_SWITCH_COOLDOWN = 12.0
+TRACK_MANIFEST_NAME = "music_manifest.json"
 PHASE_FALLBACKS = {
     STATE_EXPLORATION: (STATE_EXPLORATION, STATE_AFTERMATH, STATE_THREAT, STATE_COMBAT, STATE_CLIMAX),
     STATE_THREAT: (STATE_THREAT, STATE_COMBAT, STATE_EXPLORATION, STATE_AFTERMATH, STATE_CLIMAX),
@@ -92,6 +99,8 @@ class MusicSnapshot:
     recent_shots: float = 0.0
     recent_damage: float = 0.0
     recent_kills: float = 0.0
+    recent_event: float = 0.0
+    boss_nearby_threat: float = 0.0
     player_health_ratio: float = 1.0
 
 
@@ -100,6 +109,9 @@ class MusicTrack:
     path: Path
     mood: str
     sound: pygame.mixer.Sound | None = None
+    energy: float | None = None
+    switch_cooldown: float = DEFAULT_TRACK_SWITCH_COOLDOWN
+    tags: tuple[str, ...] = ()
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -126,6 +138,8 @@ class AdaptiveMusicLogic:
         if "rip" in name or "tear" in name:
             return STATE_CLIMAX
         if "cultist base" in name:
+            return STATE_COMBAT
+        if "at dooms morgen" in name:
             return STATE_COMBAT
         if "at dooms gate" in name or "doom's gate" in name or "dooms gate" in name:
             return STATE_COMBAT
@@ -158,6 +172,8 @@ class AdaptiveMusicLogic:
         shots_pressure = _clamp(snapshot.recent_shots, 0.0, 1.0)
         damage_pressure = _clamp(snapshot.recent_damage, 0.0, 1.0)
         kill_pressure = _clamp(snapshot.recent_kills, 0.0, 1.0)
+        event_pressure = _clamp(snapshot.recent_event, 0.0, 1.0)
+        boss_pressure = _clamp(snapshot.boss_nearby_threat / 3.2, 0.0, 1.0)
         low_health_pressure = _clamp(1.0 - snapshot.player_health_ratio, 0.0, 1.0)
         intensity = (
             active_pressure * 0.14
@@ -168,6 +184,8 @@ class AdaptiveMusicLogic:
             + shots_pressure * 0.10
             + damage_pressure * 0.05
             + kill_pressure * 0.06
+            + event_pressure * 0.06
+            + boss_pressure * 0.08
             + low_health_pressure * 0.08
         )
         return _clamp(intensity, 0.0, 1.0)
@@ -215,6 +233,8 @@ class AdaptiveMusicLogic:
             _clamp(snapshot.attacking_threat / 5.0, 0.0, 1.0),
         )
         projectile_density = _clamp(snapshot.projectile_count / 3.5, 0.0, 1.0)
+        event_spike = _clamp(snapshot.recent_event, 0.0, 1.0)
+        boss_pressure = _clamp(snapshot.boss_nearby_threat / 3.0, 0.0, 1.0)
         low_health = _clamp(1.0 - snapshot.player_health_ratio, 0.0, 1.0)
         tension_target = _clamp(
             awareness * 0.34
@@ -229,6 +249,8 @@ class AdaptiveMusicLogic:
             + projectile_density * 0.24
             + snapshot.recent_damage * 0.22
             + proximity * 0.08
+            + event_spike * 0.07
+            + boss_pressure * 0.09
             + low_health * 0.08,
             0.0,
             1.0,
@@ -259,6 +281,7 @@ class AdaptiveMusicLogic:
             self.pressure >= 0.76
             or (self.momentum >= 0.84 and self.tension >= 0.64)
             or (snapshot.nearby_threat >= 5.4 and snapshot.projectile_count >= 2)
+            or (snapshot.boss_nearby_threat >= 2.8 and (self.pressure >= 0.58 or self.tension >= 0.52))
         ):
             return STATE_CLIMAX
         if (
@@ -319,9 +342,13 @@ class DoomMusicPlayer:
         self._background_volume = 0.0
         self._session_time = 0.0
         self._current_track_started_at = 0.0
+        self._last_switch_at = -9999.0
         self._track_last_started_at: dict[Path, float] = {}
         self._channel_track: dict[int, MusicTrack | None] = {0: None, 1: None}
         self._channel_suspended_until: dict[int, float] = {0: 0.0, 1: 0.0}
+        self._channel_current_volume: dict[int, float] = {0: 0.0, 1: 0.0}
+        self._channel_target_volume: dict[int, float] = {0: 0.0, 1: 0.0}
+        self._channel_fade_rate: dict[int, float] = {0: 0.0, 1: 0.0}
 
     def start(self) -> None:
         try:
@@ -361,7 +388,8 @@ class DoomMusicPlayer:
 
     def stop(self) -> None:
         if self.using_file_music:
-            for channel in self._file_music_channels or ():
+            for index, channel in enumerate(self._file_music_channels or ()):
+                self._set_channel_volume(index, 0.0)
                 channel.stop()
             if self._background_enabled:
                 pygame.mixer.music.stop()
@@ -373,21 +401,50 @@ class DoomMusicPlayer:
 
     def update(self, snapshot: MusicSnapshot, delta_time: float) -> None:
         self._session_time += max(0.0, delta_time)
+        self._tick_channel_fades(delta_time)
         if not self.enabled or not self.using_file_music or not self._tracks:
             return
         self._cleanup_suspended_channels()
         mood = self._logic.update(snapshot, delta_time, self._available_moods())
+        if self._current_track is not None and self._session_time - self._last_switch_at < GLOBAL_SWITCH_COOLDOWN:
+            return
         if self._current_track is not None and self._current_track.mood == mood:
+            if not self._should_retarget_within_mood(mood, self._logic.intensity):
+                return
+        elif self._current_track is not None and not self._can_switch_to_mood(mood):
             return
-        if self._current_track is not None and not self._can_switch_to_mood(mood):
-            return
-        track = self._select_track_for_mood(mood, self._logic.intensity)
+        track = self._select_track_for_mood(
+            mood,
+            self._logic.intensity,
+            include_current=self._current_track is not None and self._current_track.mood == mood,
+        )
         if track is None or track == self._current_track:
             return
         self._play_file_track(track, fade_ms=450)
 
+    def _load_track_manifest(self) -> dict[str, dict[str, object]]:
+        assets_dir = Path(__file__).resolve().parent.parent / "assets"
+        manifest_path = assets_dir / TRACK_MANIFEST_NAME
+        if not manifest_path.exists():
+            return {}
+        try:
+            raw_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw_data, dict):
+            return {}
+        tracks = raw_data.get("tracks")
+        if not isinstance(tracks, dict):
+            return {}
+        manifest: dict[str, dict[str, object]] = {}
+        for key, value in tracks.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                manifest[key.casefold()] = value
+        return manifest
+
     def _find_external_tracks(self) -> list[MusicTrack]:
         assets_dir = Path(__file__).resolve().parent.parent / "assets"
+        manifest = self._load_track_manifest()
         candidates: list[Path] = []
         for ext in ("*.mp3", "*.ogg", "*.flac"):
             candidates.extend(sorted(assets_dir.glob(ext)))
@@ -396,7 +453,20 @@ class DoomMusicPlayer:
         for path in candidates:
             if not self._is_music_asset(path):
                 continue
-            tracks.append(MusicTrack(path=path, mood=AdaptiveMusicLogic.classify_track(path)))
+            manifest_entry = manifest.get(path.name.casefold()) or manifest.get(path.stem.casefold()) or {}
+            mood = str(manifest_entry.get("mood", AdaptiveMusicLogic.classify_track(path)))
+            energy = manifest_entry.get("energy")
+            cooldown = manifest_entry.get("switch_cooldown", DEFAULT_TRACK_SWITCH_COOLDOWN)
+            tags = manifest_entry.get("tags", ())
+            tracks.append(
+                MusicTrack(
+                    path=path,
+                    mood=mood,
+                    energy=float(energy) if isinstance(energy, (int, float)) else None,
+                    switch_cooldown=float(cooldown) if isinstance(cooldown, (int, float)) else DEFAULT_TRACK_SWITCH_COOLDOWN,
+                    tags=tuple(tag for tag in tags if isinstance(tag, str)) if isinstance(tags, (list, tuple)) else (),
+                )
+            )
         return tracks
 
     def _is_music_asset(self, path: Path) -> bool:
@@ -432,7 +502,16 @@ class DoomMusicPlayer:
             except pygame.error:
                 continue
             sound.set_volume(1.0)
-            loaded_tracks.append(MusicTrack(path=track.path, mood=track.mood, sound=sound))
+            loaded_tracks.append(
+                MusicTrack(
+                    path=track.path,
+                    mood=track.mood,
+                    sound=sound,
+                    energy=track.energy,
+                    switch_cooldown=track.switch_cooldown,
+                    tags=track.tags,
+                )
+            )
         return loaded_tracks
 
     def _prepare_file_music_channels(self) -> None:
@@ -440,9 +519,9 @@ class DoomMusicPlayer:
             return
         primary = pygame.mixer.Channel(0)
         secondary = pygame.mixer.Channel(5)
-        primary.set_volume(0.0)
-        secondary.set_volume(0.0)
         self._file_music_channels = (primary, secondary)
+        self._set_channel_volume(0, 0.0)
+        self._set_channel_volume(1, 0.0)
 
     def _start_background_bed(self) -> bool:
         if self._background_track is None:
@@ -459,31 +538,39 @@ class DoomMusicPlayer:
     def _available_moods(self) -> set[str]:
         return {track.mood for track in self._tracks}
 
-    def _select_track_for_mood(self, mood: str, intensity: float) -> MusicTrack | None:
+    def _select_track_for_mood(self, mood: str, intensity: float, include_current: bool = False) -> MusicTrack | None:
         matching = [track for track in self._tracks if track.mood == mood]
         if not matching:
             return None
         if len(matching) == 1:
             return matching[0]
         current_path = self._current_track.path if self._current_track is not None else None
-        alternatives = [track for track in matching if track.path != current_path]
+        alternatives = [track for track in matching if include_current or track.path != current_path]
         pool = alternatives or matching
         best_score = None
         best_track = None
         for track in pool:
-            energy_delta = abs(self._track_energy(track) - intensity)
-            last_started = self._track_last_started_at.get(track.path, -9999.0)
-            recency_penalty = max(0.0, 12.0 - (self._session_time - last_started)) * 0.05
-            score = energy_delta + recency_penalty
+            score = self._track_selection_score(track, intensity)
             if best_score is None or score < best_score:
                 best_score = score
                 best_track = track
         return best_track
 
+    def _track_selection_score(self, track: MusicTrack, intensity: float) -> float:
+        energy_delta = abs(self._track_energy(track) - intensity)
+        last_started = self._track_last_started_at.get(track.path, -9999.0)
+        recency_penalty = max(0.0, track.switch_cooldown - (self._session_time - last_started)) * 0.05
+        affinity_bonus = -0.03 if track == self._current_track else 0.0
+        return energy_delta + recency_penalty + affinity_bonus
+
     def _track_energy(self, track: MusicTrack) -> float:
+        if track.energy is not None:
+            return _clamp(track.energy, 0.0, 1.0)
         name = track.path.stem.casefold()
         if "bfg division" in name:
             return 0.98
+        if "at dooms morgen" in name:
+            return 0.62
         if "at dooms gate" in name or "doom's gate" in name or "dooms gate" in name:
             return 0.66
         if "rip" in name and "tear" in name:
@@ -506,6 +593,25 @@ class DoomMusicPlayer:
             STATE_AFTERMATH: 0.18,
         }.get(track.mood, 0.5)
 
+    def _should_retarget_within_mood(self, mood: str, intensity: float) -> bool:
+        if self._current_track is None or self._current_track.mood != mood:
+            return False
+        elapsed = self._session_time - self._current_track_started_at
+        minimum_runtime = max(INTRA_MOOD_RETARGET_MIN_SECONDS, MIN_TRACK_TIME_BY_MOOD.get(mood, 10.0) * 0.8)
+        if elapsed < minimum_runtime:
+            return False
+        if self._session_time - self._last_switch_at < max(8.0, self._current_track.switch_cooldown * 0.65):
+            return False
+        current_energy = self._track_energy(self._current_track)
+        if abs(current_energy - intensity) < INTRA_MOOD_RETARGET_DELTA:
+            return False
+        candidate = self._select_track_for_mood(mood, intensity, include_current=True)
+        if candidate is None or candidate == self._current_track:
+            return False
+        current_score = self._track_selection_score(self._current_track, intensity)
+        candidate_score = self._track_selection_score(candidate, intensity)
+        return current_score - candidate_score >= INTRA_MOOD_RETARGET_SCORE_MARGIN
+
     def _play_file_track(self, track: MusicTrack, fade_ms: int = 0) -> bool:
         if track.sound is None:
             return False
@@ -520,18 +626,23 @@ class DoomMusicPlayer:
         next_channel = self._file_music_channels[next_index]
         previous_channel = self._file_music_channels[previous_index]
         try:
-            next_channel.set_volume(MUSIC_TRACK_VOLUME)
-            next_channel.play(track.sound, loops=-1, fade_ms=fade_ms)
+            self._set_channel_volume(next_index, 0.0 if next_index != previous_index else MUSIC_TRACK_VOLUME)
+            next_channel.play(track.sound, loops=-1)
             if next_index != previous_index and previous_channel.get_busy():
-                previous_channel.set_volume(0.0)
                 self._channel_suspended_until[previous_index] = self._session_time + TRACK_RESUME_WINDOW
+                self._begin_crossfade(previous_index, next_index, fade_ms)
+            else:
+                self._set_channel_target(next_index, MUSIC_TRACK_VOLUME, fade_ms)
         except pygame.error:
             return False
         self._current_music_channel_index = next_index
         self._current_track = track
         self._current_track_started_at = self._session_time
+        self._last_switch_at = self._session_time
         self._track_last_started_at[track.path] = self._session_time
         self._channel_track[next_index] = track
+        if next_index == previous_index:
+            self._set_channel_target(next_index, MUSIC_TRACK_VOLUME, fade_ms)
         return True
 
     def _fade_out_overlay(self, fade_ms: int) -> None:
@@ -556,6 +667,9 @@ class DoomMusicPlayer:
                 channel.stop()
             self._channel_track[index] = None
             self._channel_suspended_until[index] = 0.0
+            self._set_channel_volume(index, 0.0)
+            self._channel_target_volume[index] = 0.0
+            self._channel_fade_rate[index] = 0.0
 
     def _find_channel_index_for_track(self, track: MusicTrack) -> int | None:
         if self._file_music_channels is None:
@@ -577,18 +691,79 @@ class DoomMusicPlayer:
         previous_index = self._current_music_channel_index
         previous_channel = self._file_music_channels[previous_index]
         try:
-            resume_channel.set_volume(MUSIC_TRACK_VOLUME)
             if previous_index != channel_index and previous_channel.get_busy():
-                previous_channel.set_volume(0.0)
                 self._channel_suspended_until[previous_index] = self._session_time + TRACK_RESUME_WINDOW
+                self._begin_crossfade(previous_index, channel_index, fade_ms)
+            else:
+                self._set_channel_target(channel_index, MUSIC_TRACK_VOLUME, fade_ms)
         except pygame.error:
             return False
         self._current_music_channel_index = channel_index
         self._current_track = track
         self._current_track_started_at = self._session_time
+        self._last_switch_at = self._session_time
         self._track_last_started_at[track.path] = self._session_time
         self._channel_suspended_until[channel_index] = 0.0
+        self._channel_track[channel_index] = track
         return True
+
+    def _begin_crossfade(self, from_index: int, to_index: int, fade_ms: int) -> None:
+        duration = max(0.08, fade_ms / 1000.0 if fade_ms > 0 else 0.0)
+        if duration <= 0.08:
+            self._set_channel_volume(from_index, 0.0)
+            self._set_channel_volume(to_index, MUSIC_TRACK_VOLUME)
+            self._channel_target_volume[from_index] = 0.0
+            self._channel_target_volume[to_index] = MUSIC_TRACK_VOLUME
+            self._channel_fade_rate[from_index] = 0.0
+            self._channel_fade_rate[to_index] = 0.0
+            return
+        self._set_channel_target(from_index, 0.0, fade_ms)
+        self._set_channel_target(to_index, MUSIC_TRACK_VOLUME, fade_ms)
+
+    def _set_channel_target(self, index: int, volume: float, fade_ms: int) -> None:
+        target = _clamp(volume, 0.0, MUSIC_TRACK_VOLUME)
+        self._channel_target_volume[index] = target
+        duration = fade_ms / 1000.0 if fade_ms > 0 else 0.0
+        current = self._channel_current_volume.get(index, 0.0)
+        if duration <= 0.0 or abs(target - current) < 1e-4:
+            self._channel_fade_rate[index] = 0.0
+            self._set_channel_volume(index, target)
+            return
+        self._channel_fade_rate[index] = abs(target - current) / max(duration, 0.001)
+
+    def _set_channel_volume(self, index: int, volume: float) -> None:
+        clamped = _clamp(volume, 0.0, MUSIC_TRACK_VOLUME)
+        self._channel_current_volume[index] = clamped
+        if self._file_music_channels is None:
+            return
+        try:
+            self._file_music_channels[index].set_volume(clamped)
+        except pygame.error:
+            return
+
+    def _tick_channel_fades(self, delta_time: float) -> None:
+        if self._file_music_channels is None:
+            return
+        dt = max(0.0, delta_time)
+        for index in range(len(self._file_music_channels)):
+            current = self._channel_current_volume.get(index, 0.0)
+            target = self._channel_target_volume.get(index, current)
+            if abs(current - target) < 1e-4:
+                self._channel_fade_rate[index] = 0.0
+                continue
+            rate = self._channel_fade_rate.get(index, 0.0)
+            if rate <= 0.0 or dt <= 0.0:
+                self._set_channel_volume(index, target)
+                self._channel_fade_rate[index] = 0.0
+                continue
+            step = rate * dt
+            if current < target:
+                next_volume = min(target, current + step)
+            else:
+                next_volume = max(target, current - step)
+            self._set_channel_volume(index, next_volume)
+            if abs(next_volume - target) < 1e-4:
+                self._channel_fade_rate[index] = 0.0
 
     def _next_channel_index_for_new_track(self) -> int:
         if self._file_music_channels is None:
@@ -616,9 +791,14 @@ class DoomMusicPlayer:
         current_urgency = STATE_URGENCY.get(current_mood, 0.0)
         desired_urgency = STATE_URGENCY.get(desired_mood, 0.0)
         if desired_urgency > current_urgency:
-            return elapsed >= MIN_ESCALATION_TIME or self._logic.intensity >= 0.9
+            urgency_jump = desired_urgency - current_urgency
+            if urgency_jump >= 2.0:
+                return elapsed >= MIN_ESCALATION_TIME * 0.7 or self._logic.intensity >= 0.94
+            return elapsed >= MIN_ESCALATION_TIME or self._logic.intensity >= 0.97
         if desired_mood == STATE_AFTERMATH and current_mood in {STATE_COMBAT, STATE_CLIMAX}:
-            return elapsed >= max(10.0, MIN_TRACK_TIME_BY_MOOD.get(current_mood, 10.0) * 0.7)
+            return elapsed >= max(14.0, MIN_TRACK_TIME_BY_MOOD.get(current_mood, 10.0) * 0.9)
+        if desired_urgency < current_urgency:
+            return elapsed >= MIN_TRACK_TIME_BY_MOOD.get(current_mood, 10.0) + 2.0
         return elapsed >= MIN_TRACK_TIME_BY_MOOD.get(current_mood, 10.0)
 
     def _render_loop(self) -> bytes:

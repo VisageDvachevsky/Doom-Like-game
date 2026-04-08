@@ -1,0 +1,58 @@
+{
+  "tracks": {
+    "The_Imp_s_Song.mp3": {
+      "mood": "exploration",
+      "energy": 0.08,
+      "switch_cooldown": 10.0,
+      "tags": ["classic", "light"]
+    },
+    "Mick Gordon - Ride to the Base.mp3": {
+      "mood": "exploration",
+      "energy": 0.14,
+      "switch_cooldown": 10.0,
+      "tags": ["modern", "travel"]
+    },
+    "DooM_-_Main_Theme_OST_(SkySound.cc).mp3": {
+      "mood": "threat",
+      "energy": 0.36,
+      "switch_cooldown": 12.0,
+      "tags": ["classic", "threat"]
+    },
+    "Mick Gordon - Faust.mp3": {
+      "mood": "threat",
+      "energy": 0.24,
+      "switch_cooldown": 12.0,
+      "tags": ["modern", "ominous"]
+    },
+    "Mick Gordon - Cultist Base.mp3": {
+      "mood": "combat",
+      "energy": 0.56,
+      "switch_cooldown": 14.0,
+      "tags": ["modern", "combat"]
+    },
+    "at dooms morgen.mp3": {
+      "mood": "combat",
+      "energy": 0.62,
+      "switch_cooldown": 14.0,
+      "tags": ["classic", "combat"]
+    },
+    "at dooms gate.mp3": {
+      "mood": "combat",
+      "energy": 0.66,
+      "switch_cooldown": 14.0,
+      "tags": ["classic", "combat", "push"]
+    },
+    "doom_02. Rip & Tear.mp3": {
+      "mood": "climax",
+      "energy": 0.92,
+      "switch_cooldown": 18.0,
+      "tags": ["modern", "climax"]
+    },
+    "Mick Gordon - Bfg Division.mp3": {
+      "mood": "climax",
+      "energy": 0.98,
+      "switch_cooldown": 18.0,
+      "tags": ["modern", "boss", "climax"]
+    }
+  }
+}
