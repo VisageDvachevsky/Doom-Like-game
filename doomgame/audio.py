@@ -38,6 +38,7 @@ class DoomAudio:
             "enemy": pygame.mixer.Channel(4),
         }
         shotgun_fire = self._load_asset_sound("dspistol.wav")
+        chaingun_fire = self._load_asset_sound("dspistol (1).wav")
         normal_door_open = self._load_asset_sound("dsbdopn.wav")
         locked_door_open = self._load_asset_sound("dsdoropn.wav")
         item_pickup = self._load_asset_sound("dsitemup.wav")
@@ -68,6 +69,7 @@ class DoomAudio:
         player_death = self._load_asset_sound("dspldeth.wav")
         self.sounds = {
             "shotgun_fire": shotgun_fire if shotgun_fire is not None else pygame.mixer.Sound(buffer=self._render_shotgun_fire()),
+            "chaingun_fire": chaingun_fire if chaingun_fire is not None else shotgun_fire if shotgun_fire is not None else pygame.mixer.Sound(buffer=self._render_enemy_ranged()),
             "empty_click": pygame.mixer.Sound(buffer=self._render_empty_click()),
             "pickup": item_pickup if item_pickup is not None else pygame.mixer.Sound(buffer=self._render_pickup_ping()),
             "key_pickup": pygame.mixer.Sound(buffer=self._render_key_pickup_ping()),
@@ -119,6 +121,9 @@ class DoomAudio:
 
     def play_shotgun_fire(self) -> None:
         self._play_sound("weapon", "shotgun_fire", cooldown=0.08, interrupt=True)
+
+    def play_chaingun_fire(self) -> None:
+        self._play_sound("weapon", "chaingun_fire", cooldown=0.03, interrupt=True)
 
     def play_empty_click(self) -> None:
         self._play_sound("weapon", "empty_click", cooldown=0.05, interrupt=True)

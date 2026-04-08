@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 import random
 from pathlib import Path
@@ -35,6 +36,53 @@ DIGIT_PATTERNS = {
     "8": ("111", "101", "111", "101", "111"),
     "9": ("111", "101", "111", "001", "111"),
     "%": ("101", "001", "010", "100", "101"),
+}
+
+
+@dataclass(frozen=True)
+class WeaponDefinition:
+    weapon_id: str
+    slot: int
+    ammo_pool: str
+    ammo_per_shot: int
+    damage: int
+    cooldown: float
+    anim_frames: list[int]
+    recoil: float
+    automatic: bool
+    audio_key: str
+    pickup_name: str
+    spread: float = 0.0
+
+
+WEAPON_DEFINITIONS: dict[str, WeaponDefinition] = {
+    "shotgun": WeaponDefinition(
+        weapon_id="shotgun",
+        slot=3,
+        ammo_pool="SHEL",
+        ammo_per_shot=1,
+        damage=24,
+        cooldown=settings.SHOT_COOLDOWN,
+        anim_frames=[1, 2, 2, 3, 4, 5, 0],
+        recoil=0.8,
+        automatic=False,
+        audio_key="shotgun_fire",
+        pickup_name="SHOTGUN",
+    ),
+    "chaingun": WeaponDefinition(
+        weapon_id="chaingun",
+        slot=4,
+        ammo_pool="BULL",
+        ammo_per_shot=1,
+        damage=11,
+        cooldown=0.078,
+        anim_frames=[1, 2, 1, 0],
+        recoil=0.56,
+        automatic=True,
+        audio_key="chaingun_fire",
+        pickup_name="CHAINGUN",
+        spread=0.019,
+    ),
 }
 
 
@@ -98,13 +146,17 @@ class DoomGame:
             "RCKT": 0,
             "CELL": 0,
         }
+        self.owned_weapons = {"shotgun"}
+        self.current_weapon_id = "shotgun"
         self.level_start_snapshot = {
             "health": self.health,
             "armor": self.armor,
             "ammo": self.ammo,
             "ammo_pools": dict(self.ammo_pools),
+            "owned_weapons": set(self.owned_weapons),
+            "current_weapon_id": self.current_weapon_id,
         }
-        self.selected_weapon_slot = 3
+        self.selected_weapon_slot = WEAPON_DEFINITIONS[self.current_weapon_id].slot
         self.keys_owned: set[str] = set()
         self.face_panel_sprites = {
             "center": self._load_scaled_asset("doomguy_face_center.png", (124, 124)),
@@ -177,6 +229,9 @@ class DoomGame:
             "RCKT": 0,
             "CELL": 0,
         }
+        self.owned_weapons = {"shotgun"}
+        self.current_weapon_id = "shotgun"
+        self._sync_selected_weapon_slot()
         resolved_run_seed = run_seed if run_seed is not None else random.randrange(1, 999_999)
         self.run_state = self.sequence_director.build_run_state(difficulty_id, resolved_run_seed)
         self.load_campaign_level(1, preserve_player_state=False, show_intermission=False)
@@ -200,6 +255,9 @@ class DoomGame:
                 "RCKT": 0,
                 "CELL": 0,
             }
+            self.owned_weapons = {"shotgun"}
+            self.current_weapon_id = "shotgun"
+            self._sync_selected_weapon_slot()
 
         generation_request = self.sequence_director.build_generation_request(self.run_state, level_index)
         clear_debug_log()
@@ -238,6 +296,8 @@ class DoomGame:
             "armor": self.armor,
             "ammo": self.ammo,
             "ammo_pools": dict(self.ammo_pools),
+            "owned_weapons": set(self.owned_weapons),
+            "current_weapon_id": self.current_weapon_id,
         }
         append_debug_log(
             "campaign-level-load "
@@ -270,6 +330,11 @@ class DoomGame:
         self.armor = self.level_start_snapshot["armor"]
         self.ammo = self.level_start_snapshot["ammo"]
         self.ammo_pools = dict(self.level_start_snapshot["ammo_pools"])
+        self.owned_weapons = set(self.level_start_snapshot.get("owned_weapons", {"shotgun"}))
+        self.current_weapon_id = str(self.level_start_snapshot.get("current_weapon_id", "shotgun"))
+        if self.current_weapon_id not in self.owned_weapons:
+            self.current_weapon_id = "shotgun"
+        self._sync_selected_weapon_slot()
         self.load_campaign_level(
             self.run_state.current_level_index,
             preserve_player_state=True,
@@ -320,6 +385,46 @@ class DoomGame:
             or self.face_panel_sprites.get("dead")
         )
 
+    def _sync_selected_weapon_slot(self) -> None:
+        self.selected_weapon_slot = WEAPON_DEFINITIONS[self.current_weapon_id].slot
+
+    def _current_weapon_definition(self) -> WeaponDefinition:
+        return WEAPON_DEFINITIONS[self.current_weapon_id]
+
+    def _current_weapon_ammo(self) -> int:
+        return self.ammo_pools.get(self._current_weapon_definition().ammo_pool, 0)
+
+    def _available_weapon_ids(self) -> list[str]:
+        return sorted(self.owned_weapons, key=lambda weapon_id: WEAPON_DEFINITIONS[weapon_id].slot)
+
+    def _switch_weapon(self, weapon_id: str, announce: bool = False) -> None:
+        if weapon_id not in self.owned_weapons or weapon_id == self.current_weapon_id:
+            return
+        self.current_weapon_id = weapon_id
+        self._sync_selected_weapon_slot()
+        self.shot_anim_frames = [0]
+        self.shot_anim_index = 0
+        self.shot_anim_time = 0.0
+        self.muzzle_flash = 0.0
+        self.weapon_recoil = min(self.weapon_recoil, 0.18)
+        if announce:
+            weapon = WEAPON_DEFINITIONS[weapon_id]
+            self._show_message(f"{weapon.pickup_name} READY", (232, 198, 118))
+
+    def _select_weapon_by_slot(self, slot: int, announce: bool = False) -> None:
+        for weapon_id, weapon in WEAPON_DEFINITIONS.items():
+            if weapon.slot == slot and weapon_id in self.owned_weapons:
+                self._switch_weapon(weapon_id, announce=announce)
+                return
+
+    def _cycle_weapon(self, direction: int) -> None:
+        weapons = self._available_weapon_ids()
+        if len(weapons) <= 1:
+            return
+        current_index = weapons.index(self.current_weapon_id)
+        next_index = (current_index + direction) % len(weapons)
+        self._switch_weapon(weapons[next_index], announce=True)
+
     def _begin_run_with_difficulty(self, difficulty_id: str) -> None:
         self.start_run(difficulty_id)
 
@@ -337,11 +442,16 @@ class DoomGame:
             "RCKT": 99,
             "CELL": 300,
         }
+        self.owned_weapons = {"shotgun", "chaingun"}
+        self.current_weapon_id = "chaingun"
+        self._sync_selected_weapon_slot()
         self.level_start_snapshot = {
             "health": self.health,
             "armor": self.armor,
             "ammo": self.ammo,
             "ammo_pools": dict(self.ammo_pools),
+            "owned_weapons": set(self.owned_weapons),
+            "current_weapon_id": self.current_weapon_id,
         }
 
     def _start_dev_session(self) -> None:
@@ -434,6 +544,10 @@ class DoomGame:
                     if self.campaign_complete:
                         continue
                     self._try_use_door()
+                elif event.key in (pygame.K_3, pygame.K_KP3):
+                    self._select_weapon_by_slot(3)
+                elif event.key in (pygame.K_4, pygame.K_KP4):
+                    self._select_weapon_by_slot(4)
                 elif event.key == pygame.K_TAB:
                     self.show_minimap = not self.show_minimap
             elif event.type == pygame.WINDOWFOCUSGAINED:
@@ -444,6 +558,10 @@ class DoomGame:
                 self._set_mouse_capture(True)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.mouse_captured:
                 self._try_fire()
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 4 and self.mouse_captured:
+                self._cycle_weapon(-1)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 5 and self.mouse_captured:
+                self._cycle_weapon(1)
 
     def _update(self, delta_time: float) -> None:
         self._decay_music_impulses(delta_time)
@@ -485,6 +603,9 @@ class DoomGame:
         self._collect_loot()
         self._check_level_exit()
         self.ammo_pools["SHEL"] = self.ammo
+        if self.mouse_captured and pygame.mouse.get_pressed(num_buttons=3)[0]:
+            if self._current_weapon_definition().automatic:
+                self._try_fire()
         self._update_weapon_state(delta_time)
         self.pickup_message_timer = max(0.0, self.pickup_message_timer - delta_time)
         self.pickup_flash_timer = max(0.0, self.pickup_flash_timer - delta_time * 2.8)
@@ -513,6 +634,7 @@ class DoomGame:
             self.time_seconds,
             self.walk_time,
             self.move_amount,
+            self.current_weapon_id,
             self.shot_anim_frames[self.shot_anim_index],
             self.muzzle_flash,
             self.weapon_recoil,
@@ -622,29 +744,36 @@ class DoomGame:
     def _try_fire(self) -> None:
         if self.player_death_timer > 0.0 or self.campaign_complete:
             return
-        if self.shot_cooldown > 0.0 or self.ammo <= 0:
-            if self.ammo <= 0:
+        weapon = self._current_weapon_definition()
+        current_ammo = self.ammo_pools.get(weapon.ammo_pool, 0)
+        if self.shot_cooldown > 0.0 or current_ammo < weapon.ammo_per_shot:
+            if current_ammo < weapon.ammo_per_shot:
                 self.audio.play_empty_click()
+                self.shot_cooldown = max(self.shot_cooldown, 0.08)
             return
-        self.ammo -= 1
-        self.ammo_pools["SHEL"] = self.ammo
-        self.shot_cooldown = settings.SHOT_COOLDOWN
+        self.ammo_pools[weapon.ammo_pool] = max(0, current_ammo - weapon.ammo_per_shot)
+        self.ammo = self.ammo_pools["SHEL"]
+        self.shot_cooldown = weapon.cooldown
         self.shot_anim_time = 0.0
-        self.shot_anim_frames = [1, 2, 2, 3, 4, 5, 0]
+        self.shot_anim_frames = list(weapon.anim_frames)
         self.shot_anim_index = 0
-        self.muzzle_flash = 1.0
-        self.weapon_recoil = 0.8
-        self._bump_music_impulse("music_recent_shots", 0.42)
-        self.audio.play_shotgun_fire()
+        self.muzzle_flash = 1.0 if weapon.weapon_id == "shotgun" else 0.82
+        self.weapon_recoil = weapon.recoil
+        self._bump_music_impulse("music_recent_shots", 0.42 if weapon.weapon_id == "shotgun" else 0.26)
+        if weapon.audio_key == "chaingun_fire":
+            self.audio.play_chaingun_fire()
+        else:
+            self.audio.play_shotgun_fire()
         self.world.emit_noise(
             self.player.x,
             self.player.y,
             settings.ENEMY_GUNSHOT_NOISE_RADIUS,
             settings.ENEMY_GUNSHOT_NOISE_TIME,
         )
-        self._fire_hitscan()
+        self._fire_hitscan(weapon)
 
     def _update_weapon_state(self, delta_time: float) -> None:
+        weapon = self._current_weapon_definition()
         if self.shot_cooldown > 0.0:
             self.shot_cooldown = max(0.0, self.shot_cooldown - delta_time)
 
@@ -658,12 +787,16 @@ class DoomGame:
                 self.shot_anim_time = 0.0
 
         self.muzzle_flash = max(0.0, self.muzzle_flash - delta_time * settings.SHOT_FLASH_DECAY)
-        self.weapon_recoil = max(0.0, self.weapon_recoil - delta_time * 4.2)
+        recoil_decay = 4.2 if weapon.weapon_id == "shotgun" else 5.4
+        self.weapon_recoil = max(0.0, self.weapon_recoil - delta_time * recoil_decay)
 
-    def _fire_hitscan(self) -> None:
-        ray_x = math.cos(self.player.angle)
-        ray_y = math.sin(self.player.angle)
-        impact = self.world.resolve_hitscan(self.player.x, self.player.y, ray_x, ray_y, damage=24)
+    def _fire_hitscan(self, weapon: WeaponDefinition) -> None:
+        shot_angle = self.player.angle
+        if weapon.spread > 0.0:
+            shot_angle += random.uniform(-weapon.spread, weapon.spread)
+        ray_x = math.cos(shot_angle)
+        ray_y = math.sin(shot_angle)
+        impact = self.world.resolve_hitscan(self.player.x, self.player.y, ray_x, ray_y, damage=weapon.damage)
         if impact.enemy is None:
             return
         if impact.enemy.enemy_type in {"warden", "cyberdemon"} and impact.enemy_killed:
@@ -800,6 +933,16 @@ class DoomGame:
         self._reset_weapon_state()
 
     def _apply_loot(self, kind: str, amount: int) -> str | None:
+        if kind == "chaingun":
+            gained_weapon = "chaingun" not in self.owned_weapons
+            if gained_weapon:
+                self.owned_weapons.add("chaingun")
+            bullets_before = self.ammo_pools["BULL"]
+            self.ammo_pools["BULL"] = min(settings.MAX_BULLETS, bullets_before + amount)
+            if not gained_weapon and self.ammo_pools["BULL"] == bullets_before:
+                return None
+            self._switch_weapon("chaingun")
+            return "FOUND THE CHAINGUN" if gained_weapon else f"CHAINGUN AMMO +{self.ammo_pools['BULL'] - bullets_before}"
         definition = get_pickup_definition(kind)
         current_value = self._get_pickup_stat(definition.effect.stat)
         result = definition.effect.apply(current_value, amount)
@@ -816,6 +959,8 @@ class DoomGame:
             return self.armor
         if stat == "ammo":
             return self.ammo
+        if stat == "bullets":
+            return self.ammo_pools["BULL"]
         raise ValueError(f"Unsupported pickup stat: {stat}")
 
     def _set_pickup_stat(self, stat: str, value: int) -> None:
@@ -828,6 +973,9 @@ class DoomGame:
         if stat == "ammo":
             self.ammo = min(settings.MAX_SHELLS, max(0, value))
             self.ammo_pools["SHEL"] = self.ammo
+            return
+        if stat == "bullets":
+            self.ammo_pools["BULL"] = min(settings.MAX_BULLETS, max(0, value))
             return
         raise ValueError(f"Unsupported pickup stat: {stat}")
 
@@ -1006,7 +1154,7 @@ class DoomGame:
         armor_rect = pygame.Rect(settings.SCREEN_WIDTH - 134, hud_y + 18, 114, 88)
         left_panel_x = face_rect.left - 132
 
-        self._draw_stat_box(ammo_rect, "AMMO", self.ammo, None, (188, 42, 34))
+        self._draw_stat_box(ammo_rect, "AMMO", self._current_weapon_ammo(), None, (188, 42, 34))
         self._draw_face_panel(face_rect)
         self._draw_stat_box(health_rect, "HEALTH", self.health, "%", (188, 42, 34))
         self._draw_stat_box(armor_rect, "ARMOR", self.armor, "%", (188, 42, 34))
@@ -1172,7 +1320,7 @@ class DoomGame:
         face_rect = draw_sprite.get_rect(center=(rect.centerx, rect.centery + 2))
         self.screen.blit(draw_sprite, face_rect)
 
-        ammo_flash = (196, 182, 92) if self.ammo > 0 else (132, 42, 42)
+        ammo_flash = (196, 182, 92) if self._current_weapon_ammo() > 0 else (132, 42, 42)
         for side in (-1, 1):
             lamp_rect = pygame.Rect(rect.centerx + side * 58 - 10, rect.y + 16, 20, 14)
             pygame.draw.rect(self.screen, ammo_flash, lamp_rect, border_radius=3)
@@ -1189,10 +1337,14 @@ class DoomGame:
             slot = start_slot + idx
             slot_rect = pygame.Rect(rect.x + 8 + idx * 40, rect.y + 16, 32, 16)
             active = self.selected_weapon_slot == slot
-            fill = (164, 38, 28) if active else (60, 54, 52)
+            owned = any(
+                weapon.slot == slot and weapon.weapon_id in self.owned_weapons
+                for weapon in WEAPON_DEFINITIONS.values()
+            )
+            fill = (164, 38, 28) if active else (60, 54, 52) if owned else (28, 26, 28)
             pygame.draw.rect(self.screen, fill, slot_rect, border_radius=2)
             pygame.draw.rect(self.screen, (142, 136, 126), slot_rect, 2, border_radius=2)
-            number = self.small_font.render(str(slot), True, (240, 214, 170))
+            number = self.small_font.render(str(slot), True, (240, 214, 170) if owned else (114, 108, 102))
             self.screen.blit(number, number.get_rect(center=slot_rect.center))
 
     def _draw_key_panel(self, rect: pygame.Rect) -> None:

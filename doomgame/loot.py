@@ -63,6 +63,20 @@ class LootTableEntry:
 
 
 PICKUP_DEFINITIONS: dict[str, PickupDefinition] = {
+    "bullets": PickupDefinition(
+        kind="bullets",
+        display_name="Bullets",
+        default_amount=20,
+        effect=PickupEffect("bullets", "add", settings.MAX_BULLETS, "PICKED UP BULLETS"),
+        visual=PickupVisual((22, 28), (198, 180, 94), (255, 214, 118), 0.34, 0.8),
+    ),
+    "bullet_box": PickupDefinition(
+        kind="bullet_box",
+        display_name="Ammo Box",
+        default_amount=60,
+        effect=PickupEffect("bullets", "add", settings.MAX_BULLETS, "PICKED UP AMMO BOX"),
+        visual=PickupVisual((28, 24), (214, 186, 84), (255, 224, 126), 0.36, 0.88),
+    ),
     "shells": PickupDefinition(
         kind="shells",
         display_name="Shells",
@@ -105,6 +119,13 @@ PICKUP_DEFINITIONS: dict[str, PickupDefinition] = {
         effect=PickupEffect("armor", "set_floor", 100, "GREEN ARMOR"),
         visual=PickupVisual((28, 30), (64, 164, 120), (118, 230, 160), 0.38, 0.94),
     ),
+    "chaingun": PickupDefinition(
+        kind="chaingun",
+        display_name="Chaingun",
+        default_amount=100,
+        effect=PickupEffect("bullets", "add", settings.MAX_BULLETS, "FOUND THE CHAINGUN"),
+        visual=PickupVisual((36, 24), (158, 150, 132), (232, 196, 118), 0.42, 0.98),
+    ),
 }
 
 
@@ -115,17 +136,22 @@ ROOM_LOOT_TABLES: dict[str, tuple[LootTableEntry, ...]] = {
         LootTableEntry("armor_bonus", 1, 2),
     ),
     "storage": (
+        LootTableEntry("bullets", 20, 3),
         LootTableEntry("shells", 4, 12),
         LootTableEntry("shell_box", 20, 7),
+        LootTableEntry("bullet_box", 60, 2),
         LootTableEntry("armor_bonus", 1, 2),
     ),
     "arena": (
+        LootTableEntry("bullets", 20, 3),
         LootTableEntry("shells", 4, 9),
         LootTableEntry("shell_box", 20, 6),
         LootTableEntry("stimpack", 10, 4),
         LootTableEntry("medkit", 25, 3),
     ),
     "tech": (
+        LootTableEntry("bullets", 20, 4),
+        LootTableEntry("bullet_box", 60, 2),
         LootTableEntry("stimpack", 10, 5),
         LootTableEntry("armor_bonus", 1, 7),
         LootTableEntry("green_armor", 100, 2),
@@ -137,6 +163,7 @@ ROOM_LOOT_TABLES: dict[str, tuple[LootTableEntry, ...]] = {
         LootTableEntry("shell_box", 20, 2),
     ),
     "cross": (
+        LootTableEntry("bullets", 20, 2),
         LootTableEntry("shells", 4, 7),
         LootTableEntry("stimpack", 10, 5),
         LootTableEntry("armor_bonus", 1, 3),

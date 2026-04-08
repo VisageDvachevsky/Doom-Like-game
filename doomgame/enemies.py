@@ -589,7 +589,11 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         wander_radius=2.2,
         hit_reaction_chance=0.76,
         corpse_time=settings.ENEMY_CORPSE_TIME,
-        drops=(EnemyDrop("shells", 0.34, 4), EnemyDrop("stimpack", 0.12, 10)),
+        drops=(
+            EnemyDrop("bullets", 0.42, 20),
+            EnemyDrop("shells", 0.22, 4),
+            EnemyDrop("stimpack", 0.12, 10),
+        ),
         visual=EnemyVisual(
             base_color=(116, 122, 130),
             accent_color=(214, 88, 68),
@@ -653,7 +657,11 @@ ENEMY_DEFINITIONS: dict[str, EnemyDefinition] = {
         wander_radius=1.9,
         hit_reaction_chance=0.34,
         corpse_time=settings.ENEMY_CORPSE_TIME + 1.0,
-        drops=(EnemyDrop("shell_box", 0.42, 20), EnemyDrop("green_armor", 0.08, 100)),
+        drops=(
+            EnemyDrop("bullet_box", 0.46, 60),
+            EnemyDrop("shell_box", 0.24, 20),
+            EnemyDrop("green_armor", 0.08, 100),
+        ),
         visual=EnemyVisual(
             base_color=(70, 92, 120),
             accent_color=(138, 228, 176),

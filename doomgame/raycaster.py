@@ -64,9 +64,12 @@ class Raycaster:
         self.horizon_glow = pygame.Surface((self.width, 48), pygame.SRCALPHA)
         self.horizon_glow.fill((118, 214, 140, 255))
         self.weapon_frames = self._load_weapon_frames()
-        self.weapon_idle_frame = self._load_weapon_idle_frame()
+        self.weapon_idle_frames = self._load_weapon_idle_frames()
         self.scaled_weapon_frames = self._prepare_weapon_frames()
-        self.scaled_weapon_idle_frame = self._prepare_single_weapon_frame(self.weapon_idle_frame)
+        self.scaled_weapon_idle_frames = {
+            weapon_id: self._prepare_single_weapon_frame(frame)
+            for weapon_id, frame in self.weapon_idle_frames.items()
+        }
         self.pickup_sprites = self._build_pickup_sprites()
         self.door_textures = self._build_door_textures()
         self.native_door_texture_bytes = self._build_native_door_texture_bytes()
@@ -121,6 +124,7 @@ class Raycaster:
         time_seconds: float,
         walk_time: float,
         move_amount: float,
+        weapon_id: str = "shotgun",
         weapon_frame: int = 0,
         muzzle_flash: float = 0.0,
         recoil: float = 0.0,
@@ -227,7 +231,7 @@ class Raycaster:
             self._draw_enemies(surface, world, player, time_seconds)
             self._draw_enemy_projectiles(surface, world, player, time_seconds)
         surface.blit(self.vignette, (0, 0))
-        self._draw_weapon(surface, time_seconds, walk_time, move_amount, weapon_frame, muzzle_flash, recoil)
+        self._draw_weapon(surface, time_seconds, walk_time, move_amount, weapon_id, weapon_frame, muzzle_flash, recoil)
 
     def _build_native_door_buffer(self, world: World) -> None:
         self.native_door_buffer = bytearray()
@@ -451,6 +455,7 @@ class Raycaster:
         time_seconds: float,
         walk_time: float,
         move_amount: float,
+        weapon_id: str,
         weapon_frame: int,
         muzzle_flash: float,
         recoil: float,
@@ -461,15 +466,17 @@ class Raycaster:
         kick_y = recoil * 12.0
         center_x = int(self.width // 2 + sway_x - recoil * 1.5)
         base_y = int(self.height - 142 + bob + recoil_breath + kick_y)
-        if not self.scaled_weapon_frames:
+        weapon_frames = self.scaled_weapon_frames.get(weapon_id) or self.scaled_weapon_frames.get("shotgun") or []
+        idle_frame = self.scaled_weapon_idle_frames.get(weapon_id) or self.scaled_weapon_idle_frames.get("shotgun")
+        if not weapon_frames:
             fallback = pygame.Rect(center_x - 120, base_y + 28, 240, 96)
             pygame.draw.rect(surface, (48, 40, 44), fallback, border_radius=18)
             return
 
-        frame_index = max(0, min(len(self.scaled_weapon_frames) - 1, weapon_frame))
-        weapon_surface = self.scaled_weapon_frames[frame_index]
-        if weapon_frame == 0 and self.scaled_weapon_idle_frame is not None:
-            weapon_surface = self.scaled_weapon_idle_frame
+        frame_index = max(0, min(len(weapon_frames) - 1, weapon_frame))
+        weapon_surface = weapon_frames[frame_index]
+        if weapon_frame == 0 and idle_frame is not None:
+            weapon_surface = idle_frame
         sprite_rect = weapon_surface.get_rect(midbottom=(center_x + 2, self.height + 8 + int(bob * 0.1) + int(kick_y)))
         surface.blit(weapon_surface, sprite_rect)
 
@@ -1211,21 +1218,31 @@ class Raycaster:
             depth_buffer[column] = max(0.0001, distance)
         return depth_buffer
 
-    def _load_weapon_frames(self) -> list[pygame.Surface]:
-        assets_dir = Path(__file__).resolve().parent.parent / "assets"
-        frames: list[pygame.Surface] = []
-        for index in range(1, 6):
-            sprite_path = assets_dir / f"weapon_shotgun_{index}.png"
-            if not sprite_path.exists():
-                continue
-            raw = pygame.image.load(str(sprite_path)).convert_alpha()
-            bounds = raw.get_bounding_rect()
-            frame = raw if bounds.width <= 0 or bounds.height <= 0 else raw.subsurface(bounds).copy()
-            frames.append(frame)
-        return frames
+    def _load_weapon_frames(self) -> dict[str, list[pygame.Surface]]:
+        return {
+            "shotgun": [
+                frame
+                for frame in (
+                    self._load_trimmed_asset(f"weapon_shotgun_{index}.png")
+                    for index in range(1, 6)
+                )
+                if frame is not None
+            ],
+            "chaingun": [
+                frame
+                for frame in (
+                    self._load_trimmed_asset(f"chaingun_fire_0{index}.png")
+                    for index in range(1, 3)
+                )
+                if frame is not None
+            ],
+        }
 
-    def _load_weapon_idle_frame(self) -> pygame.Surface | None:
-        return self._load_trimmed_asset("weapon_shotgun_idle.png")
+    def _load_weapon_idle_frames(self) -> dict[str, pygame.Surface | None]:
+        return {
+            "shotgun": self._load_trimmed_asset("weapon_shotgun_idle.png"),
+            "chaingun": self._load_trimmed_asset("chaingun_idle.png"),
+        }
 
     def _load_trimmed_asset(self, asset_name: str) -> pygame.Surface | None:
         assets_dir = Path(__file__).resolve().parent.parent / "assets"
@@ -1236,14 +1253,15 @@ class Raycaster:
         bounds = raw.get_bounding_rect()
         return raw if bounds.width <= 0 or bounds.height <= 0 else raw.subsurface(bounds).copy()
 
-    def _prepare_weapon_frames(self) -> list[pygame.Surface]:
-        if not self.weapon_frames:
-            return []
-        scaled_frames: list[pygame.Surface] = []
-        for frame in self.weapon_frames:
-            prepared = self._prepare_single_weapon_frame(frame)
-            if prepared is not None:
-                scaled_frames.append(prepared)
+    def _prepare_weapon_frames(self) -> dict[str, list[pygame.Surface]]:
+        scaled_frames: dict[str, list[pygame.Surface]] = {}
+        for weapon_id, frames in self.weapon_frames.items():
+            prepared_frames = [
+                prepared
+                for prepared in (self._prepare_single_weapon_frame(frame) for frame in frames)
+                if prepared is not None
+            ]
+            scaled_frames[weapon_id] = prepared_frames
         return scaled_frames
 
     def _prepare_single_weapon_frame(
@@ -1260,6 +1278,9 @@ class Raycaster:
 
     def _build_pickup_sprites(self) -> dict[str, pygame.Surface]:
         external_names = {
+            "bullets": "bullets.png",
+            "bullet_box": "bullet_box.png",
+            "chaingun": "chaingun_world.png",
             "shells": "shells.png",
             "shell_box": "shell_box.png",
             "stimpack": "stimpack.png",
@@ -1271,6 +1292,9 @@ class Raycaster:
             "secret": "secret_marker.png",
         }
         sprites = {
+            "bullets": self._make_bullet_clip_sprite(),
+            "bullet_box": self._make_bullet_box_sprite(),
+            "chaingun": self._make_weapon_pickup_sprite(),
             "shells": self._make_shell_sprite((188, 54, 46), 22, 28),
             "shell_box": self._make_shell_box_sprite(),
             "stimpack": self._make_med_sprite((70, 208, 120), small=True),
@@ -1726,6 +1750,31 @@ class Raycaster:
         pygame.draw.rect(sprite, (70, 30, 18), (4, 5, 20, 15), 2, border_radius=3)
         pygame.draw.rect(sprite, (236, 210, 150), (8, 8, 12, 4), border_radius=1)
         pygame.draw.line(sprite, (72, 40, 24), (6, 5), (22, 5), 1)
+        return sprite
+
+    def _make_bullet_clip_sprite(self) -> pygame.Surface:
+        sprite = pygame.Surface((22, 28), pygame.SRCALPHA)
+        pygame.draw.rect(sprite, (66, 68, 74), (5, 6, 12, 17), border_radius=2)
+        pygame.draw.rect(sprite, (180, 188, 196), (7, 3, 8, 6), border_radius=2)
+        pygame.draw.rect(sprite, (226, 190, 96), (7, 18, 8, 5), border_radius=1)
+        pygame.draw.rect(sprite, (24, 24, 30), (5, 6, 12, 17), 2, border_radius=2)
+        return sprite
+
+    def _make_bullet_box_sprite(self) -> pygame.Surface:
+        sprite = pygame.Surface((28, 24), pygame.SRCALPHA)
+        pygame.draw.rect(sprite, (94, 96, 104), (4, 5, 20, 14), border_radius=3)
+        pygame.draw.rect(sprite, (202, 174, 92), (6, 8, 16, 5), border_radius=2)
+        pygame.draw.rect(sprite, (34, 34, 40), (4, 5, 20, 14), 2, border_radius=3)
+        pygame.draw.line(sprite, (224, 228, 234), (8, 6), (20, 6), 1)
+        return sprite
+
+    def _make_weapon_pickup_sprite(self) -> pygame.Surface:
+        sprite = pygame.Surface((38, 24), pygame.SRCALPHA)
+        pygame.draw.rect(sprite, (56, 58, 66), (6, 9, 24, 8), border_radius=4)
+        pygame.draw.rect(sprite, (108, 110, 120), (18, 6, 14, 5), border_radius=2)
+        pygame.draw.rect(sprite, (182, 150, 88), (8, 12, 6, 8), border_radius=2)
+        pygame.draw.rect(sprite, (34, 34, 40), (6, 9, 24, 8), 2, border_radius=4)
+        pygame.draw.rect(sprite, (34, 34, 40), (18, 6, 14, 5), 1, border_radius=2)
         return sprite
 
     def _make_med_sprite(self, cross_color: tuple[int, int, int], small: bool) -> pygame.Surface:

@@ -3684,6 +3684,8 @@ class MapGenerator:
                 scaled_max = max(scaled_max, settings.EARLY_STAGE_SOFT_CAP + 1)
             spawn_count = min(len(candidates), self.rng.randint(scaled_min, scaled_max))
             loot_table = ROOM_LOOT_TABLES.get(room.kind, ROOM_LOOT_TABLES["cross"])
+            if self._campaign_field("level_index", 1) < 2:
+                loot_table = tuple(entry for entry in loot_table if entry.kind not in {"bullets", "bullet_box"})
 
             placed = 0
             for x, y in candidates:
@@ -3704,7 +3706,79 @@ class MapGenerator:
                 if placed >= spawn_count:
                     break
 
+        level_index = self._campaign_field("level_index", 1)
+        if level_index == 2:
+            next_id = self._place_chaingun_pickup(
+                loot_spawns,
+                next_id,
+                tiles,
+                stair_mask,
+                sector_types,
+                rooms,
+                spawn,
+                occupied_positions,
+            )
+
         return loot_spawns
+
+    def _place_chaingun_pickup(
+        self,
+        loot_spawns: list[LootSpawn],
+        next_id: int,
+        tiles: list[list[int]],
+        stair_mask: list[list[int]],
+        sector_types: list[list[int]],
+        rooms: list[Room],
+        spawn: tuple[float, float],
+        occupied_positions: list[tuple[float, float]],
+    ) -> int:
+        preferred_kinds = {"tech", "storage", "shrine"}
+        candidate_room_indices = [
+            room_index
+            for room_index in range(1, max(1, len(rooms) - 1))
+            if rooms[room_index].kind in preferred_kinds
+        ]
+        if not candidate_room_indices:
+            candidate_room_indices = [
+                room_index
+                for room_index in range(1, max(1, len(rooms) - 1))
+                if rooms[room_index].kind != "arena"
+            ]
+        if not candidate_room_indices:
+            candidate_room_indices = list(range(1, max(1, len(rooms) - 1)))
+        candidate_room_indices.sort(
+            key=lambda room_index: (
+                0 if rooms[room_index].kind == "tech" else 1 if rooms[room_index].kind == "storage" else 2,
+                -math.dist((rooms[room_index].center[0] + 0.5, rooms[room_index].center[1] + 0.5), spawn),
+            )
+        )
+
+        for room_index in candidate_room_indices:
+            room = rooms[room_index]
+            candidates = self._room_floor_candidates(
+                room,
+                tiles,
+                stair_mask,
+                sector_types,
+                spawn,
+                occupied_positions,
+                allowed_sectors={SECTOR_SAFE, SECTOR_BRIDGE},
+            )
+            if not candidates:
+                continue
+            x, y = candidates[0]
+            loot_spawns.append(
+                LootSpawn(
+                    f"loot-{self.seed}-chaingun-{next_id:03d}",
+                    x,
+                    y,
+                    "chaingun",
+                    resolve_pickup_amount("chaingun"),
+                )
+            )
+            occupied_positions.append((x, y))
+            return next_id + 1
+        return next_id
 
     def _adjust_loot_kind_for_difficulty(self, loot_kind: str) -> str:
         if self.difficulty_id == "easy":
