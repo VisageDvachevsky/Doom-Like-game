@@ -128,6 +128,8 @@ class EnemyProjectile:
                 self._explode(player, damage_player, audio)
                 return
             if math.hypot(self.x - player.x, self.y - player.y) <= self.radius + settings.ENEMY_PROJECTILE_PLAYER_HIT_RADIUS:
+                if player.jump_offset >= settings.PLAYER_PROJECTILE_DODGE_HEIGHT and self.owner_type != "cyberdemon":
+                    continue
                 self._explode(player, damage_player, audio, direct_hit=True)
                 return
 

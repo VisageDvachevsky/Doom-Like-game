@@ -135,6 +135,7 @@ class Raycaster:
         weapon_frame: int = 0,
         muzzle_flash: float = 0.0,
         recoil: float = 0.0,
+        jump_offset: float = 0.0,
     ) -> None:
         if self.native_renderer is not None and self.map_bytes:
             self._build_native_door_buffer(world)
@@ -238,7 +239,7 @@ class Raycaster:
             self._draw_enemies(surface, world, player, time_seconds)
             self._draw_enemy_projectiles(surface, world, player, time_seconds)
         surface.blit(self.vignette, (0, 0))
-        self._draw_weapon(surface, time_seconds, walk_time, move_amount, weapon_id, weapon_frame, muzzle_flash, recoil)
+        self._draw_weapon(surface, time_seconds, walk_time, move_amount, weapon_id, weapon_frame, muzzle_flash, recoil, jump_offset)
 
     def _build_native_door_buffer(self, world: World) -> None:
         self.native_door_buffer = bytearray()
@@ -266,8 +267,9 @@ class Raycaster:
         surface.blit(self.horizon_glow, (0, self.height // 2 - 18))
 
     def _draw_floor_and_ceiling(self, surface: pygame.Surface, world: World, player: Player) -> None:
-        eye_z = player.z + 0.5
-        horizon = int(self.height // 2 + player.z * self.height * 0.085)
+        eye_z = player.z + settings.PLAYER_EYE_HEIGHT
+        # Jumping changes the eye height, but not the camera pitch, so the horizon stays fixed.
+        horizon = self.height // 2
         stride = settings.FLOORCAST_STRIDE
 
         dir_x = math.cos(player.angle)
@@ -323,7 +325,7 @@ class Raycaster:
         dir_y = math.sin(player.angle)
         plane_x = -dir_y * self.camera_plane_scale
         plane_y = dir_x * self.camera_plane_scale
-        eye_z = player.z + 0.5
+        eye_z = player.z + settings.PLAYER_EYE_HEIGHT
 
         for column in range(0, self.width, settings.RAYCAST_STRIDE):
             camera_x = 2.0 * column / self.width - 1.0
@@ -466,13 +468,15 @@ class Raycaster:
         weapon_frame: int,
         muzzle_flash: float,
         recoil: float,
+        jump_offset: float,
     ) -> None:
         sway_x = math.sin(walk_time * 0.9) * 9 * move_amount
         bob = math.sin(walk_time * 1.8) * 7 * move_amount + math.sin(time_seconds * 0.8) * 1.5
         recoil_breath = math.sin(time_seconds * 0.55) * 2
         kick_y = recoil * 12.0
+        jump_lift = jump_offset * 54.0
         center_x = int(self.width // 2 + sway_x - recoil * 1.5)
-        base_y = int(self.height - 142 + bob + recoil_breath + kick_y)
+        base_y = int(self.height - 142 + bob + recoil_breath + kick_y + jump_lift)
         weapon_frames = self.scaled_weapon_frames.get(weapon_id) or self.scaled_weapon_frames.get("shotgun") or []
         idle_frame = self.scaled_weapon_idle_frames.get(weapon_id) or self.scaled_weapon_idle_frames.get("shotgun")
         if not weapon_frames:
@@ -484,11 +488,13 @@ class Raycaster:
         weapon_surface = weapon_frames[frame_index]
         if weapon_frame == 0 and idle_frame is not None:
             weapon_surface = idle_frame
-        sprite_rect = weapon_surface.get_rect(midbottom=(center_x + 2, self.height + 8 + int(bob * 0.1) + int(kick_y)))
+        sprite_rect = weapon_surface.get_rect(
+            midbottom=(center_x + 2, self.height + 8 + int(bob * 0.1) + int(kick_y + jump_lift))
+        )
         surface.blit(weapon_surface, sprite_rect)
 
     def _draw_doors(self, surface: pygame.Surface, world: World, player: Player) -> None:
-        eye_z = player.z + 0.5
+        eye_z = player.z + settings.PLAYER_EYE_HEIGHT
         dir_x = math.cos(player.angle)
         dir_y = math.sin(player.angle)
         plane_x = -dir_y * self.camera_plane_scale
@@ -643,7 +649,7 @@ class Raycaster:
         plane_x = -dir_y * self.camera_plane_scale
         plane_y = dir_x * self.camera_plane_scale
         inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y)
-        eye_z = player.z + 0.5
+        eye_z = player.z + settings.PLAYER_EYE_HEIGHT
 
         visible: list[tuple[float, float, float, object]] = []
         for pickup in [*world.active_loot(), *world.active_keys(), *world.active_switches(), *world.visible_secrets()]:
@@ -740,7 +746,7 @@ class Raycaster:
         plane_x = -dir_y * self.camera_plane_scale
         plane_y = dir_x * self.camera_plane_scale
         inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y)
-        eye_z = player.z + 0.5
+        eye_z = player.z + settings.PLAYER_EYE_HEIGHT
 
         visible: list[tuple[float, float, float, object]] = []
         for enemy in world.active_enemies(include_corpses=True):
@@ -822,7 +828,7 @@ class Raycaster:
         plane_x = -dir_y * self.camera_plane_scale
         plane_y = dir_x * self.camera_plane_scale
         inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y)
-        eye_z = player.z + 0.5
+        eye_z = player.z + settings.PLAYER_EYE_HEIGHT
 
         visible: list[tuple[float, float, float, object]] = []
         for projectile in world.active_enemy_projectiles():
@@ -917,7 +923,7 @@ class Raycaster:
         sprite_height = max(20, int(self.height / transform_y * pulse))
         sprite_width = max(20, int(sprite_height * self.exit_sprite.get_width() / max(1, self.exit_sprite.get_height())))
         scaled = self._get_scaled_sprite(self.exit_sprite, sprite_width, sprite_height)
-        bottom_y = self._project_z(player.z + 0.5, floor_z, transform_y)
+        bottom_y = self._project_z(player.z + settings.PLAYER_EYE_HEIGHT, floor_z, transform_y)
         sprite_rect = scaled.get_rect(midbottom=(screen_x, bottom_y))
         if sprite_rect.right < 0 or sprite_rect.left > self.width:
             return

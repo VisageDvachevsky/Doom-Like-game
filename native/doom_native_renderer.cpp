@@ -598,7 +598,8 @@ void draw_floor_and_ceiling(
     int map_height
 ) {
     const double eye_z = player_z + 0.5;
-    const int horizon = static_cast<int>(height / 2 + player_z * height * 0.085);
+    // Eye height changes during a jump, but the view pitch does not, so the horizon stays fixed.
+    const int horizon = height / 2;
     const double dir_x = std::cos(angle);
     const double dir_y = std::sin(angle);
     const double plane_x = -dir_y * kCameraPlaneScale;

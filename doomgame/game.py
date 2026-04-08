@@ -544,6 +544,8 @@ class DoomGame:
                     if self.campaign_complete:
                         continue
                     self._try_use_door()
+                elif event.key == pygame.K_SPACE and self.mouse_captured:
+                    self.player.jump(self.world)
                 elif event.key in (pygame.K_3, pygame.K_KP3):
                     self._select_weapon_by_slot(3)
                 elif event.key in (pygame.K_4, pygame.K_KP4):
@@ -614,9 +616,9 @@ class DoomGame:
         if self.pickup_message_timer <= 0.0:
             self.pickup_message = ""
 
-        self.move_amount = min(1.0, abs(forward) + abs(strafe))
+        self.move_amount = self.player.speed_ratio
         if self.move_amount > 0.0:
-            self.walk_time += delta_time * (4.5 + self.move_amount * 5.0)
+            self.walk_time += delta_time * (3.2 + self.move_amount * 8.4)
             self.ammo = max(0, self.ammo - 0)
         self._update_music_events()
         self.music.update(self._build_music_snapshot(), delta_time)
@@ -638,6 +640,7 @@ class DoomGame:
             self.shot_anim_frames[self.shot_anim_index],
             self.muzzle_flash,
             self.weapon_recoil,
+            self.player.jump_offset,
         )
         scaled_scene = pygame.transform.scale(
             self.scene_surface, (settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT)

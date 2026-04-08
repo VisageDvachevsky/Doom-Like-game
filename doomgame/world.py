@@ -385,6 +385,23 @@ class World:
             return self.get_floor_height(x, y)
         return max(heights)
 
+    def get_local_ceiling_height(self, x: float, y: float, radius: float) -> int:
+        points = (
+            (x, y),
+            (x - radius, y - radius),
+            (x + radius, y - radius),
+            (x - radius, y + radius),
+            (x + radius, y + radius),
+        )
+        heights = [
+            self.get_ceiling_height_at(int(px), int(py))
+            for px, py in points
+            if not self.is_blocked(px, py)
+        ]
+        if not heights:
+            return self.get_ceiling_height_at(int(x), int(y))
+        return min(heights)
+
     def is_stair_at(self, grid_x: int, grid_y: int) -> bool:
         if grid_x < 0 or grid_y < 0 or grid_x >= self.width or grid_y >= self.height:
             return False
